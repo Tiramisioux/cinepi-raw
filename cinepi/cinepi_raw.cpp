@@ -71,6 +71,7 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller)
 		// check for record trigger signal, open a new folder if rec_start or reset frame count if _rec_stop
 		int trigger = controller.triggerRec();
 		if(trigger > 0){
+			app.GetEncoder()->still_capture = false;
 			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
 		} else if (trigger < 0){
 			controller.folderOpen = false;
