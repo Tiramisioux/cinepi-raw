@@ -63,6 +63,16 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller)
 		if (msg.type != CinePIRecorder::MsgType::RequestComplete)
 			throw std::runtime_error("unrecognised message!");
 
+		// Insert the timestamp code here
+		auto now = std::chrono::system_clock::now();
+		auto time_t_now = std::chrono::system_clock::to_time_t(now);
+		auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+		std::ostringstream oss;
+		oss << std::put_time(std::localtime(&time_t_now), "%Y-%m-%d %H:%M:%S");
+		oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+		std::cout << "Frame creation started at: " << oss.str() << std::endl;
+
 		CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
 
 		// parse the frame info metadata for the current frame, publish to redis stats channel
