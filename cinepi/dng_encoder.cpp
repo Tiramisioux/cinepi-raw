@@ -375,13 +375,20 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
 
     // LOG(1, offset_x_start << " " << offset_x_end << " " << offset_y_start << " " << offset_y_end);
 
-    const uint16_t byte_offset_x = (1.5 * offset_x_start) / sizeof(uint64_t); 
-    // const uint16_t read_length_x = (1.5 * (info.width - (offset_x_start+offset_x_end))) / sizeof(uint64_t);
-    const uint16_t t_height = (info.height - (offset_y_start+offset_y_end));
-    const uint16_t t_width = (info.width - (offset_x_start+offset_x_end));
+	const float bppf = (bayer_format.bits / 8);
+	const uint16_t byte_offset_x = (bppf * offset_x_start) / sizeof(uint64_t);
+	// const uint16_t read_length_x = (1.5 * (info.width - (offset_x_start+offset_x_end))) / sizeof(uint64_t);
+	uint16_t t_height = (info.height - (offset_y_start + offset_y_end));
+	uint16_t t_width = (info.width - (offset_x_start + offset_x_end));
 
-    TIFF *tif = nullptr;
-    MemoryBuffer memBuf;
+	if (bayer_format.bits == 10)
+	{
+		t_height = info.height;
+		t_width = info.width;
+	}
+
+	TIFF *tif = nullptr;
+	MemoryBuffer memBuf;
     memBuf.buffer = (unsigned char*)mem_tiff;
     if (!memBuf.buffer) {
         fprintf(stderr, "Failed to allocate memory\n");
@@ -527,24 +534,53 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
 
         LOG(2, thread_num << " Writing DNG main image " << fn);
 
-		// Adjust the memory pointer based on stride and row skips
-		mem += (info.stride * offset_y_start);
-		LOG(2, thread_num << " Writing buffer " << t_height);
-
-        // (info.stride / sizeof(uint64_t)) - 
-		const uint16_t chunk = (info.stride / sizeof(uint64_t));
-		LOG(2, thread_num << " Writing DNG chunk: " << chunk << "Stride: " << info.stride);
-		std::vector<uint64_t> buffer(chunk);
-		for (unsigned int y = 0; y < t_height; y++)
+		if (bayer_format.bits == 10)
 		{
-		    uint64_t* read = (uint64_t*)(mem + y * info.stride) + byte_offset_x;  // Combined addition
-			unpack12_64(read, buffer.data(), chunk);
-		    if (TIFFWriteScanline(tif, (uint8_t *)buffer.data(), y, 0) != 1)
-		        throw std::runtime_error("error writing DNG image data");
+			uint8_t *d = (uint8_t *)mem;
+			uint64_t k = 0;
+			for (unsigned int y = 0; y < t_height; y++)
+			{
+				std::vector<uint8_t> rowBuff(info.stride);
+				for (unsigned int col = 0; col < info.stride; col += 5)
+				{
+					uint8_t px1 = d[k++];
+					uint8_t px2 = d[k++];
+					uint8_t px3 = d[k++];
+					uint8_t px4 = d[k++];
+					uint8_t split = d[k++];
+
+					rowBuff[col + 0] = px1;
+					rowBuff[col + 1] = (split & 0xC0) | px2 >> 2;
+					rowBuff[col + 2] = ((px2 << 6) & 0xff) | (split & 0x30) | (px3 >> 4);
+					rowBuff[col + 3] = ((px3 << 4) & 0xff) | (split & 0x0C) | (px4 >> 6);
+					rowBuff[col + 4] = ((px4 << 2) & 0xff) | (split & 0x03);
+				}
+
+				if (TIFFWriteScanline(tif, (uint8_t *)rowBuff.data(), y, 0) != 1)
+					throw std::runtime_error("error writing DNG image data");
+			}
 		}
-        
-        TIFFCheckpointDirectory(tif);
-        offset_subifd = TIFFCurrentDirOffset(tif);
+		else if (bayer_format.bits == 12)
+		{
+			// Adjust the memory pointer based on stride and row skips
+			mem += (info.stride * offset_y_start);
+			LOG(2, thread_num << " Writing buffer " << t_height);
+
+			// (info.stride / sizeof(uint64_t)) -
+			const uint16_t chunk = (info.stride / sizeof(uint64_t));
+			LOG(2, thread_num << " Writing DNG chunk: " << chunk << "Stride: " << info.stride);
+			std::vector<uint64_t> buffer(chunk);
+			for (unsigned int y = 0; y < t_height; y++)
+			{
+				uint64_t *read = (uint64_t *)(mem + y * info.stride) + byte_offset_x; // Combined addition
+				unpack12_64(read, buffer.data(), chunk);
+				if (TIFFWriteScanline(tif, (uint8_t *)buffer.data(), y, 0) != 1)
+					throw std::runtime_error("error writing DNG image data");
+			}
+		}
+
+		TIFFCheckpointDirectory(tif);
+		offset_subifd = TIFFCurrentDirOffset(tif);
         LOG(2, thread_num << " Writing DNG main dict " << fn);
         TIFFWriteDirectory(tif);
 
