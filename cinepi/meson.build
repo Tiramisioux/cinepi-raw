@@ -28,9 +28,9 @@ sources = [
   'utils.cpp'
 ]
 
-alsa_dep = dependency('alsa')
+#alsa_dep = dependency('alsa')
 
-cinepi_raw_dep = [tiff_dep, hiredis_lib, redis_plus_plus_lib, boost_dep, thread_dep, libcamera_dep, libcamera_app_dep, alsa_dep]
+cinepi_raw_dep = [tiff_dep, hiredis_lib, redis_plus_plus_lib, boost_dep, thread_dep, libcamera_dep, libcamera_app_dep]
 
 
 # Executable
