@@ -5,6 +5,8 @@
  * libcamera_encoder.cpp - libcamera video encoding class.
  */
 
+#pragma once
+
 #include "core/libcamera_app.hpp"
 #include "core/stream_info.hpp"
 #include "core/video_options.hpp"
@@ -36,7 +38,8 @@ public:
 		assert(encoder_);
 		StreamInfo info = GetStreamInfo(stream);
 		FrameBuffer *buffer = completed_request->buffers[stream];
-		libcamera::Span span = Mmap(buffer)[0];
+		BufferReadSync r(this, buffer);
+		libcamera::Span span = r.Get()[0];
 		void *mem = span.data();
 		if (!buffer || !mem)
 			throw std::runtime_error("no buffer to encode");

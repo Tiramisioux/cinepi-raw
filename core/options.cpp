@@ -4,23 +4,52 @@
  *
  * options.cpp - common program options helpers
  */
-#include <fcntl.h>
-#include <linux/v4l2-controls.h>
-#include <linux/videodev2.h>
-#include <sys/ioctl.h>
 #include <algorithm>
+#include <fcntl.h>
 #include <iomanip>
 #include <iostream>
+#include <linux/v4l2-controls.h>
+#include <linux/videodev2.h>
+#include <map>
+#include <string>
+#include <sys/ioctl.h>
 
+#include <libcamera/formats.h>
 #include <libcamera/logging.h>
+#include <libcamera/property_ids.h>
 
 #include "core/options.hpp"
 
-Mode::Mode(std::string const &mode_string)
+static const std::map<int, std::string> cfa_map =
 {
-	if (mode_string.empty())
-		bit_depth = 0;
-	else
+	{ properties::draft::ColorFilterArrangementEnum::RGGB, "RGGB" },
+	{ properties::draft::ColorFilterArrangementEnum::GRBG, "GRBG" },
+	{ properties::draft::ColorFilterArrangementEnum::GBRG, "GBRG" },
+	{ properties::draft::ColorFilterArrangementEnum::RGB, "RGB" },
+	{ properties::draft::ColorFilterArrangementEnum::MONO, "MONO" },
+};
+
+static const std::map<libcamera::PixelFormat, unsigned int> bayer_formats =
+{
+	{ libcamera::formats::SRGGB10_CSI2P, 10 },
+	{ libcamera::formats::SGRBG10_CSI2P, 10 },
+	{ libcamera::formats::SBGGR10_CSI2P, 10 },
+	{ libcamera::formats::R10_CSI2P,     10 },
+	{ libcamera::formats::SGBRG10_CSI2P, 10 },
+	{ libcamera::formats::SRGGB12_CSI2P, 12 },
+	{ libcamera::formats::SGRBG12_CSI2P, 12 },
+	{ libcamera::formats::SBGGR12_CSI2P, 12 },
+	{ libcamera::formats::SGBRG12_CSI2P, 12 },
+	{ libcamera::formats::SRGGB16,       16 },
+	{ libcamera::formats::SGRBG16,       16 },
+	{ libcamera::formats::SBGGR16,       16 },
+	{ libcamera::formats::SGBRG16,       16 },
+};
+
+
+Mode::Mode(std::string const &mode_string) : Mode()
+{
+	if (!mode_string.empty())
 	{
 		char p;
 		int n = sscanf(mode_string.c_str(), "%u:%u:%u:%c", &width, &height, &bit_depth, &p);
@@ -47,8 +76,22 @@ std::string Mode::ToString() const
 	{
 		std::stringstream ss;
 		ss << width << ":" << height << ":" << bit_depth << ":" << (packed ? "P" : "U");
+		if (framerate)
+			ss << "(" << framerate << ")";
 		return ss.str();
 	}
+}
+
+void Mode::update(const libcamera::Size &size, const std::optional<float> &fps)
+{
+	if (!width)
+		width = size.width;
+	if (!height)
+		height = size.height;
+	if (!bit_depth)
+		bit_depth = 12;
+	if (fps)
+		framerate = fps.value();
 }
 
 static int xioctl(int fd, unsigned long ctl, void *arg)
@@ -98,10 +141,19 @@ bool Options::Parse(int argc, char *argv[])
 	else if (!lens_position_.empty())
 		throw std::runtime_error("Invalid lens position: " + lens_position_);
 
-	// HDR control. Set this before opening or listing any cameras.
+	// Convert time strings to durations
+	timeout.set(timeout_);
+	shutter.set(shutter_);
+	flicker_period.set(flicker_period_);
+
+	if (hdr != "off" && hdr != "single-exp" && hdr != "sensor" && hdr != "auto")
+		throw std::runtime_error("Invalid HDR option provided: " + hdr);
+
+	// HDR control. Set the sensor control before opening or listing any cameras.
 	// Currently this does not exist in libcamera, so go directly to V4L2
 	// XXX it's not obvious which v4l2-subdev to use for which camera!
 	{
+		bool en = (hdr == "auto" || hdr == "sensor");
 		bool ok = false;
 		for (int i = 0; i < 4 && !ok; i++)
 		{
@@ -111,13 +163,20 @@ bool Options::Parse(int argc, char *argv[])
 			if (fd < 0)
 				continue;
 
-			v4l2_control ctrl { V4L2_CID_WIDE_DYNAMIC_RANGE, hdr };
+			v4l2_control ctrl { V4L2_CID_WIDE_DYNAMIC_RANGE, en };
 			ok = !xioctl(fd, VIDIOC_S_CTRL, &ctrl);
 			close(fd);
 		}
-		if (hdr && !ok)
-			LOG_ERROR("WARNING: Unable to set HDR mode");
+		if (hdr == "sensor" && en && !ok)
+			LOG_ERROR("WARNING: Unable to set sensor HDR mode");
+		else if (hdr == "auto" && en && ok)
+			hdr = "sensor";
 	}
+
+	// We have to pass the tuning file name through an environment variable.
+	// Note that we only overwrite the variable if the option was given.
+	if (tuning_file != "-")
+		setenv("LIBCAMERA_RPI_TUNING_FILE", tuning_file.c_str(), 1);
 
 	// Set the verbosity
 	LibcameraApp::verbosity = verbose;
@@ -142,18 +201,14 @@ bool Options::Parse(int argc, char *argv[])
 	{
 		// Disable any libcamera logging for this bit.
 		logSetTarget(LoggingTargetNone);
+		LibcameraApp::verbosity = 1;
 
 		std::unique_ptr<CameraManager> cm = std::make_unique<CameraManager>();
 		int ret = cm->start();
 		if (ret)
 			throw std::runtime_error("camera manager failed to start, code " + std::to_string(-ret));
 
-		std::vector<std::shared_ptr<libcamera::Camera>> cameras = cm->cameras();
-		// Do not show USB webcams as these are not supported in libcamera-apps!
-		auto rem = std::remove_if(cameras.begin(), cameras.end(),
-								  [](auto &cam) { return cam->id().find("/usb") != std::string::npos; });
-		cameras.erase(rem, cameras.end());
-
+		std::vector<std::shared_ptr<libcamera::Camera>> cameras = LibcameraApp::GetCameras(cm.get());
 		if (cameras.size() != 0)
 		{
 			unsigned int idx = 0;
@@ -162,11 +217,13 @@ bool Options::Parse(int argc, char *argv[])
 			for (auto const &cam : cameras)
 			{
 				cam->acquire();
-				std::cout << idx++ << " : " << *cam->properties().get(libcamera::properties::Model);
+
+				std::stringstream sensor_props;
+				sensor_props << idx++ << " : " << *cam->properties().get(libcamera::properties::Model) << " [";
+
 				auto area = cam->properties().get(properties::PixelArrayActiveAreas);
 				if (area)
-					std::cout << " [" << (*area)[0].size().toString() << "]";
-				std::cout << " (" << cam->id() << ")" << std::endl;
+					sensor_props << (*area)[0].size().toString() << " ";
 
 				std::unique_ptr<CameraConfiguration> config = cam->generateConfiguration({libcamera::StreamRole::Raw});
 				if (!config)
@@ -175,6 +232,28 @@ bool Options::Parse(int argc, char *argv[])
 
 				if (!formats.pixelformats().size())
 					continue;
+
+				unsigned int bits = 0;
+				for (const auto &pix : formats.pixelformats())
+				{
+					const auto &b = bayer_formats.find(pix);
+					if (b != bayer_formats.end() && b->second > bits)
+						bits = b->second;
+				}
+				if (bits)
+					sensor_props << bits << "-bit ";
+
+				auto cfa = cam->properties().get(properties::draft::ColorFilterArrangement);
+				if (cfa && cfa_map.count(*cfa))
+					sensor_props << cfa_map.at(*cfa) << " ";
+
+				sensor_props.seekp(-1, sensor_props.cur);
+				sensor_props << "] (" << cam->id() << ")";
+				std::cout << sensor_props.str() << std::endl;
+
+				ControlInfoMap control_map;
+				Size max_size;
+				PixelFormat max_fmt;
 
 				std::cout << "    Modes: ";
 				unsigned int i = 0;
@@ -186,12 +265,23 @@ bool Options::Parse(int argc, char *argv[])
 					unsigned int num = formats.sizes(pix).size();
 					for (const auto &size : formats.sizes(pix))
 					{
+						LibcameraApp::SensorMode sensor_mode(size, pix, 0);
 						std::cout << size.toString() << " ";
 
 						config->at(0).size = size;
 						config->at(0).pixelFormat = pix;
+						config->sensorConfig = libcamera::SensorConfiguration();
+						config->sensorConfig->outputSize = size;
+						config->sensorConfig->bitDepth = sensor_mode.depth();
 						config->validate();
 						cam->configure(config.get());
+
+						if (size > max_size)
+						{
+							control_map = cam->controls();
+							max_fmt = pix;
+							max_size = size;
+						}
 
 						auto fd_ctrl = cam->controls().find(&controls::FrameDurationLimits);
 						auto crop_ctrl = cam->properties().get(properties::ScalerCropMaximum);
@@ -207,12 +297,31 @@ bool Options::Parse(int argc, char *argv[])
 					std::cout << std::endl;
 				}
 
+				if (verbose > 1)
+				{
+					std::stringstream ss;
+					ss << "\n    Available controls for " << max_size.toString() << " " << max_fmt.toString()
+					   << " mode:\n    ";
+					std::cout << ss.str();
+					for (std::size_t s = 0; s < ss.str().length() - 10; std::cout << "-", s++);
+					std::cout << std::endl;
+
+					std::vector<std::string> ctrls;
+					for (auto const &[id, info] : control_map)
+						ctrls.emplace_back(id->name() + " : " + info.toString());
+					std::sort(ctrls.begin(), ctrls.end(), [](auto const &l, auto const &r) { return l < r; });
+					for (auto const &c : ctrls)
+						std::cout << "    " << c << std::endl;
+				}
+
+				std::cout << std::endl;
 				cam->release();
 			}
 		}
 		else
 			std::cout << "No cameras available!" << std::endl;
 
+		verbose = 1;
 		cameras.clear();
 		cm->stop();
 		return false;
@@ -307,11 +416,6 @@ bool Options::Parse(int argc, char *argv[])
 	saturation = std::clamp(saturation, 0.0f, 15.99f); // limits are arbitrary..
 	sharpness = std::clamp(sharpness, 0.0f, 15.99f); // limits are arbitrary..
 
-	// We have to pass the tuning file name through an environment variable.
-	// Note that we only overwrite the variable if the option was given.
-	if (tuning_file != "-")
-		setenv("LIBCAMERA_RPI_TUNING_FILE", tuning_file.c_str(), 1);
-
 	if (strcasecmp(metadata_format.c_str(), "json") == 0)
 		metadata_format = "json";
 	else if (strcasecmp(metadata_format.c_str(), "txt") == 0)
@@ -332,12 +436,11 @@ void Options::Print() const
 	if (!config_file.empty())
 		std::cerr << "    config file: " << config_file << std::endl;
 	std::cerr << "    info_text:" << info_text << std::endl;
-	std::cerr << "    timeout: " << timeout << std::endl;
+	std::cerr << "    timeout: " << timeout.get() << "ms" << std::endl;
 	std::cerr << "    width: " << width << std::endl;
 	std::cerr << "    height: " << height << std::endl;
 	std::cerr << "    output: " << output << std::endl;
 	std::cerr << "    post_process_file: " << post_process_file << std::endl;
-	std::cerr << "    rawfull: " << rawfull << std::endl;
 	if (nopreview)
 		std::cerr << "    preview: none" << std::endl;
 	else if (fullscreen)
@@ -354,11 +457,13 @@ void Options::Print() const
 	else
 		std::cerr << "    roi: " << roi_x << "," << roi_y << "," << roi_width << "," << roi_height << std::endl;
 	if (shutter)
-		std::cerr << "    shutter: " << shutter << std::endl;
+		std::cerr << "    shutter: " << shutter.get() << "us" << std::endl;
 	if (gain)
 		std::cerr << "    gain: " << gain << std::endl;
 	std::cerr << "    metering: " << metering << std::endl;
 	std::cerr << "    exposure: " << exposure << std::endl;
+	if (flicker_period)
+		std::cerr << "    flicker period: " << flicker_period.get() << "us" << std::endl;
 	std::cerr << "    ev: " << ev << std::endl;
 	std::cerr << "    awb: " << awb << std::endl;
 	if (awb_gain_r && awb_gain_b)
@@ -389,8 +494,7 @@ void Options::Print() const
 				  << afWindow_height << std::endl;
 	if (!lens_position_.empty())
 		std::cerr << "    lens-position: " << lens_position_ << std::endl;
-	if (hdr)
-		std::cerr << "    hdr: enabled" << hdr << std::endl;
+	std::cerr << "    hdr: " << hdr << std::endl;
 	std::cerr << "    mode: " << mode.ToString() << std::endl;
 	std::cerr << "    viewfinder-mode: " << viewfinder_mode.ToString() << std::endl;
 	if (buffer_count > 0)

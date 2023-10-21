@@ -24,7 +24,7 @@ public:
 		index_ = 0;
 	}
 	int bufferSize(){
-		return cache_buffer_.size();
+		return disk_buffer_.size();
 	}
 	uint64_t getFrameCount(){
 		return frames_;
@@ -37,12 +37,12 @@ public:
 
 private:
 	// How many threads to use. Whichever thread is idle will pick up the next frame.
-	static const int NUM_ENC_THREADS = 6;
+	static const int NUM_ENC_THREADS = 10;
 
 	// These threads do the actual encoding.
 	void encodeThread(int num);
 
-	void cacheThread(int num);
+	void diskThread(int num);
 	// Handle the output buffers in another thread so as not to block the encoders. The
 	// application can take its time, after which we return this buffer to the encoder for
 	// re-use.
@@ -58,12 +58,13 @@ private:
 
     RawOptions const *options_;
 
-	void dng_save(uint8_t const *mem, StreamInfo const &info, uint8_t const *lomem, StreamInfo const &loinfo, size_t losize,
+	size_t dng_save(int thread_num, uint8_t const *mem_tiff, uint8_t const *mem, StreamInfo const &info, uint8_t const *lomem, StreamInfo const &loinfo, size_t losize,
 			libcamera::ControlList const &metadata, std::string const &filename, std::string const &cam_name,
 			RawOptions const *options, uint64_t fn);
 
 	struct EncodeItem
 	{
+
 		void *mem;
         size_t size;
 		StreamInfo info;
@@ -79,21 +80,18 @@ private:
 	std::condition_variable encode_cond_var_;
 	std::thread encode_thread_[NUM_ENC_THREADS];
 
-	struct CachedItem
+	struct DiskItem
 	{
-		void *mem;
+		void *mem_tiff;
         size_t size;
 		StreamInfo info;
-		void *lomem;
-		size_t losize;
-		StreamInfo loinfo;
 		CompletedRequest::ControlList met;
 		int64_t timestamp_us;
 		uint64_t index;
 	};
-	boost::circular_buffer<CachedItem> cache_buffer_;
-	std::queue<CachedItem> cache_queue_;
-	std::mutex cache_mutex_;
-	std::condition_variable cache_cond_var_;
-	std::thread cache_thread_[NUM_ENC_THREADS];
+	boost::circular_buffer<DiskItem> disk_buffer_;
+	std::queue<DiskItem> disk_queue_;
+	std::mutex disk_mutex_;
+	std::condition_variable disk_cond_var_;
+	std::thread disk_thread_[NUM_ENC_THREADS];
 };

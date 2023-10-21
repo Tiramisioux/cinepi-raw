@@ -27,6 +27,14 @@ struct RawOptions : public VideoOptions
 	std::string mediaDest;
 	std::string folder;
 
+	bool awbEn;
+	int compression;
+
+	int thumbnail;
+	int thumbnailSize;
+
+	uint16_t rawCrop[4];
+
 	float wb;
 	std::string sensor;
 	std::string model;

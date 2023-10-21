@@ -34,6 +34,10 @@
 #define CONTROL_KEY_HEIGHT "height"
 #define CONTROL_KEY_MODE "mode"
 #define CONTROL_KEY_COMPRESSION "compress"
+#define CONTROL_KEY_THUMBNAIL "thumbnail"
+#define CONTROL_KEY_THUMBNAIL_SIZE "thumbnail_size"
+
+#define CONTROL_KEY_RAW_CROP "raw_crop"
 
 #define CONTROL_KEY_CAMERAINIT "cam_init"
 
@@ -70,7 +74,9 @@ class CinePIState
         int mode_;
         int compression_;
 
+        int thumbnail_;
+        int thumbnail_size_;
+
         unsigned int clip_number_;
         unsigned int still_number_;
-        
 };

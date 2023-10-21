@@ -40,18 +40,17 @@ public:
 		StreamInfo loinfo = GetStreamInfo(lostream);
 
 		FrameBuffer *buffer = completed_request->buffers[stream];
-		FrameBuffer *loBuffer = completed_request->buffers[lostream];
 
-		libcamera::Span span = Mmap(buffer)[0];
-		libcamera::Span lospan = Mmap(loBuffer)[0];
+		BufferReadSync r1(this, completed_request->buffers[stream]);
+		const std::vector<libcamera::Span<uint8_t>> mem = r1.Get();
 
-		void *mem = span.data();
-		void *lomem = lospan.data();
-
-		if (!buffer || !mem)
+		BufferReadSync r2(this, completed_request->buffers[lostream]);
+		const std::vector<libcamera::Span<uint8_t>> lomem = r2.Get();
+		
+		if (!mem[0].data())
 			throw std::runtime_error("no buffer to encode");
 
-		if (!loBuffer || !lomem)
+		if (!lomem[0].data())
 			throw std::runtime_error("no buffer to encode, thumbnail");
 			
 		auto ts = completed_request->metadata.get(controls::SensorTimestamp);
@@ -60,7 +59,7 @@ public:
 			std::lock_guard<std::mutex> lock(encode_buffer_queue_mutex_);
 			encode_buffer_queue_.push(completed_request); // creates a new reference
 		}
-		encoder_->EncodeBuffer2(buffer->planes()[0].fd.get(), span.size(), mem, info, lospan.size(), lomem, loinfo, timestamp_ns / 1000, completed_request->metadata);
+		encoder_->EncodeBuffer2(buffer->planes()[0].fd.get(), mem[0].size(), (void *)mem[0].data(), info, lomem[0].size(), (void *)lomem[0].data(), loinfo, timestamp_ns / 1000, completed_request->metadata);
 	}
 	RawOptions *GetOptions() const { return static_cast<RawOptions *>(options_.get()); }
 	DngEncoder *GetEncoder() { return encoder_.get(); }

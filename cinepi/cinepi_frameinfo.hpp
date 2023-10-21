@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <string>
 
-#include <linux/bcm2835-isp.h>
+// #include <linux/bcm2835-isp.h>
 #include <libcamera/controls.h>
 #include "core/frame_info.hpp"
 

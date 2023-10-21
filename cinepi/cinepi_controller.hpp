@@ -8,6 +8,9 @@
 #include <time.h>
 #include <stdint.h>
 
+#include <alsa/asoundlib.h>
+#include <fstream>
+
 #include "dng_encoder.hpp"
 #include "preview/preview.hpp"
 #include "core/logging.hpp"
@@ -41,17 +44,26 @@ using namespace sw::redis;
 class CinePIController : public CinePIState
 {
     public:
-        CinePIController(CinePIRecorder *app) : CinePIState(), app_(app), options_(app->GetOptions()), 
-            folderOpen(false), abortThread_(false), cameraInit_(true), cameraRunning(false), triggerStill_(0) {};
+        CinePIController(CinePIRecorder *app) 
+            : CinePIState(), 
+            app_(app),
+            folderOpen(false),
+            cameraRunning(false),
+            options_(app->GetOptions()), 
+            triggerStill_(0), 
+            cameraInit_(true), 
+            abortThread_(false) 
+        {};
         ~CinePIController() {
             abortThread_ = true;
-            main_thread_.join();
+            // main_thread_.join();
         };
 
         void start(){
             redis_ = new Redis(options_->redis.value_or(REDIS_DEFAULT));
             LOG(2, redis_->ping());
             main_thread_ = std::thread(std::bind(&CinePIController::mainThread, this));
+            // sound_thread_ = std::thread(std::bind(&CinePIController::soundThread, this));
         }
 
         void sync();
@@ -77,7 +89,7 @@ class CinePIController : public CinePIState
                 return 0;
             }
             int state = trigger_;
-            if(state < 0){
+            if(state <= 0){
                 clip_number_++;
             }
             trigger_ = 0;
@@ -95,6 +107,7 @@ class CinePIController : public CinePIState
     private:
         void mainThread();
         void pubThread();
+        void soundThread();
 
         int trigger_;
         int triggerStill_;
@@ -108,4 +121,5 @@ class CinePIController : public CinePIState
 
         bool abortThread_;
         std::thread main_thread_;
+        std::thread sound_thread_;
 };

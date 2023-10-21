@@ -11,6 +11,8 @@
 #include "dng_encoder.hpp"
 #include "output/output.hpp"
 
+#define LIBAV_PRESENT 1
+
 using namespace std::placeholders;
 
 // The main even loop for the application.
@@ -27,7 +29,7 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller)
 
 	app.OpenCamera();
 	app.StartEncoder();
-	app.GetOptions()->sensor = app.GetCamera()->properties().get(libcamera::properties::Model).value_or(app.CameraId());
+	app.GetOptions()->sensor = app.MyCameraModel()->properties().get(libcamera::properties::Model).value_or(app.CameraId());
 
 	for (unsigned int count = 0; ; count++)
 	{
@@ -37,7 +39,7 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller)
 				app.StopCamera();
 				app.Teardown();
 			}
-			app.ConfigureVideo(CinePIRecorder::FLAG_VIDEO_RAW);
+			app.ConfigureVideo(CinePIRecorder::FLAG_VIDEO_RAW, options->thumbnailSize);
 			app.StartCamera();
 			controller.cameraRunning = true;
 
@@ -91,7 +93,9 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller)
 		}
 
 		// show frame on display
-		app.ShowPreview(completed_request, app.VideoStream());        
+		// app.ShowPreview(completed_request, app.LoresStream());       
+
+		LOG(1, count); 
 	}
 }
 
@@ -106,6 +110,10 @@ int main(int argc, char *argv[])
 		if (options->Parse(argc, argv))
 		{
 			options->mediaDest = "/media/RAW";
+			options->rawCrop[0] = 0;
+			options->rawCrop[1] = 0;
+			options->rawCrop[2] = 0;
+			options->rawCrop[3] = 0;
 
 			if (options->verbose >= 2)
 				options->Print();

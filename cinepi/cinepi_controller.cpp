@@ -12,9 +12,16 @@ using namespace std::chrono;
 #define CP_DEF_HEIGHT 1080
 #define CP_DEF_FRAMERATE 30
 #define CP_DEF_ISO 400
-#define CP_DEF_SHUTTER 60
+#define CP_DEF_SHUTTER 50
 #define CP_DEF_AWB 1
-#define CP_DEF_COMPRESS 1
+#define CP_DEF_COMPRESS 0
+#define CP_DEF_THUMBNAIL 1
+#define CP_DEF_THUMBNAIL_SIZE 3
+
+#define SAMPLE_RATE 48000
+#define CHANNELS 2
+#define FORMAT SND_PCM_FORMAT_S16_LE
+#define BUFFER_SIZE 2048
 
 void CinePIController::sync(){
     auto pipe = redis_->pipeline();
@@ -26,9 +33,9 @@ void CinePIController::sync(){
                             .get(CONTROL_KEY_WB)
                             .get(CONTROL_KEY_COLORGAINS)
                             .get(CONTROL_KEY_COMPRESSION)
+                            .get(CONTROL_KEY_THUMBNAIL)
+                            .get(CONTROL_KEY_THUMBNAIL_SIZE)
                             .exec();
-
-    // width_ = stoi(pipe_replies.get<std::optional<std::string>>(0).value_or("1920"));
 
     auto width = pipe_replies.get<OptionalString>(0);
     if(width){
@@ -94,13 +101,38 @@ void CinePIController::sync(){
         ptr = strtok(NULL, ",");  
     }
 
+    auto thumbnail = pipe_replies.get<OptionalString>(8);
+    if(thumbnail){
+        thumbnail_ = stoi(*thumbnail);
+    }else{
+        thumbnail_ = CP_DEF_THUMBNAIL;
+        redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_));
+    }
+
+    auto thumbnail_size = pipe_replies.get<OptionalString>(9);
+    if(thumbnail_size){
+        thumbnail_size_ = stoi(*thumbnail_size);
+    }else{
+        thumbnail_size_ = CP_DEF_THUMBNAIL_SIZE;
+        redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_size_));
+    }
+
+    std::unordered_map<std::string, std::string> m;
+    redis_->hgetall("rawCrop", std::inserter(m, m.begin()));
+
+    options_->rawCrop[0] = std::stoi(m["offset_y_start"]);
+    options_->rawCrop[1] = std::stoi(m["offset_y_end"]);
+    options_->rawCrop[2] = std::stoi(m["offset_x_start"]);
+    options_->rawCrop[3] = std::stoi(m["offset_x_end"]);
+
+    options_->thumbnail = thumbnail_;
+    options_->thumbnailSize = thumbnail_size_;
+    
     options_->compression = compression_;
     options_->width = width_;
     options_->height = height_;
     options_->framerate = framerate_;
     options_->gain = iso_;
-
-    options_->shutter = shutter_speed_ * 1e+6;
 
     options_->awbEn = awb_;
     if(awb_)
@@ -111,8 +143,8 @@ void CinePIController::sync(){
     }
     
     options_->denoise = "off";
-    options_->lores_width = 400;
-    options_->lores_height = 200;
+    options_->lores_width = options_->width >> 2;
+    options_->lores_height = options_->height >> 2;
     options_->mode_string = "0:0:0:0";
 }
 
@@ -143,11 +175,14 @@ void CinePIController::mainThread(){
     sub.on_message([this](std::string channel, std::string msg) {
         std::cout << msg << " from: " << channel << std::endl;
 
-        if(msg.compare(CONTROL_TRIGGER_STILL) == 0){
-            triggerStill_ = !triggerStill_;
-            if(!triggerStill_){
-                still_number_++;
-            }
+        if(msg.compare(CONTROL_KEY_RAW_CROP) == 0){
+            std::unordered_map<std::string, std::string> m;
+            redis_->hgetall("rawCrop", std::inserter(m, m.begin()));
+
+            options_->rawCrop[0] = std::stoi(m["offset_y_start"]);
+            options_->rawCrop[1] = std::stoi(m["offset_y_end"]);
+            options_->rawCrop[2] = std::stoi(m["offset_x_start"]);
+            options_->rawCrop[3] = std::stoi(m["offset_x_end"]);
         }
 
         auto r = redis_->get(msg);
@@ -215,7 +250,15 @@ void CinePIController::mainThread(){
             else if(msg.compare(CONTROL_KEY_FRAMERATE) == 0){
                 framerate_ = stof(*r);
                 options_->framerate = framerate_;
-                cameraInit_ = true;
+
+                long int durationValues[2] = { static_cast<long int>(1000000.0 / framerate_),
+                                            static_cast<long int>(1000000.0 / framerate_) };
+
+                libcamera::Span<const long int, 2> durationRange(durationValues, 2);
+
+                libcamera::ControlList cl;
+                cl.set(libcamera::controls::FrameDurationLimits, durationRange);
+                app_->SetControls(cl);
             }
             else if(msg.compare(CONTROL_KEY_CAMERAINIT) == 0){
                 cameraInit_ = true;
@@ -230,7 +273,7 @@ void CinePIController::mainThread(){
                 roi_x = (roi_x - roi_width) / 2;
                 roi_y = (roi_y - roi_height) / 2;
 
-                libcamera::Rectangle sensor_area = *app_->GetCamera()->properties().get(properties::ScalerCropMaximum);
+                libcamera::Rectangle sensor_area = *app_->MyCameraModel()->properties().get(properties::ScalerCropMaximum);
                 int x = roi_x * sensor_area.width;
                 int y = roi_y * sensor_area.height;
                 int w = roi_width * sensor_area.width;
@@ -241,6 +284,13 @@ void CinePIController::mainThread(){
                 libcamera::ControlList cl;
                 cl.set(libcamera::controls::ScalerCrop, crop);
                 app_->SetControls(cl);
+            }
+            else if(msg.compare(CONTROL_KEY_THUMBNAIL) == 0){
+                options_->thumbnail = stoi(*r);
+            }
+            else if(msg.compare(CONTROL_KEY_THUMBNAIL_SIZE) == 0){
+                options_->thumbnailSize = stoi(*r);
+                cameraInit_ = true;
             }
 
             redis_->bgsave();
@@ -259,4 +309,25 @@ void CinePIController::mainThread(){
         t += milliseconds(THREAD_SLEEP_MS);
         this_thread::sleep_until(t);
     }
+}
+
+
+void CinePIController::soundThread(){
+
+    time_point<system_clock> t = system_clock::now();
+
+    LOG(1, "CINEPI_CONTROLLER SOUND THREAD STARTED");
+
+    while (true) {
+        try {
+
+        } catch (const Error &err) {
+            // Handle exceptions.
+        }
+
+        t += milliseconds(THREAD_SLEEP_MS);
+        this_thread::sleep_until(t);
+    }
+
+
 }
