@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2020, Raspberry Pi (Trading) Ltd.
  *
- * Based on mjpeg_encoder.cpp, modifcations by Csaba Nagy & Will Whang 
+ * Based on mjpeg_encoder.cpp, modifications by Csaba Nagy & Will Whang 
  *
  * dng_encoder.cpp - dng video encoder.
  */
