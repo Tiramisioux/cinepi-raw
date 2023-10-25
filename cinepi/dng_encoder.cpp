@@ -44,9 +44,11 @@ static char TIFF_GBRG[4] = { 1, 2, 0, 1 };
 
 struct BayerFormat
 {
-    const char *name;
-    int bits;
-    const char *order;
+	char const *name;
+	int bits;
+	char const *order;
+	bool packed;
+	bool compressed;
 };
 
 ttag_t TIFFTAG_FRAMERATE =  0xC764;
@@ -60,141 +62,242 @@ static const TIFFFieldInfo xtiffFieldInfo[] = {
       true, false,  timeCodestr },
 };
 
+static const std::map<PixelFormat, BayerFormat> bayer_formats = {
+	{ formats::SRGGB10_CSI2P, { "RGGB-10", 10, TIFF_RGGB, true, false } },
+	{ formats::SGRBG10_CSI2P, { "GRBG-10", 10, TIFF_GRBG, true, false } },
+	{ formats::SBGGR10_CSI2P, { "BGGR-10", 10, TIFF_BGGR, true, false } },
+	{ formats::SGBRG10_CSI2P, { "GBRG-10", 10, TIFF_GBRG, true, false } },
 
-static const std::map<PixelFormat, BayerFormat> bayer_formats =
-{
-    { formats::SRGGB10_CSI2P, { "RGGB-10", 10, TIFF_RGGB } },
-    { formats::SGRBG10_CSI2P, { "GRBG-10", 10, TIFF_GRBG } },
-    { formats::SBGGR10_CSI2P, { "BGGR-10", 10, TIFF_BGGR } },
-    { formats::SGBRG10_CSI2P, { "GBRG-10", 10, TIFF_GBRG } },
-    { formats::SRGGB12_CSI2P, { "RGGB-12", 12, TIFF_RGGB } },
-    { formats::SGRBG12_CSI2P, { "GRBG-12", 12, TIFF_GRBG } },
-    { formats::SBGGR12_CSI2P, { "BGGR-12", 12, TIFF_BGGR } },
-    { formats::SGBRG12_CSI2P, { "GBRG-12", 12, TIFF_GBRG } },
-    { formats::SRGGB12, { "RGGB-12", 12, TIFF_RGGB } },
-    { formats::SRGGB10, { "RGGB-10", 10, TIFF_RGGB } },
-    { formats::SBGGR12, { "BGGR-12", 12, TIFF_BGGR } },
-    { formats::SBGGR10, { "BGGR-10", 10, TIFF_BGGR } },
+	{ formats::SRGGB10, { "RGGB-10", 10, TIFF_RGGB, false, false } },
+	{ formats::SGRBG10, { "GRBG-10", 10, TIFF_GRBG, false, false } },
+	{ formats::SBGGR10, { "BGGR-10", 10, TIFF_BGGR, false, false } },
+	{ formats::SGBRG10, { "GBRG-10", 10, TIFF_GBRG, false, false } },
+
+	{ formats::SRGGB12_CSI2P, { "RGGB-12", 12, TIFF_RGGB, true, false } },
+	{ formats::SGRBG12_CSI2P, { "GRBG-12", 12, TIFF_GRBG, true, false } },
+	{ formats::SBGGR12_CSI2P, { "BGGR-12", 12, TIFF_BGGR, true, false } },
+	{ formats::SGBRG12_CSI2P, { "GBRG-12", 12, TIFF_GBRG, true, false } },
+
+	{ formats::SRGGB12, { "RGGB-12", 12, TIFF_RGGB, false, false } },
+	{ formats::SGRBG12, { "GRBG-12", 12, TIFF_GRBG, false, false } },
+	{ formats::SBGGR12, { "BGGR-12", 12, TIFF_BGGR, false, false } },
+	{ formats::SGBRG12, { "GBRG-12", 12, TIFF_GBRG, false, false } },
+
+	{ formats::SRGGB16, { "RGGB-16", 16, TIFF_RGGB, false, false } },
+	{ formats::SGRBG16, { "GRBG-16", 16, TIFF_GRBG, false, false } },
+	{ formats::SBGGR16, { "BGGR-16", 16, TIFF_BGGR, false, false } },
+	{ formats::SGBRG16, { "GBRG-16", 16, TIFF_GBRG, false, false } },
+
+	{ formats::R10_CSI2P, { "BGGR-10", 10, TIFF_BGGR, true, false } },
+	{ formats::R10, { "BGGR-10", 10, TIFF_BGGR, false, false } },
+	// Currently not in the main libcamera branch
+	//{ formats::R12_CSI2P, { "BGGR-12", 12, TIFF_BGGR, true } },
+	{ formats::R12, { "BGGR-12", 12, TIFF_BGGR, false, false } },
+
+	/* PiSP compressed formats. */
+	{ formats::RGGB16_PISP_COMP1, { "RGGB-16-PISP", 16, TIFF_RGGB, false, true } },
+	{ formats::GRBG16_PISP_COMP1, { "GRBG-16-PISP", 16, TIFF_GRBG, false, true } },
+	{ formats::GBRG16_PISP_COMP1, { "GBRG-16-PISP", 16, TIFF_GBRG, false, true } },
+	{ formats::BGGR16_PISP_COMP1, { "BGGR-16-PISP", 16, TIFF_BGGR, false, true } },
 };
 
-extern __attribute__((noinline, section("disasm"))) void unpack10_64(uint64_t *read, uint64_t *buffer, const uint16_t chunk){
-    for (uint64_t* write64 = buffer; write64 < buffer + chunk; write64 += 5, read += 5){
-
-        uint64_t a = *(read);
-        uint64_t b = *(read + 1);
-        uint64_t c = *(read + 2);
-        uint64_t d = *(read + 3);
-        uint64_t e = *(read + 4);
-
-        *(write64 + 0) = ((a >> 0) & 0x00FF0000FF0000FF) | ((a >>  4) & 0x0F000FFF000FFF00) | ((a << 12) & 0x0000F00000F00000) | (((b << 28) & 0xF0000000) << 32);
-        *(write64 + 1) = ((b >> 0) & 0xFF0000FF0000FF00) | ((b >>  4) & 0x000FFF000FFF000F) | ((b << 12) & 0x00F00000F0000000) | (((a >> 56) & 0x0F) << 4);
-        *(write64 + 2) = ((c >> 0) & 0x0000FF0000FF0000) | ((c >>  4) & 0x0FFF000FFF000FFF) | ((c << 12) & 0xF00000000000F000) | (((c << 28) & 0xF0000000) >> 32) | (((c >> 20) & 0x000000F0) << 32);
-        *(write64 + 3) = ((d >> 0) & 0x0000FF0000FF0000) | ((c >>  4) & 0x0FFF000FFF000FFF) | ((c << 12) & 0xF00000000000F000) | (((c << 28) & 0xF0000000) >> 32) | (((c >> 20) & 0x000000F0) << 32);
-        *(write64 + 4) = ((e >> 0) & 0x0000FF0000FF0000) | ((c >>  4) & 0x0FFF000FFF000FFF) | ((c << 12) & 0xF00000000000F000) | (((c << 28) & 0xF0000000) >> 32) | (((c >> 20) & 0x000000F0) << 32);
-    }
+// TODO.
+// uint64_t unpack method written by Csaba Nagy.
+void unpack8_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
+				const uint16_t chunk)
+{
+	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 1, read += 1)
+	{
+		uint64_t a = *(read);
+		*(write64 + 0) = a;
+	}
 }
 
+// uint64_t unpack method written by Csaba Nagy. Unpacks 32 x 10-bit pixels.
+void unpack10_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
+				 const uint16_t chunk)
+{
+	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 5, read += 5)
+	{
+		uint64_t a = *(read);
+		uint64_t b = *(read + 1);
+		uint64_t c = *(read + 2);
+		uint64_t d = *(read + 3);
+		uint64_t e = *(read + 4);
 
-extern __attribute__((noinline, section("disasm"))) void unpack12_64(uint64_t *read, uint64_t *buffer, const uint16_t chunk){
-    for (uint64_t* write64 = buffer; write64 < buffer + chunk; write64 += 3, read+=3){
+		*(write64 + 0) = (a & 0x0000ff03000000ff) | (a & 0x00fc00000000fc00) >> 2 | (a & 0x0003000000000300) << 14 |
+						 (a & 0xf000000000f00000) >> 4 | (a & 0x0f000000000f0000) << 12 |
+						 (a & 0x00000000c0000000) >> 6 | (a & 0x000000003f000000) << 10 |
+						 (a & 0x000000C000000000) >> 24 | (a & 0x0000003000000000) >> 16 |
+						 (a & 0x0000000C00000000) >> 8 | (b & 0xC000) << 40 | (b & 0x3000) << 48;
 
-        uint64_t a = *(read);
-        uint64_t b = *(read + 1);
-        uint64_t c = *(read + 2);
+		*(write64 + 1) = (b & 0xff03000000ff0300) | (b & 0x00000000fc000000) >> 2 | (b & 0x0000000003000000) << 14 |
+						 (b & 0x000000f000000000) >> 4 | (b & 0x0000000f00000000) << 12 |
+						 (b & 0x0000c000000000c0) >> 6 | (b & 0x00003f000000003f) << 10 |
+						 (b & 0x00c000000000c000) >> 24 | (b & 0x0030000000003000) >> 16 |
+						 (b & 0x000c000000000c00) >> 8 | (a & 0x0f00000000000000) >> 52;
 
-        *(write64 + 0) = ((a >> 0) & 0x00FF0000FF0000FF) | ((a >>  4) & 0x0F000FFF000FFF00) | ((a << 12) & 0x0000F00000F00000) | (((b << 28) & 0xF0000000) << 32);
-        *(write64 + 1) = ((b >> 0) & 0xFF0000FF0000FF00) | ((b >>  4) & 0x000FFF000FFF000F) | ((b << 12) & 0x00F00000F0000000) | (((a >> 56) & 0x0F) << 4);
-        *(write64 + 2) = ((c >> 0) & 0x0000FF0000FF0000) | ((c >>  4) & 0x0FFF000FFF000FFF) | ((c << 12) & 0xF00000000000F000) | (((c << 28) & 0xF0000000) >> 32) | (((c >> 20) & 0x000000F0) << 32);
-    }
+		*(write64 + 2) = (c & 0x000000ff03000000) | (c & 0x0000fc00000000fc) >> 2 | (c & 0x0000030000000003) << 14 |
+						 (c & 0x00f000000000f000) >> 4 | (c & 0x000f000000000f00) << 12 |
+						 (c & 0xc000000000c00000) >> 6 | (c & 0x3f000000003f0000) << 10 |
+						 (c & 0x00000000c0000000) >> 24 | (c & 0x0000000030000000) >> 16 |
+						 (c & 0x000000000c000000) >> 8 | (d & 0xC0) << 40 | (d & 0x30) << 48 | (d & 0xC) << 56;
+
+		*(write64 + 3) =
+			(d & 0x00ff03000000ff03) | (d & 0xfc00000000fc0000) >> 2 | (d & 0x0300000000030000) << 14 |
+			(d & 0x00000000f0000000) >> 4 | (d & 0x000000000f000000) << 12 | (d & 0x000000c000000000) >> 6 |
+			(d & 0x0000003f00000000) << 10 | (d & 0x0000c000000000c0) >> 24 | (d & 0x0000300000000030) >> 16 |
+			(d & 0x00000c000000000c) >> 8 | (e & 0x0000000000C00000) << 40 | (c & 0x3f00000000000000) >> 54;
+
+		*(write64 + 4) = (e & 0x03000000ff030000) | (e & 0x000000fc00000000) >> 2 | (e & 0x0000000300000000) << 14 |
+						 (e & 0x0000f000000000f0) >> 4 | (e & 0x00000f000000000f) << 12 |
+						 (e & 0x00c000000000c000) >> 6 | (e & 0x003f000000003f00) << 10 |
+						 (e & 0xc000000000c00000) >> 24 | (e & 0x3000000000300000) >> 16 |
+						 (e & 0x0c000000000c0000) >> 8 | (d & 0x0300000000000000) >> 50;
+	}
+}
+
+// uint64_t unpack method written by Csaba Nagy. Unpacks 16 x 12-bit pixels.
+void unpack12_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
+				 const uint16_t chunk)
+{
+	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 3, read += 3)
+	{
+		uint64_t a = *(read);
+		uint64_t b = *(read + 1);
+		uint64_t c = *(read + 2);
+
+		*(write64 + 0) = ((a >> 0) & 0x00FF0000FF0000FF) | ((a >> 4) & 0x0F000FFF000FFF00) |
+						 ((a << 12) & 0x0000F00000F00000) | (((b << 28) & 0xF0000000) << 32);
+		*(write64 + 1) = ((b >> 0) & 0xFF0000FF0000FF00) | ((b >> 4) & 0x000FFF000FFF000F) |
+						 ((b << 12) & 0x00F00000F0000000) | (((a >> 56) & 0x0F) << 4);
+		*(write64 + 2) = ((c >> 0) & 0x0000FF0000FF0000) | ((c >> 4) & 0x0FFF000FFF000FFF) |
+						 ((c << 12) & 0xF00000000000F000) | (((c << 28) & 0xF0000000) >> 32) |
+						 (((c >> 20) & 0x000000F0) << 32);
+	}
+}
+
+// TODO.
+// uint64_t unpack method written by Csaba Nagy.
+void unpack14_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
+				 const uint16_t chunk)
+{
+	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 5, read += 5)
+	{
+		uint64_t a = *(read);
+		uint64_t b = *(read + 1);
+		uint64_t c = *(read + 2);
+		uint64_t d = *(read + 3);
+		uint64_t e = *(read + 4);
+		uint64_t f = *(read + 5);
+		uint64_t g = *(read + 6);
+
+		*(write64 + 0) = a;
+		*(write64 + 1) = b;
+		*(write64 + 2) = c;
+		*(write64 + 3) = d;
+		*(write64 + 4) = e;
+		*(write64 + 5) = f;
+		*(write64 + 6) = g;
+	}
+}
+
+// TODO.
+// uint64_t unpack method written by Csaba Nagy.
+void unpack16_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
+				 const uint16_t chunk)
+{
+	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 1, read += 1)
+	{
+		uint64_t a = *(read);
+		*(write64 + 0) = a;
+	}
 }
 
 struct Matrix
 {
-Matrix(float m0, float m1, float m2,
-       float m3, float m4, float m5,
-       float m6, float m7, float m8)
-    {
-        m[0] = m0, m[1] = m1, m[2] = m2;
-        m[3] = m3, m[4] = m4, m[5] = m5;
-        m[6] = m6, m[7] = m7, m[8] = m8;
-    }
-    Matrix(float diag0, float diag1, float diag2) : Matrix(diag0, 0, 0, 0, diag1, 0, 0, 0, diag2) {}
-    Matrix() {}
-    float m[9];
-    Matrix T() const
-    {
-        return Matrix(m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]);
-    }
-    Matrix C() const
-    {
-        return Matrix(m[4] * m[8] - m[5] * m[7], -(m[3] * m[8] - m[5] * m[6]), m[3] * m[7] - m[4] * m[6],
-                      -(m[1] * m[8] - m[2] * m[7]), m[0] * m[8] - m[2] * m[6], -(m[0] * m[7] - m[1] * m[6]),
-                      m[1] * m[5] - m[2] * m[4], -(m[0] * m[5] - m[2] * m[3]), m[0] * m[4] - m[1] * m[3]);
-    }
-    Matrix Adj() const { return C().T(); }
-    float Det() const
-    {
-        return (m[0] * (m[4] * m[8] - m[5] * m[7]) -
-                m[1] * (m[3] * m[8] - m[5] * m[6]) +
-                m[2] * (m[3] * m[7] - m[4] * m[6]));
-    }
-    Matrix Inv() const { return Adj() * (1.0 / Det()); }
-    Matrix operator*(Matrix const &other) const
-    {
-        Matrix result;
-        for (int i = 0; i < 3; i++)
-            for (int j = 0; j < 3; j++)
-                result.m[i * 3 + j] =
-                    m[i * 3] * other.m[j] + m[i * 3 + 1] * other.m[3 + j] + m[i * 3 + 2] * other.m[6 + j];
-        return result;
-    }
-    Matrix operator*(float const &f) const
-    {
-        Matrix result;
-        for (int i = 0; i < 9; i++)
-            result.m[i] = m[i] * f;
-        return result;
-    }
+	Matrix(float m0, float m1, float m2, float m3, float m4, float m5, float m6, float m7, float m8)
+	{
+		m[0] = m0, m[1] = m1, m[2] = m2;
+		m[3] = m3, m[4] = m4, m[5] = m5;
+		m[6] = m6, m[7] = m7, m[8] = m8;
+	}
+	Matrix(float diag0, float diag1, float diag2) : Matrix(diag0, 0, 0, 0, diag1, 0, 0, 0, diag2) {}
+	Matrix() {}
+	float m[9];
+	Matrix T() const { return Matrix(m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]); }
+	Matrix C() const
+	{
+		return Matrix(m[4] * m[8] - m[5] * m[7], -(m[3] * m[8] - m[5] * m[6]), m[3] * m[7] - m[4] * m[6],
+					  -(m[1] * m[8] - m[2] * m[7]), m[0] * m[8] - m[2] * m[6], -(m[0] * m[7] - m[1] * m[6]),
+					  m[1] * m[5] - m[2] * m[4], -(m[0] * m[5] - m[2] * m[3]), m[0] * m[4] - m[1] * m[3]);
+	}
+	Matrix Adj() const { return C().T(); }
+	float Det() const
+	{
+		return (m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+				m[2] * (m[3] * m[7] - m[4] * m[6]));
+	}
+	Matrix Inv() const { return Adj() * (1.0 / Det()); }
+	Matrix operator*(Matrix const &other) const
+	{
+		Matrix result;
+		for (int i = 0; i < 3; i++)
+			for (int j = 0; j < 3; j++)
+				result.m[i * 3 + j] =
+					m[i * 3] * other.m[j] + m[i * 3 + 1] * other.m[3 + j] + m[i * 3 + 2] * other.m[6 + j];
+		return result;
+	}
+	Matrix operator*(float const &f) const
+	{
+		Matrix result;
+		for (int i = 0; i < 9; i++)
+			result.m[i] = m[i] * f;
+		return result;
+	}
 };
 
 #include <pthread.h>
 
 DngEncoder::DngEncoder(RawOptions const *options)
-    : Encoder(options), // Assuming you're calling the base class constructor
-      compressed(false), // Default value, adjust as needed
-      still_capture(false), // Default value, adjust as needed
-      encodeCheck_(false), // Default value, adjust as needed
-      abortEncode_(false), // Default value, adjust as needed
-      abortOutput_(false), // Default value, adjust as needed
-      resetCount_(false), // Default value, adjust as needed
-      index_(0), // Default value, adjust as needed
-      frames_(0), // Default value, adjust as needed
-      frameStop_(0), // Default value, adjust as needed
-      options_(options),
-      disk_buffer_(448)
+	: Encoder(options), // Assuming you're calling the base class constructor
+	  compressed(false), // Default value, adjust as needed
+	  still_capture(false), // Default value, adjust as needed
+	  encodeCheck_(false), // Default value, adjust as needed
+	  abortEncode_(false), // Default value, adjust as needed
+	  abortOutput_(false), // Default value, adjust as needed
+	  resetCount_(false), // Default value, adjust as needed
+	  index_(0), // Default value, adjust as needed
+	  frames_(0), // Default value, adjust as needed
+	  frameStop_(0), // Default value, adjust as needed
+	  options_(options), disk_buffer_(448)
 {
-    for (int i = 0; i < 2; i++){
-        encode_thread_[i] = std::thread(std::bind(&DngEncoder::encodeThread, this, i));
-    }
-    for (int i = 0; i < 10; i++){
-        disk_thread_[i] = std::thread(std::bind(&DngEncoder::diskThread, this, i));
-    }
+	for (int i = 0; i < NUM_ENC_THREADS; i++)
+	{
+		encode_thread_[i] = std::thread(std::bind(&DngEncoder::encodeThread, this, i));
+	}
+	for (int i = 0; i < NUM_DISK_THREADS; i++)
+	{
+		disk_thread_[i] = std::thread(std::bind(&DngEncoder::diskThread, this, i));
+	}
 
-    LOG(2, "Opened DngEncoder");
+	LOG(2, "Opened DngEncoder");
 }
 
 DngEncoder::~DngEncoder()
 {
-    abortEncode_ = true;
-    for (int i = 0; i < 2; i++){
-        encode_thread_[i].join();
-    }
-    for (int i = 0; i < 10; i++){
-        disk_thread_[i].join();
-    }
+	abortEncode_ = true;
+	for (int i = 0; i < NUM_ENC_THREADS; i++)
+	{
+		encode_thread_[i].join();
+	}
+	for (int i = 0; i < NUM_DISK_THREADS; i++)
+	{
+		disk_thread_[i].join();
+	}
 
-    abortOutput_ = true;
-    LOG(2, "DngEncoder closed");
+	abortOutput_ = true;
+	LOG(2, "DngEncoder closed");
 }
 
 void DngEncoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us)
@@ -225,7 +328,7 @@ void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const 
 #include <fcntl.h>
 #include <unistd.h>
 
-#define BUFFER_SIZE 9 * 1024 * 1024  // 16MB
+#define BUFFER_SIZE 4 * 1024 * 1024 // 16MB
 
 typedef struct {
     unsigned char* buffer;  // In-memory buffer
@@ -367,13 +470,18 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
                    0.0193339, 0.1191920, 0.9503041);
     Matrix CAM_XYZ = (RGB2XYZ * CCM * WB_GAINS).Inv();
 
-    // Finally write the DNG.
-    const uint16_t offset_y_start = options_->rawCrop[0];
-    const uint16_t offset_y_end = options_->rawCrop[1];
-    const uint16_t offset_x_start = options_->rawCrop[2];
-    const uint16_t offset_x_end = options_->rawCrop[3];
+	// Finally write the DNG.
+	// const uint16_t offset_y_start = options_->rawCrop[0];
+	// const uint16_t offset_y_end = options_->rawCrop[1];
+	// const uint16_t offset_x_start = options_->rawCrop[2];
+	// const uint16_t offset_x_end = options_->rawCrop[3];
 
-    // LOG(1, offset_x_start << " " << offset_x_end << " " << offset_y_start << " " << offset_y_end);
+	const uint16_t offset_y_start = 0;
+	const uint16_t offset_y_end = 0;
+	const uint16_t offset_x_start = 0;
+	const uint16_t offset_x_end = 0;
+
+	// LOG(1, offset_x_start << " " << offset_x_end << " " << offset_y_start << " " << offset_y_end);
 
 	const float bppf = (bayer_format.bits / 8);
 	const uint16_t byte_offset_x = (bppf * offset_x_start) / sizeof(uint64_t);
@@ -381,21 +489,16 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
 	uint16_t t_height = (info.height - (offset_y_start + offset_y_end));
 	uint16_t t_width = (info.width - (offset_x_start + offset_x_end));
 
-	if (bayer_format.bits == 10)
-	{
-		t_height = info.height;
-		t_width = info.width;
-	}
-
 	TIFF *tif = nullptr;
 	MemoryBuffer memBuf;
-    memBuf.buffer = (unsigned char*)mem_tiff;
-    if (!memBuf.buffer) {
-        fprintf(stderr, "Failed to allocate memory\n");
-        exit(1);
-    }
-    memBuf.offset = 0;
-    memBuf.usedSize = 0;
+	memBuf.buffer = (unsigned char *)mem_tiff;
+	if (!memBuf.buffer)
+	{
+		fprintf(stderr, "Failed to allocate memory\n");
+		exit(1);
+	}
+	memBuf.offset = 0;
+	memBuf.usedSize = 0;
     memBuf.totalSize = BUFFER_SIZE;
 
     LOG(2, thread_num << " Writing DNG " << fn);
@@ -534,59 +637,47 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
 
         LOG(2, thread_num << " Writing DNG main image " << fn);
 
-		if (bayer_format.bits == 10)
+		// Adjust the memory pointer based on stride and row skips
+		mem += (info.stride * offset_y_start);
+
+		const uint16_t chunk = (info.stride / sizeof(uint64_t));
+		std::vector<uint64_t> buffer(chunk);
+		for (unsigned int y = 0; y < t_height; y++)
 		{
-			uint8_t *d = (uint8_t *)mem;
-			uint64_t k = 0;
-			for (unsigned int y = 0; y < t_height; y++)
+			uint64_t *read = (uint64_t *)(mem + y * info.stride) + byte_offset_x; // Combined addition
+			switch (bayer_format.bits)
 			{
-				std::vector<uint8_t> rowBuff(info.stride);
-				for (unsigned int col = 0; col < info.stride; col += 5)
-				{
-					uint8_t px1 = d[k++];
-					uint8_t px2 = d[k++];
-					uint8_t px3 = d[k++];
-					uint8_t px4 = d[k++];
-					uint8_t split = d[k++];
-
-					rowBuff[col + 0] = px1;
-					rowBuff[col + 1] = (split & 0xC0) | px2 >> 2;
-					rowBuff[col + 2] = ((px2 << 6) & 0xff) | (split & 0x30) | (px3 >> 4);
-					rowBuff[col + 3] = ((px3 << 4) & 0xff) | (split & 0x0C) | (px4 >> 6);
-					rowBuff[col + 4] = ((px4 << 2) & 0xff) | (split & 0x03);
-				}
-
-				if (TIFFWriteScanline(tif, (uint8_t *)rowBuff.data(), y, 0) != 1)
-					throw std::runtime_error("error writing DNG image data");
-			}
-		}
-		else if (bayer_format.bits == 12)
-		{
-			// Adjust the memory pointer based on stride and row skips
-			mem += (info.stride * offset_y_start);
-			LOG(2, thread_num << " Writing buffer " << t_height);
-
-			// (info.stride / sizeof(uint64_t)) -
-			const uint16_t chunk = (info.stride / sizeof(uint64_t));
-			LOG(2, thread_num << " Writing DNG chunk: " << chunk << "Stride: " << info.stride);
-			std::vector<uint64_t> buffer(chunk);
-			for (unsigned int y = 0; y < t_height; y++)
-			{
-				uint64_t *read = (uint64_t *)(mem + y * info.stride) + byte_offset_x; // Combined addition
+			case 8:
+				unpack8_64(read, buffer.data(), chunk);
+				break;
+			case 10:
+				unpack10_64(read, buffer.data(), chunk);
+				break;
+			case 12:
 				unpack12_64(read, buffer.data(), chunk);
-				if (TIFFWriteScanline(tif, (uint8_t *)buffer.data(), y, 0) != 1)
-					throw std::runtime_error("error writing DNG image data");
+				break;
+			case 14:
+				unpack14_64(read, buffer.data(), chunk);
+				break;
+			case 16:
+				unpack16_64(read, buffer.data(), chunk);
+				break;
+			default:
+				break;
 			}
+
+			if (TIFFWriteScanline(tif, (uint8_t *)buffer.data(), y, 0) != 1)
+				throw std::runtime_error("error writing DNG image data");
 		}
 
 		TIFFCheckpointDirectory(tif);
 		offset_subifd = TIFFCurrentDirOffset(tif);
-        LOG(2, thread_num << " Writing DNG main dict " << fn);
-        TIFFWriteDirectory(tif);
+		LOG(2, thread_num << " Writing DNG main dict " << fn);
+		TIFFWriteDirectory(tif);
 
-        LOG(2, thread_num << " Writing DNG EXIF " << fn);
-        
-        TIFFCreateEXIFDirectory(tif);
+		LOG(2, thread_num << " Writing DNG EXIF " << fn);
+
+		TIFFCreateEXIFDirectory(tif);
 
         LOG(2, thread_num << " Writing DNG TIFFCreateEXIFDirectory " << fn);
         char time_str[32];
@@ -627,21 +718,12 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
 void DngEncoder::encodeThread(int num)
 {
     std::chrono::duration<double> encode_time(0);
-    EncodeItem encode_item;
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(3, &cpuset);
+	EncodeItem encode_item;
 
-    pthread_t current_thread = pthread_self();    
-    if(pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset)) {
-        std::cerr << "Error setting thread affinity" << std::endl;
-    }
-
-
-    while (true)
-    {
-        {
-            std::unique_lock<std::mutex> lock(encode_mutex_);
+	while (true)
+	{
+		{
+			std::unique_lock<std::mutex> lock(encode_mutex_);
             while (true)
             {   
                 if (!encode_queue_.empty())
@@ -654,9 +736,9 @@ void DngEncoder::encodeThread(int num)
                     encode_cond_var_.wait_for(lock, 500us);
                 }
             }
-        }
+		}
 
-        frames_ = {encode_item.index};
+		frames_ = {encode_item.index};
         LOG(1, "Thread[" << num << "] " << " encode frame: " << encode_item.index);
 
         {   
@@ -683,9 +765,8 @@ void DngEncoder::encodeThread(int num)
         {
             input_done_callback_(nullptr);
             output_ready_callback_(encode_item.mem, encode_item.size, encode_item.timestamp_us, true);
-        }       
-
-    }
+		}
+	}
 }
 
 
@@ -694,21 +775,10 @@ void DngEncoder::diskThread(int num)
 {
     DiskItem disk_item;
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(1, &cpuset);
-    CPU_SET(2, &cpuset);
-    CPU_SET(0, &cpuset);
-
-    pthread_t current_thread = pthread_self();    
-    if(pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset)) {
-        std::cerr << "Error setting thread affinity" << std::endl;
-    }
-
-    while (true)
-    {
-        {
-            std::unique_lock<std::mutex> lock(disk_mutex_);
+	while (true)
+	{
+		{
+			std::unique_lock<std::mutex> lock(disk_mutex_);
             while (true)
             {
                 if (!disk_buffer_.empty())
@@ -721,9 +791,9 @@ void DngEncoder::diskThread(int num)
                     disk_cond_var_.wait_for(lock, 1ms);
                 }
             }
-        }
+		}
 
-        char ft[128];
+		char ft[128];
         snprintf(ft, sizeof(ft), "%s/%s/%s_%09ld.dng", options_->mediaDest.c_str(), options_->folder.c_str(), options_->folder.c_str(), disk_item.index);
         
         std::string filename = std::string(ft);
@@ -758,5 +828,5 @@ void DngEncoder::diskThread(int num)
         
 
         still_capture = false;
-    }
+	}
 }

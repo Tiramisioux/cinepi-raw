@@ -37,7 +37,8 @@ public:
 
 private:
 	// How many threads to use. Whichever thread is idle will pick up the next frame.
-	static const int NUM_ENC_THREADS = 10;
+	static const int NUM_ENC_THREADS = 4;
+	static const int NUM_DISK_THREADS = 16;
 
 	// These threads do the actual encoding.
 	void encodeThread(int num);
@@ -93,5 +94,5 @@ private:
 	std::queue<DiskItem> disk_queue_;
 	std::mutex disk_mutex_;
 	std::condition_variable disk_cond_var_;
-	std::thread disk_thread_[NUM_ENC_THREADS];
+	std::thread disk_thread_[NUM_DISK_THREADS];
 };
