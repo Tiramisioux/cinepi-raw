@@ -29,7 +29,7 @@ public:
     void Read(boost::property_tree::ptree const &params) override;
     void Configure() override;
     bool Process(CompletedRequestPtr &completed_request) override;
-
+    void Teardown() override;
 
 
 private:
@@ -140,6 +140,9 @@ networkPreviewStage::networkPreviewStage(LibcameraApp *app) : PostProcessingStag
 
 networkPreviewStage::~networkPreviewStage() 
 {
+}
+
+void networkPreviewStage::Teardown(){
     streamer_.stop();
 }
 
@@ -185,10 +188,10 @@ bool networkPreviewStage::Process(CompletedRequestPtr &completed_request)
     auto endOverall = std::chrono::high_resolution_clock::now();
 
     // Logging the durations
-    LOG(2, "Duration of WriteSync: " << std::chrono::duration_cast<std::chrono::microseconds>(endWriteSync - startWriteSync).count() << " microseconds.");
-    LOG(2, "Duration of Compression: " << std::chrono::duration_cast<std::chrono::microseconds>(endCompression - startCompression).count() << " microseconds.");
-    LOG(2, "Duration of Publish: " << std::chrono::duration_cast<std::chrono::microseconds>(endPublish - startPublish).count() << " microseconds.");
-    LOG(2, "Overall Duration: " << std::chrono::duration_cast<std::chrono::microseconds>(endOverall - startOverall).count() << " microseconds.");
+    // LOG(2, "Duration of WriteSync: " << std::chrono::duration_cast<std::chrono::microseconds>(endWriteSync - startWriteSync).count() << " microseconds.");
+    // LOG(2, "Duration of Compression: " << std::chrono::duration_cast<std::chrono::microseconds>(endCompression - startCompression).count() << " microseconds.");
+    // LOG(2, "Duration of Publish: " << std::chrono::duration_cast<std::chrono::microseconds>(endPublish - startPublish).count() << " microseconds.");
+    // LOG(2, "Overall Duration: " << std::chrono::duration_cast<std::chrono::microseconds>(endOverall - startOverall).count() << " microseconds.");
 
     return false;
 }

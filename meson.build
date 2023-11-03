@@ -4,7 +4,7 @@ project('libcamera-apps', 'c', 'cpp',
         default_options : [
             'werror=false',
             'warning_level=3',
-            'cpp_std=c++17',
+            'cpp_std=c++20',
             'c_std=c11',
             'buildtype=release',
         ],
@@ -64,7 +64,7 @@ libcamera_app = library(
 
 subdir('cinepi')
 
-#subdir('apps')
+subdir('apps')
 
 summary({
             'libav encoder' : enable_libav,

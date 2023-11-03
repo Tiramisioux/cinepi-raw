@@ -12,12 +12,11 @@
 #include <libcamera/control_ids.h>
 #include <libcamera/formats.h>
 
-
 #include <tiffio.h>
 #include <tiffio.hxx>
 #include <sstream>
 #include <fstream>
-
+#include <regex>
 
 #include "core/still_options.hpp"
 #include "core/stream_info.hpp"
@@ -32,6 +31,7 @@
 #include <filesystem>
 namespace fs = std::filesystem;
 
+#define ONE_MB 1048576
 #define BLOCK_SIZE 4096 
 
 using namespace libcamera;
@@ -51,18 +51,33 @@ struct BayerFormat
 	bool compressed;
 };
 
+// CinemaDNG Tags
 ttag_t TIFFTAG_FRAMERATE =  0xC764;
 ttag_t TIFFTAG_TIMECODE = 0xC763;
+ttag_t TIFFTAG_CAMERALABEL = 0xC7A1;
+ttag_t TIFFTAG_REELNAME = 0xC789;
+ttag_t TIFFTAG_TSTOP = 0xC772;
 char frameRateStr[] = "FrameRate";
-char timeCodestr[] = "TimeCodes";
+char timeCodeStr[] = "TimeCodes";
+char cameraLabelStr[] = "CameraLabel";
+char reelNameStr[] = "ReelName";
+char tStopStr[] = "TStop";
 static const TIFFFieldInfo xtiffFieldInfo[] = {
-    { TIFFTAG_FRAMERATE, 1, 1, TIFF_RATIONAL,   FIELD_CUSTOM,
+    { TIFFTAG_FRAMERATE, 1, 1, TIFF_SRATIONAL,   FIELD_CUSTOM,
       true, false,  frameRateStr },
+    { TIFFTAG_TSTOP, 1, 1, TIFF_RATIONAL,   FIELD_CUSTOM,
+      true, false,  tStopStr },
     { TIFFTAG_TIMECODE, 8, 8, TIFF_BYTE,    FIELD_CUSTOM,
-      true, false,  timeCodestr },
+      true, false,  timeCodeStr },
+    { TIFFTAG_CAMERALABEL, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_ASCII,      FIELD_CUSTOM, 
+      true, false, cameraLabelStr },
+    { TIFFTAG_REELNAME, TIFF_VARIABLE, TIFF_VARIABLE, TIFF_ASCII,      FIELD_CUSTOM, 
+      true, false, reelNameStr }
 };
 
-static const std::map<PixelFormat, BayerFormat> bayer_formats = {
+
+static const std::map<PixelFormat, BayerFormat> bayer_formats =
+{
 	{ formats::SRGGB10_CSI2P, { "RGGB-10", 10, TIFF_RGGB, true, false } },
 	{ formats::SGRBG10_CSI2P, { "GRBG-10", 10, TIFF_GRBG, true, false } },
 	{ formats::SBGGR10_CSI2P, { "BGGR-10", 10, TIFF_BGGR, true, false } },
@@ -101,203 +116,131 @@ static const std::map<PixelFormat, BayerFormat> bayer_formats = {
 	{ formats::BGGR16_PISP_COMP1, { "BGGR-16-PISP", 16, TIFF_BGGR, false, true } },
 };
 
-// TODO.
-// uint64_t unpack method written by Csaba Nagy.
-void unpack8_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
-				const uint16_t chunk)
-{
-	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 1, read += 1)
-	{
-		uint64_t a = *(read);
-		*(write64 + 0) = a;
-	}
+void pack_10bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
+    // 5 bytes can hold 4 10-bit pixels
+    // Every iteration of the loop processes 4 pixels (40 bits)
+    for (size_t i = 0; i < num_pixels; i += 4) {
+        dst[0] = src[i] >> 2;                               // Highest 8 bits of pixel 1
+        dst[1] = (src[i] << 6) | (src[i + 1] >> 4);         // Lowest 2 bits of pixel 1 + highest 6 bits of pixel 2
+        dst[2] = (src[i + 1] << 4) | (src[i + 2] >> 6);     // Lowest 4 bits of pixel 2 + highest 4 bits of pixel 3
+        dst[3] = (src[i + 2] << 2) | (src[i + 3] >> 8);     // Lowest 6 bits of pixel 3 + highest 2 bits of pixel 4
+        dst[4] = src[i + 3];                                // Lowest 8 bits of pixel 4
+
+        dst += 5; // Move to the next 5 bytes
+    }
 }
 
-// uint64_t unpack method written by Csaba Nagy. Unpacks 32 x 10-bit pixels.
-void unpack10_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
-				 const uint16_t chunk)
-{
-	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 5, read += 5)
-	{
-		uint64_t a = *(read);
-		uint64_t b = *(read + 1);
-		uint64_t c = *(read + 2);
-		uint64_t d = *(read + 3);
-		uint64_t e = *(read + 4);
+void pack_12bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
+    // 3 bytes can hold 2 12-bit pixels
+    // Every iteration of the loop processes 2 pixels (24 bits)
+    for (size_t i = 0; i < num_pixels; i += 2) {
+        dst[0] = src[i] >> 4;                               // Highest 8 bits of pixel 1
+        dst[1] = (src[i] << 4) | (src[i + 1] >> 8);         // Lowest 4 bits of pixel 1 + highest 4 bits of pixel 2
+        dst[2] = src[i + 1];                                // Lowest 8 bits of pixel 2
 
-		*(write64 + 0) = (a & 0x0000ff03000000ff) | (a & 0x00fc00000000fc00) >> 2 | (a & 0x0003000000000300) << 14 |
-						 (a & 0xf000000000f00000) >> 4 | (a & 0x0f000000000f0000) << 12 |
-						 (a & 0x00000000c0000000) >> 6 | (a & 0x000000003f000000) << 10 |
-						 (a & 0x000000C000000000) >> 24 | (a & 0x0000003000000000) >> 16 |
-						 (a & 0x0000000C00000000) >> 8 | (b & 0xC000) << 40 | (b & 0x3000) << 48;
-
-		*(write64 + 1) = (b & 0xff03000000ff0300) | (b & 0x00000000fc000000) >> 2 | (b & 0x0000000003000000) << 14 |
-						 (b & 0x000000f000000000) >> 4 | (b & 0x0000000f00000000) << 12 |
-						 (b & 0x0000c000000000c0) >> 6 | (b & 0x00003f000000003f) << 10 |
-						 (b & 0x00c000000000c000) >> 24 | (b & 0x0030000000003000) >> 16 |
-						 (b & 0x000c000000000c00) >> 8 | (a & 0x0f00000000000000) >> 52;
-
-		*(write64 + 2) = (c & 0x000000ff03000000) | (c & 0x0000fc00000000fc) >> 2 | (c & 0x0000030000000003) << 14 |
-						 (c & 0x00f000000000f000) >> 4 | (c & 0x000f000000000f00) << 12 |
-						 (c & 0xc000000000c00000) >> 6 | (c & 0x3f000000003f0000) << 10 |
-						 (c & 0x00000000c0000000) >> 24 | (c & 0x0000000030000000) >> 16 |
-						 (c & 0x000000000c000000) >> 8 | (d & 0xC0) << 40 | (d & 0x30) << 48 | (d & 0xC) << 56;
-
-		*(write64 + 3) =
-			(d & 0x00ff03000000ff03) | (d & 0xfc00000000fc0000) >> 2 | (d & 0x0300000000030000) << 14 |
-			(d & 0x00000000f0000000) >> 4 | (d & 0x000000000f000000) << 12 | (d & 0x000000c000000000) >> 6 |
-			(d & 0x0000003f00000000) << 10 | (d & 0x0000c000000000c0) >> 24 | (d & 0x0000300000000030) >> 16 |
-			(d & 0x00000c000000000c) >> 8 | (e & 0x0000000000C00000) << 40 | (c & 0x3f00000000000000) >> 54;
-
-		*(write64 + 4) = (e & 0x03000000ff030000) | (e & 0x000000fc00000000) >> 2 | (e & 0x0000000300000000) << 14 |
-						 (e & 0x0000f000000000f0) >> 4 | (e & 0x00000f000000000f) << 12 |
-						 (e & 0x00c000000000c000) >> 6 | (e & 0x003f000000003f00) << 10 |
-						 (e & 0xc000000000c00000) >> 24 | (e & 0x3000000000300000) >> 16 |
-						 (e & 0x0c000000000c0000) >> 8 | (d & 0x0300000000000000) >> 50;
-	}
+        dst += 3; // Move to the next 3 bytes
+    }
 }
 
-// uint64_t unpack method written by Csaba Nagy. Unpacks 16 x 12-bit pixels.
-void unpack12_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
-				 const uint16_t chunk)
-{
-	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 3, read += 3)
-	{
-		uint64_t a = *(read);
-		uint64_t b = *(read + 1);
-		uint64_t c = *(read + 2);
+void pack_14bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
+    // 4 bytes can hold 2 14-bit pixels
+    // Every iteration of the loop processes 2 pixels (28 bits)
+    for (size_t i = 0; i < num_pixels; i += 2) {
+        dst[0] = src[i] >> 6;                               // Highest 8 bits of pixel 1
+        dst[1] = (src[i] << 2) | (src[i + 1] >> 12);        // Lowest 6 bits of pixel 1 + highest 2 bits of pixel 2
+        dst[2] = (src[i + 1] >> 4);                         // Next 8 bits of pixel 2
+        dst[3] = src[i + 1] << 4;                           // Lowest 4 bits of pixel 2
 
-		*(write64 + 0) = ((a >> 0) & 0x00FF0000FF0000FF) | ((a >> 4) & 0x0F000FFF000FFF00) |
-						 ((a << 12) & 0x0000F00000F00000) | (((b << 28) & 0xF0000000) << 32);
-		*(write64 + 1) = ((b >> 0) & 0xFF0000FF0000FF00) | ((b >> 4) & 0x000FFF000FFF000F) |
-						 ((b << 12) & 0x00F00000F0000000) | (((a >> 56) & 0x0F) << 4);
-		*(write64 + 2) = ((c >> 0) & 0x0000FF0000FF0000) | ((c >> 4) & 0x0FFF000FFF000FFF) |
-						 ((c << 12) & 0xF00000000000F000) | (((c << 28) & 0xF0000000) >> 32) |
-						 (((c >> 20) & 0x000000F0) << 32);
-	}
-}
-
-// TODO.
-// uint64_t unpack method written by Csaba Nagy.
-void unpack14_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
-				 const uint16_t chunk)
-{
-	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 5, read += 5)
-	{
-		uint64_t a = *(read);
-		uint64_t b = *(read + 1);
-		uint64_t c = *(read + 2);
-		uint64_t d = *(read + 3);
-		uint64_t e = *(read + 4);
-		uint64_t f = *(read + 5);
-		uint64_t g = *(read + 6);
-
-		*(write64 + 0) = a;
-		*(write64 + 1) = b;
-		*(write64 + 2) = c;
-		*(write64 + 3) = d;
-		*(write64 + 4) = e;
-		*(write64 + 5) = f;
-		*(write64 + 6) = g;
-	}
-}
-
-// TODO.
-// uint64_t unpack method written by Csaba Nagy.
-void unpack16_64(uint64_t *__attribute__((aligned(8))) read, uint64_t *__attribute__((aligned(8))) buffer,
-				 const uint16_t chunk)
-{
-	for (uint64_t *write64 = buffer; write64 < buffer + chunk; write64 += 1, read += 1)
-	{
-		uint64_t a = *(read);
-		*(write64 + 0) = a;
-	}
+        dst += 4; // Move to the next 4 bytes
+    }
 }
 
 struct Matrix
 {
-	Matrix(float m0, float m1, float m2, float m3, float m4, float m5, float m6, float m7, float m8)
-	{
-		m[0] = m0, m[1] = m1, m[2] = m2;
-		m[3] = m3, m[4] = m4, m[5] = m5;
-		m[6] = m6, m[7] = m7, m[8] = m8;
-	}
-	Matrix(float diag0, float diag1, float diag2) : Matrix(diag0, 0, 0, 0, diag1, 0, 0, 0, diag2) {}
-	Matrix() {}
-	float m[9];
-	Matrix T() const { return Matrix(m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]); }
-	Matrix C() const
-	{
-		return Matrix(m[4] * m[8] - m[5] * m[7], -(m[3] * m[8] - m[5] * m[6]), m[3] * m[7] - m[4] * m[6],
-					  -(m[1] * m[8] - m[2] * m[7]), m[0] * m[8] - m[2] * m[6], -(m[0] * m[7] - m[1] * m[6]),
-					  m[1] * m[5] - m[2] * m[4], -(m[0] * m[5] - m[2] * m[3]), m[0] * m[4] - m[1] * m[3]);
-	}
-	Matrix Adj() const { return C().T(); }
-	float Det() const
-	{
-		return (m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
-				m[2] * (m[3] * m[7] - m[4] * m[6]));
-	}
-	Matrix Inv() const { return Adj() * (1.0 / Det()); }
-	Matrix operator*(Matrix const &other) const
-	{
-		Matrix result;
-		for (int i = 0; i < 3; i++)
-			for (int j = 0; j < 3; j++)
-				result.m[i * 3 + j] =
-					m[i * 3] * other.m[j] + m[i * 3 + 1] * other.m[3 + j] + m[i * 3 + 2] * other.m[6 + j];
-		return result;
-	}
-	Matrix operator*(float const &f) const
-	{
-		Matrix result;
-		for (int i = 0; i < 9; i++)
-			result.m[i] = m[i] * f;
-		return result;
-	}
+Matrix(float m0, float m1, float m2,
+       float m3, float m4, float m5,
+       float m6, float m7, float m8)
+    {
+        m[0] = m0, m[1] = m1, m[2] = m2;
+        m[3] = m3, m[4] = m4, m[5] = m5;
+        m[6] = m6, m[7] = m7, m[8] = m8;
+    }
+    Matrix(float diag0, float diag1, float diag2) : Matrix(diag0, 0, 0, 0, diag1, 0, 0, 0, diag2) {}
+    Matrix() {}
+    float m[9];
+    Matrix T() const
+    {
+        return Matrix(m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]);
+    }
+    Matrix C() const
+    {
+        return Matrix(m[4] * m[8] - m[5] * m[7], -(m[3] * m[8] - m[5] * m[6]), m[3] * m[7] - m[4] * m[6],
+                      -(m[1] * m[8] - m[2] * m[7]), m[0] * m[8] - m[2] * m[6], -(m[0] * m[7] - m[1] * m[6]),
+                      m[1] * m[5] - m[2] * m[4], -(m[0] * m[5] - m[2] * m[3]), m[0] * m[4] - m[1] * m[3]);
+    }
+    Matrix Adj() const { return C().T(); }
+    float Det() const
+    {
+        return (m[0] * (m[4] * m[8] - m[5] * m[7]) -
+                m[1] * (m[3] * m[8] - m[5] * m[6]) +
+                m[2] * (m[3] * m[7] - m[4] * m[6]));
+    }
+    Matrix Inv() const { return Adj() * (1.0 / Det()); }
+    Matrix operator*(Matrix const &other) const
+    {
+        Matrix result;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                result.m[i * 3 + j] =
+                    m[i * 3] * other.m[j] + m[i * 3 + 1] * other.m[3 + j] + m[i * 3 + 2] * other.m[6 + j];
+        return result;
+    }
+    Matrix operator*(float const &f) const
+    {
+        Matrix result;
+        for (int i = 0; i < 9; i++)
+            result.m[i] = m[i] * f;
+        return result;
+    }
 };
 
 #include <pthread.h>
 
 DngEncoder::DngEncoder(RawOptions const *options)
-	: Encoder(options), // Assuming you're calling the base class constructor
-	  compressed(false), // Default value, adjust as needed
-	  still_capture(false), // Default value, adjust as needed
-	  encodeCheck_(false), // Default value, adjust as needed
-	  abortEncode_(false), // Default value, adjust as needed
-	  abortOutput_(false), // Default value, adjust as needed
-	  resetCount_(false), // Default value, adjust as needed
-	  index_(0), // Default value, adjust as needed
-	  frames_(0), // Default value, adjust as needed
-	  frameStop_(0), // Default value, adjust as needed
-	  options_(options), disk_buffer_(448)
+    : Encoder(options), // Assuming you're calling the base class constructor
+      encoder_initialized_(false),
+      encodeCheck_(false),
+      abortEncode_(false), 
+      abortOutput_(false), 
+      resetCount_(false), 
+      index_(0), 
+      frames_(0), 
+      options_(options)
 {
-	for (int i = 0; i < NUM_ENC_THREADS; i++)
-	{
-		encode_thread_[i] = std::thread(std::bind(&DngEncoder::encodeThread, this, i));
-	}
-	for (int i = 0; i < NUM_DISK_THREADS; i++)
-	{
-		disk_thread_[i] = std::thread(std::bind(&DngEncoder::diskThread, this, i));
-	}
+    console = spdlog::stdout_color_mt("dng_encoder");
 
-	LOG(2, "Opened DngEncoder");
+    for (int i = 0; i < NUM_ENC_THREADS; i++){
+        encode_thread_[i] = std::thread(std::bind(&DngEncoder::encodeThread, this, i));
+    }
+    for (int i = 0; i < NUM_DISK_THREADS; i++){
+        disk_thread_[i] = std::thread(std::bind(&DngEncoder::diskThread, this, i));
+    }
+
+    console->info("DngEncoder started!");
 }
 
 DngEncoder::~DngEncoder()
 {
-	abortEncode_ = true;
-	for (int i = 0; i < NUM_ENC_THREADS; i++)
-	{
-		encode_thread_[i].join();
-	}
-	for (int i = 0; i < NUM_DISK_THREADS; i++)
-	{
-		disk_thread_[i].join();
-	}
+    abortEncode_ = true;
+    for (int i = 0; i < NUM_ENC_THREADS; i++){
+        encode_thread_[i].join();
+    }
+    for (int i = 0; i < NUM_DISK_THREADS; i++){
+        disk_thread_[i].join();
+    }
 
-	abortOutput_ = true;
-	LOG(2, "DngEncoder closed");
+    abortOutput_ = true;
+    console->info("DngEncoder stopped!");
 }
 
 void DngEncoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us)
@@ -321,14 +264,161 @@ void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const 
     }
 }
 
+void DngEncoder::setup_encoder(libcamera::StreamConfiguration const &cfg, libcamera::StreamConfiguration const &lo_cfg, CompletedRequest::ControlList const &metadata)
+{
+    // Check the Bayer format
+    auto it = bayer_formats.find(cfg.pixelFormat);
+    if (it == bayer_formats.end())
+        throw std::runtime_error("unsupported Bayer format");
+    BayerFormat const &bayer_format = it->second;
+    console->debug("Bayer format is {}", bayer_format.name);
+
+    dng_info.bits = bayer_format.bits;
+
+    // white level
+    dng_info.white = (1 << bayer_format.bits) - 1;
+
+    // black_level configuartion
+    dng_info.black = 4096 * (1 << dng_info.bits) / 65536.0;
+    std::fill(std::begin(dng_info.black_levels), std::end(dng_info.black_levels), dng_info.black);
+
+    auto bl = metadata.get(controls::SensorBlackLevels);
+    if (bl)
+    {
+        // levels is in the order R, Gr, Gb, B. Re-order it for the actual bayer order.
+        for (int i = 0; i < 4; i++)
+        {
+            int j = bayer_format.order[i];
+            j = j == 0 ? 0 : (j == 2 ? 3 : 1 + !!bayer_format.order[i ^ 1]);
+            dng_info.black_levels[j] = (*bl)[i] * (1 << dng_info.bits) / 65536.0;
+        }
+    }
+    else
+        console->error("WARNING: no black level found, using default");
+
+    // AnalogBalance -- Nuetral setup
+    std::fill(std::begin(dng_info.NEUTRAL), std::end(dng_info.NEUTRAL), 1);
+    std::fill(std::begin(dng_info.ANALOGBALANCE), std::end(dng_info.ANALOGBALANCE), 1);
+
+
+    // CCM Configuration
+    Matrix WB_GAINS(1, 1, 1);
+    auto cg = metadata.get(controls::ColourGains);
+    if (cg)
+    {
+        dng_info.NEUTRAL[0] = 1.0 / (*cg)[0];
+        dng_info.NEUTRAL[2] = 1.0 / (*cg)[1];
+        WB_GAINS = Matrix((*cg)[0], 1, (*cg)[1]);
+    }
+
+    // Use a slightly plausible default CCM in case the metadata doesn't have one (it should!).
+    Matrix CCM(1.90255, -0.77478, -0.12777,
+               -0.31338, 1.88197, -0.56858,
+               -0.06001, -0.61785, 1.67786);
+    auto ccm = metadata.get(controls::ColourCorrectionMatrix);
+    if (ccm)
+    {
+        CCM = Matrix((*ccm)[0], (*ccm)[1], (*ccm)[2], (*ccm)[3], (*ccm)[4], (*ccm)[5], (*ccm)[6], (*ccm)[7], (*ccm)[8]);
+    }
+    else
+        console->error("WARNING: no CCM metadata found");
+
+    // This maxtrix from http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
+    Matrix RGB2XYZ(0.4124564, 0.3575761, 0.1804375,
+                   0.2126729, 0.7151522, 0.0721750,
+                   0.0193339, 0.1191920, 0.9503041);
+    Matrix CAM_XYZ = (RGB2XYZ * CCM * WB_GAINS).Inv();
+    std::copy(std::begin(CAM_XYZ.m), std::end(CAM_XYZ.m), std::begin(dng_info.CAM_XYZ));
+
+    // cfa
+    dng_info.cfa_repeat_pattern_dim[0] = 2;
+    dng_info.cfa_repeat_pattern_dim[1] = 2;
+    dng_info.black_level_repeat_dim[0] = 2;
+    dng_info.black_level_repeat_dim[1] = 2;
+    dng_info.bayer_order = strdup(bayer_format.order);
+
+    // offsets
+    // dng_info.offset_y_start = options_->rawCrop[0];
+    // dng_info.offset_y_end = options_->rawCrop[1];
+    // dng_info.offset_x_start = options_->rawCrop[2];
+    // dng_info.offset_x_end = options_->rawCrop[3];
+
+    dng_info.offset_y_start = 0;
+    dng_info.offset_y_end = 0;
+    dng_info.offset_x_start = 0;
+    dng_info.offset_x_end = 0;
+
+    // const float bppf = (dng_bits/8);
+    // const uint16_t byte_offset_x = (bppf * offset_x_start) / sizeof(uint64_t); 
+    // // const uint16_t read_length_x = (1.5 * (info.width - (offset_x_start+offset_x_end))) / sizeof(uint64_t);
+    dng_info.t_height = (cfg.size.height - (dng_info.offset_y_start+dng_info.offset_y_end));
+    dng_info.t_width = (cfg.size.width - (dng_info.offset_x_start+dng_info.offset_x_end));
+
+    // thumbnail config
+    dng_info.thumbType = options_->thumbnail;
+    dng_info.thumbWidth = 32;
+    dng_info.thumbHeight = 32;
+    dng_info.thumbPhotometric = PHOTOMETRIC_MINISBLACK;
+    dng_info.thumbBitsPerSample = 8;
+    dng_info.thumbSamplesPerPixel = 1;
+    unsigned int thumbnail_size = dng_info.thumbWidth * dng_info.thumbHeight;
+
+    switch(dng_info.thumbType){
+        case 1:
+            dng_info.thumbWidth = lo_cfg.stride;
+            dng_info.thumbHeight = lo_cfg.size.height;
+            thumbnail_size = dng_info.thumbWidth * dng_info.thumbHeight;
+            break;
+        case 2:
+            dng_info.thumbWidth = lo_cfg.size.width;
+            dng_info.thumbHeight = lo_cfg.size.height;
+            dng_info.thumbSamplesPerPixel = 3;
+            dng_info.thumbPhotometric = PHOTOMETRIC_RGB;
+            thumbnail_size = lo_cfg.stride*3*lo_cfg.size.height;
+            break;
+    }
+
+    // buffer_size calculation
+    const unsigned int dng_wrapper_size = 20000; // ~20kb, much smaller in practice.  
+    const unsigned int frame_size = (cfg.size.width * cfg.size.height * dng_info.bits) / 8;
+    const unsigned long bytes = frame_size + dng_wrapper_size + thumbnail_size;
+    dng_info.buffer_size = ((bytes + ONE_MB - 1) / ONE_MB) * ONE_MB;
+
+    // compression and other
+    dng_info.compression = COMPRESSION_NONE;
+
+    // extra metadata
+    dng_info.make = "Raspberry Pi";
+    dng_info.model = options_->model;
+    dng_info.serial = getHwId();
+    dng_info.software = "Libcamera;cinepi-raw";
+    dng_info.ucm = options_->ucm.value_or("CinePI");
+
+    // adjust disk_buffer
+    const double MAX_RAM_FRACTION = 2.0 / 3.0;
+    std::ifstream meminfo("/proc/meminfo");
+    std::string content((std::istreambuf_iterator<char>(meminfo)), std::istreambuf_iterator<char>());
+
+    std::regex memAvailRegex(R"(MemAvailable:\s+(\d+)\s+kB)");
+    std::smatch match;
+
+    size_t totalRam = 0;
+    if (std::regex_search(content, match, memAvailRegex)) {
+        totalRam = std::stoull(match[1]) * 1024;  // Convert kilobytes to bytes
+    }
+    max_buffer_frames = (MAX_RAM_FRACTION * totalRam) / dng_info.buffer_size;
+
+    console->debug("Max Frames in Buffer: {}", max_buffer_frames);
+
+    encoder_initialized_ = true;
+    console->info("DngEncoder is setup!");
+}
 
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-
-#define BUFFER_SIZE 4 * 1024 * 1024 // 16MB
 
 typedef struct {
     unsigned char* buffer;  // In-memory buffer
@@ -390,125 +480,50 @@ int myTIFFCloseProc(thandle_t fd) {
 }
 
 
-size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t const *mem, StreamInfo const &info, uint8_t const *lomem, StreamInfo const &loinfo, size_t losize,
-              ControlList const &metadata, std::string const &filename,
-              std::string const &cam_name, RawOptions const *options, uint64_t fn)
+size_t DngEncoder::dng_save(int thread_num, uint8_t const *mem_tiff, uint8_t const *mem, StreamInfo const &info, uint8_t const *lomem, StreamInfo const &loinfo, size_t losize,
+              ControlList const &metadata, uint64_t fn)
 {
-    
-    uint8_t rawUniq[8]; 
-    memset(rawUniq, 0, sizeof(rawUniq));
-    auto rU = metadata.get(libcamera::controls::SensorTimestamp);
-    if(rU){
-        memcpy(rawUniq, (uint8_t*)&(*rU), sizeof(rawUniq));
+    const DngInfo& constDngInfo = dng_info;
+
+    // get raw unique value as sensor timestamp
+    std::array<uint8_t, 8> rawUniq = {};
+    if (auto rU = metadata.get(libcamera::controls::SensorTimestamp)) {
+        std::copy_n(reinterpret_cast<uint8_t*>(&*rU), rawUniq.size(), rawUniq.begin());
     }
 
-    // Check the Bayer format
-    auto it = bayer_formats.find(info.pixel_format);
-    if (it == bayer_formats.end())
-        throw std::runtime_error("unsupported Bayer format");
-    BayerFormat const &bayer_format = it->second;
-    LOG(2, "Bayer format is " << bayer_format.name);
-
-    // We need to fish out some metadata values for the DNG.
-    float black = 4096 * (1 << bayer_format.bits) / 65536.0;
-    float black_levels[] = { black, black, black, black };
-    auto bl = metadata.get(controls::SensorBlackLevels);
-    if (bl)
-    {
-        // levels is in the order R, Gr, Gb, B. Re-order it for the actual bayer order.
-        for (int i = 0; i < 4; i++)
-        {
-            int j = bayer_format.order[i];
-            j = j == 0 ? 0 : (j == 2 ? 3 : 1 + !!bayer_format.order[i ^ 1]);
-            black_levels[j] = (*bl)[i] * (1 << bayer_format.bits) / 65536.0;
-        }
-    }
-    else
-        LOG_ERROR("WARNING: no black level found, using default");
-
+    // get shutter speed
     auto exp = metadata.get(controls::ExposureTime);
     float exp_time = 10000;
     if (exp)
         exp_time = *exp;
     else
-        LOG_ERROR("WARNING: default to exposure time of " << exp_time << "us");
+        console->error("WARNING: default to exposure time of {}us", exp_time);
     exp_time /= 1e6;
 
+    // get iso
     auto ag = metadata.get(controls::AnalogueGain);
     uint16_t iso = 100;
     if (ag)
         iso = *ag * 100.0;
     else
-        LOG_ERROR("WARNING: default to ISO value of " << iso);
+        console->error("WARNING: default to ISO value of {}", iso);
 
-    float NEUTRAL[] = { 1, 1, 1 };
-    float ANALOGBALANCE[] = { 1, 1, 1 };
-    Matrix WB_GAINS(1, 1, 1);
-    auto cg = metadata.get(controls::ColourGains);
-    if (cg)
-    {
-        NEUTRAL[0] = 1.0 / (*cg)[0];
-        NEUTRAL[2] = 1.0 / (*cg)[1];
-        WB_GAINS = Matrix((*cg)[0], 1, (*cg)[1]);
+    // begin writing TIFF/DNG
+    TIFF *tif = nullptr;
+    MemoryBuffer memBuf;
+    memBuf.buffer = (unsigned char*)mem_tiff;
+    if (!memBuf.buffer) {
+        console->error("Failed to allocate memory\n");
+        exit(1);
     }
+    memBuf.offset = 0;
+    memBuf.usedSize = 0;
+    memBuf.totalSize = constDngInfo.buffer_size;
 
-    // Use a slightly plausible default CCM in case the metadata doesn't have one (it should!).
-    Matrix CCM(1.90255, -0.77478, -0.12777,
-               -0.31338, 1.88197, -0.56858,
-               -0.06001, -0.61785, 1.67786);
-    auto ccm = metadata.get(controls::ColourCorrectionMatrix);
-    if (ccm)
-    {
-        CCM = Matrix((*ccm)[0], (*ccm)[1], (*ccm)[2], (*ccm)[3], (*ccm)[4], (*ccm)[5], (*ccm)[6], (*ccm)[7], (*ccm)[8]);
-    }
-    else
-        LOG_ERROR("WARNING: no CCM metadata found");
-
-    // This maxtrix from http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
-    Matrix RGB2XYZ(0.4124564, 0.3575761, 0.1804375,
-                   0.2126729, 0.7151522, 0.0721750,
-                   0.0193339, 0.1191920, 0.9503041);
-    Matrix CAM_XYZ = (RGB2XYZ * CCM * WB_GAINS).Inv();
-
-	// Finally write the DNG.
-	// const uint16_t offset_y_start = options_->rawCrop[0];
-	// const uint16_t offset_y_end = options_->rawCrop[1];
-	// const uint16_t offset_x_start = options_->rawCrop[2];
-	// const uint16_t offset_x_end = options_->rawCrop[3];
-
-	const uint16_t offset_y_start = 0;
-	const uint16_t offset_y_end = 0;
-	const uint16_t offset_x_start = 0;
-	const uint16_t offset_x_end = 0;
-
-	// LOG(1, offset_x_start << " " << offset_x_end << " " << offset_y_start << " " << offset_y_end);
-
-	const float bppf = (bayer_format.bits / 8);
-	const uint16_t byte_offset_x = (bppf * offset_x_start) / sizeof(uint64_t);
-	// const uint16_t read_length_x = (1.5 * (info.width - (offset_x_start+offset_x_end))) / sizeof(uint64_t);
-	uint16_t t_height = (info.height - (offset_y_start + offset_y_end));
-	uint16_t t_width = (info.width - (offset_x_start + offset_x_end));
-
-	TIFF *tif = nullptr;
-	MemoryBuffer memBuf;
-	memBuf.buffer = (unsigned char *)mem_tiff;
-	if (!memBuf.buffer)
-	{
-		fprintf(stderr, "Failed to allocate memory\n");
-		exit(1);
-	}
-	memBuf.offset = 0;
-	memBuf.usedSize = 0;
-    memBuf.totalSize = BUFFER_SIZE;
-
-    LOG(2, thread_num << " Writing DNG " << fn);
+    console->trace("thrd: {} Writing DNG {}", thread_num, fn);
     try
     {
-
-        const short cfa_repeat_pattern_dim[] = { 2, 2 };
-        uint32_t white = (1 << bayer_format.bits) - 1;
         toff_t offset_subifd = 0, offset_exififd = 0;
-
 
         tif = TIFFClientOpen("memory", "w", (thandle_t)&memBuf,
                                    myTIFFReadProc, myTIFFWriteProc,
@@ -518,102 +533,86 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
         if (!tif)
             throw std::runtime_error("could not open file " + fn);
         
-        
-        uint16_t thumbWidth = 32;
-        uint16_t thumbHeight = 32;
-        uint16_t thumbPhotometric = PHOTOMETRIC_MINISBLACK;
-        uint16_t thumbBitsPerSample = 8;
-        uint16_t thumbSamplesPerPixel = 1;
-
-        if(options_->thumbnail == 1){
-            thumbWidth = loinfo.stride;
-            thumbHeight = loinfo.height;
-        } else if(options_->thumbnail == 2){
-            thumbWidth = loinfo.width;
-            thumbHeight = loinfo.height;
-            thumbSamplesPerPixel = 3;
-            thumbPhotometric = PHOTOMETRIC_RGB;
-        }
-
-        LOG(2, thread_num << " Writing DNG thumbnail" << fn);
-
+        console->trace("thrd: {} Writing DNG thumbnail {}", thread_num, fn);
         TIFFSetField(tif, TIFFTAG_SUBFILETYPE, 1);
-        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, thumbWidth);
-        TIFFSetField(tif, TIFFTAG_IMAGELENGTH, thumbHeight);
-        TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, thumbBitsPerSample);
-        TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
-        TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, thumbPhotometric );
-        TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, thumbSamplesPerPixel);
-        TIFFSetField(tif, TIFFTAG_MAKE, "Raspberry Pi");
-        TIFFSetField(tif, TIFFTAG_MODEL, options_->sensor.c_str());
+        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, constDngInfo.thumbWidth);
+        TIFFSetField(tif, TIFFTAG_IMAGELENGTH, constDngInfo.thumbHeight);
+        TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, constDngInfo.thumbBitsPerSample);
+        TIFFSetField(tif, TIFFTAG_COMPRESSION, constDngInfo.compression);
+        TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, constDngInfo.thumbPhotometric );
+        TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, constDngInfo.thumbSamplesPerPixel);
+        TIFFSetField(tif, TIFFTAG_MAKE, constDngInfo.make.c_str());
+        TIFFSetField(tif, TIFFTAG_MODEL, constDngInfo.model.c_str());
+        TIFFSetField(tif, TIFFTAG_UNIQUECAMERAMODEL, constDngInfo.ucm.c_str());
+        TIFFSetField(tif, TIFFTAG_CAMERASERIALNUMBER, constDngInfo.serial.c_str());
+        TIFFSetField(tif, TIFFTAG_RAWDATAUNIQUEID, rawUniq.data());
+        TIFFSetField(tif, TIFFTAG_SOFTWARE, constDngInfo.software.c_str());
         TIFFSetField(tif, TIFFTAG_DNGVERSION, "\001\004\000\000");
         TIFFSetField(tif, TIFFTAG_DNGBACKWARDVERSION, "\001\001\000\000");
-        TIFFSetField(tif, TIFFTAG_UNIQUECAMERAMODEL, options_->serial.c_str());
-        TIFFSetField(tif, TIFFTAG_RAWDATAUNIQUEID, rawUniq);
         TIFFSetField(tif, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
         TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-        TIFFSetField(tif, TIFFTAG_SOFTWARE, "Libcamera;cinepi-raw");
-        TIFFSetField(tif, TIFFTAG_COLORMATRIX1, 9, CAM_XYZ.m);
-        TIFFSetField(tif, TIFFTAG_ASSHOTNEUTRAL, 3, NEUTRAL);
+        TIFFSetField(tif, TIFFTAG_COLORMATRIX1, 9, constDngInfo.CAM_XYZ);
+        TIFFSetField(tif, TIFFTAG_ASSHOTNEUTRAL, 3, constDngInfo.NEUTRAL);
         TIFFSetField(tif, TIFFTAG_CALIBRATIONILLUMINANT1, 21);
         TIFFSetField(tif, TIFFTAG_SUBIFD, 1, &offset_subifd);
         TIFFSetField(tif, TIFFTAG_EXIFIFD, offset_exififd);
 
-        if(options_->thumbnail == 0){
-            size_t tSize = thumbWidth * thumbHeight;
-            uint8_t *thumb = (uint8_t*)malloc(tSize);
-            memset(thumb, 0, tSize);
-            TIFFWriteRawStrip(tif, 0, thumb, tSize);
-            free(thumb);
-        } else if(options_->thumbnail == 1){
-            uint8_t* Y_data = const_cast<uint8_t*>(lomem);
-            TIFFWriteRawStrip(tif, 0, Y_data, thumbWidth * thumbHeight);
-        } else if(options_->thumbnail == 2){
-            size_t rowSize = loinfo.stride*3;
-            size_t thumbSize = rowSize*loinfo.height;
-            uint8_t *thumb = (uint8_t*)malloc(thumbSize);
-            uint8_t *read = &thumb[0];
-            if(nv21_to_rgb(thumb, lomem, loinfo.stride, loinfo.height) != 1){
-                throw std::runtime_error("error converting yuv2rgb image data");
+        switch (constDngInfo.thumbType) {
+            case 0: {
+                // a small 32x32 black thumbnail as a placeholder.
+                size_t tSize = constDngInfo.thumbWidth * constDngInfo.thumbHeight;
+                std::vector<uint8_t> thumb(tSize, 0);
+                TIFFWriteRawStrip(tif, 0, thumb.data(), tSize);
+                break;
             }
-            // TIFFWriteRawStrip(tif, 0, read, thumbSize);
-            for(unsigned int y = 0; y < loinfo.height; y++){
-                if (TIFFWriteScanline(tif, (read + y*rowSize), y, 0) != 1)
-                    throw std::runtime_error("error writing DNG image data");
-                
+            case 1: {
+                // a luma only thumbnail from YUV data.
+                uint8_t* Y_data = const_cast<uint8_t*>(lomem);
+                TIFFWriteRawStrip(tif, 0, Y_data, constDngInfo.thumbWidth * constDngInfo.thumbHeight);
+                break;
             }
-            free(thumb);
-            LOG(1, "made thumb!");
+            case 2: {
+                // a small RGB thumbnail. (
+                size_t rowSize = loinfo.stride*3;
+                size_t thumbSize = rowSize*loinfo.height;
+                std::vector<uint8_t> thumb(thumbSize);
+                uint8_t *read = thumb.data();
+                if(nv21_to_rgb(read, lomem, loinfo.stride, loinfo.height) != 1){
+                    throw std::runtime_error("error converting yuv2rgb image data");
+                }
+                for(unsigned int y = 0; y < loinfo.height; y++){
+                    if (TIFFWriteScanline(tif, (read + y*rowSize), y, 0) != 1)
+                        throw std::runtime_error("error writing DNG image data");   
+                }
+                break;
+            }
         }
 
         TIFFCheckpointDirectory(tif);
         TIFFWriteDirectory(tif);
 
-        LOG(2, thread_num << " Writing DNG scanline end " << fn);
-        
-        LOG(2, thread_num << " Writing DNG main image " << fn);
-
+        console->trace("thrd: {} Writing DNG thumbnail end {}", thread_num, fn);
+    
         // The main image (actually tends to show up as "sub-image 1").
         TIFFSetField(tif, TIFFTAG_SUBFILETYPE, 0);
-        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, t_width);
-        TIFFSetField(tif, TIFFTAG_IMAGELENGTH, t_height);
-        TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, bayer_format.bits);
+        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, constDngInfo.t_width);
+        TIFFSetField(tif, TIFFTAG_IMAGELENGTH, constDngInfo.t_height);
+        TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, constDngInfo.bits);
         TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_NONE );
         TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_CFA);
         TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
         TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
-        TIFFSetField(tif, TIFFTAG_CFAREPEATPATTERNDIM, cfa_repeat_pattern_dim);
+        TIFFSetField(tif, TIFFTAG_CFAREPEATPATTERNDIM, constDngInfo.cfa_repeat_pattern_dim);
 #if TIFFLIB_VERSION >= 20201219 // version 4.2.0 or later
-        TIFFSetField(tif, TIFFTAG_CFAPATTERN, 4, bayer_format.order);
+        TIFFSetField(tif, TIFFTAG_CFAPATTERN, 4, constDngInfo.bayer_order);
 #else
-        TIFFSetField(tif, TIFFTAG_CFAPATTERN, bayer_format.order);
+        TIFFSetField(tif, TIFFTAG_CFAPATTERN, constDngInfo.bayer_order);
 #endif
-        TIFFSetField(tif, TIFFTAG_WHITELEVEL, 1, &white);
-        const uint16_t black_level_repeat_dim[] = { 2, 2 };
-        TIFFSetField(tif, TIFFTAG_BLACKLEVELREPEATDIM, &black_level_repeat_dim);
-        TIFFSetField(tif, TIFFTAG_BLACKLEVEL, 4, &black_levels);
+        TIFFSetField(tif, TIFFTAG_WHITELEVEL, 1, &constDngInfo.white);
+        TIFFSetField(tif, TIFFTAG_BLACKLEVELREPEATDIM, &constDngInfo.black_level_repeat_dim);
+        TIFFSetField(tif, TIFFTAG_BLACKLEVEL, 4, &constDngInfo.black_levels);
         
-        TIFFSetField(tif, TIFFTAG_ANALOGBALANCE, 3, ANALOGBALANCE);
+        TIFFSetField(tif, TIFFTAG_ANALOGBALANCE, 3, constDngInfo.ANALOGBALANCE);
         TIFFSetField(tif, TIFFTAG_BASELINEEXPOSURE, 1.0);
         TIFFSetField(tif, TIFFTAG_BASELINENOISE, 1.0);
         TIFFSetField(tif, TIFFTAG_BASELINESHARPNESS, 1.0);
@@ -623,63 +622,75 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
         time_t t;
         time(&t);
         struct tm *time_info = localtime(&t);
-        TIFFMergeFieldInfo(tif, xtiffFieldInfo, 2);
+        TIFFMergeFieldInfo(tif, xtiffFieldInfo, 5);
         const double frameRate = (double)*options_->framerate;
         TIFFSetField(tif, TIFFTAG_FRAMERATE, &frameRate);
+
+        const uint8_t frames = static_cast<uint8_t>(fn % static_cast<int>(frameRate));
+        const uint8_t seconds = static_cast<uint8_t>(time_info->tm_sec);
+        const uint8_t minutes = static_cast<uint8_t>(time_info->tm_min);
+        const uint8_t hours = static_cast<uint8_t>(time_info->tm_hour);
+
         const char timecode[] = { 
-            static_cast<char>(fn % static_cast<uint8_t>(frameRate)),
-            static_cast<char>(time_info->tm_sec),
-            static_cast<char>(time_info->tm_min),
-            static_cast<char>(time_info->tm_hour), 
-            0, 0, 0, 0 
+            static_cast<char>((frames / 10) << 4 | (frames % 10)),     // Tens of Frames and Units of Frames
+            static_cast<char>((seconds / 10) << 4 | (seconds % 10)),   // Tens of Seconds and Units of Seconds
+            static_cast<char>((minutes / 10) << 4 | (minutes % 10)),   // Tens of Minutes and Units of Minutes
+            static_cast<char>((hours / 10) << 4 | (hours % 10)),       // Tens of Hours and Units of Hours
+            0,  // BG 2
+            0,  // BG 4
+            0,  // BG 6
+            0   // BG 8
         };
         TIFFSetField(tif, TIFFTAG_TIMECODE, &timecode);
 
-        LOG(2, thread_num << " Writing DNG main image " << fn);
+        // capture the originationTimeCode for the first frame, used by sound module for sync. 
+        if(fn == 0){
+            originationTimeCode = {hours, minutes, seconds, frames, timecode[3], timecode[2], timecode[1], timecode[0]};
+            originationDate = {(uint16_t)(time_info->tm_year + 1900),  (uint16_t)(time_info->tm_mon + 1), (uint16_t)time_info->tm_mday};
+        }
+        
+        //TIFFSetField(tif, TIFFTAG_CAMERALABEL, "Camera A");
+        //TIFFSetField(tif, TIFFTAG_REELNAME, "A0000_001234");
+        // const double tstop = 2.0;
+        //TIFFSetField(tif, TIFFTAG_TSTOP, &tstop);
 
-		// Adjust the memory pointer based on stride and row skips
-		mem += (info.stride * offset_y_start);
+        console->trace("thrd: {} Writing DNG main image {}", thread_num, fn);
 
-		const uint16_t chunk = (info.stride / sizeof(uint64_t));
-		std::vector<uint64_t> buffer(chunk);
-		for (unsigned int y = 0; y < t_height; y++)
-		{
-			uint64_t *read = (uint64_t *)(mem + y * info.stride) + byte_offset_x; // Combined addition
-			switch (bayer_format.bits)
-			{
-			case 8:
-				unpack8_64(read, buffer.data(), chunk);
-				break;
-			case 10:
-				unpack10_64(read, buffer.data(), chunk);
-				break;
-			case 12:
-				unpack12_64(read, buffer.data(), chunk);
-				break;
-			case 14:
-				unpack14_64(read, buffer.data(), chunk);
-				break;
-			case 16:
-				unpack16_64(read, buffer.data(), chunk);
-				break;
-			default:
-				break;
-			}
+        auto main_image_start = std::chrono::high_resolution_clock::now();
 
-			if (TIFFWriteScanline(tif, (uint8_t *)buffer.data(), y, 0) != 1)
-				throw std::runtime_error("error writing DNG image data");
-		}
+        const unsigned int num_pixels = constDngInfo.t_height * constDngInfo.t_width;
+        const size_t data_size = (num_pixels * constDngInfo.bits ) / 8;
+        std::vector<uint8_t> packed_data(data_size);
 
-		TIFFCheckpointDirectory(tif);
-		offset_subifd = TIFFCurrentDirOffset(tif);
-		LOG(2, thread_num << " Writing DNG main dict " << fn);
-		TIFFWriteDirectory(tif);
+        auto packData = [&](int bits) -> uint8_t* {
+            switch(constDngInfo.bits) {
+                case 10: pack_10bit_data((uint16_t*)mem, (uint8_t*)packed_data.data(), num_pixels); return (uint8_t*)packed_data.data();
+                case 12: pack_12bit_data((uint16_t*)mem, (uint8_t*)packed_data.data(), num_pixels); return (uint8_t*)packed_data.data();
+                case 14: pack_14bit_data((uint16_t*)mem, (uint8_t*)packed_data.data(), num_pixels); return (uint8_t*)packed_data.data();
+                case 8:
+                case 16:
+                default: return (uint8_t*)mem;
+            }
+        };
 
-		LOG(2, thread_num << " Writing DNG EXIF " << fn);
+        int size = (constDngInfo.bits == 8 || constDngInfo.bits == 16) ? info.stride * info.height : data_size;
+        TIFFWriteRawStrip(tif, 0, packData(constDngInfo.bits), size);
 
-		TIFFCreateEXIFDirectory(tif);
+        auto main_image_end = std::chrono::high_resolution_clock::now();
+        auto main_image_duration = std::chrono::duration_cast<std::chrono::milliseconds>(main_image_end - main_image_start).count();
 
-        LOG(2, thread_num << " Writing DNG TIFFCreateEXIFDirectory " << fn);
+        console->debug("main image written to dng: {}ms", main_image_duration);
+
+        TIFFCheckpointDirectory(tif);
+        offset_subifd = TIFFCurrentDirOffset(tif);
+        console->trace("thrd: {} Writing DNG main dict {}", thread_num, fn);
+        TIFFWriteDirectory(tif);
+
+        console->trace("thrd: {} Writing DNG EXIF {}", thread_num, fn);
+        
+        TIFFCreateEXIFDirectory(tif);
+
+        console->trace("thrd: {} Writing DNG TIFFCreateEXIFDirectory {}", thread_num, fn);
         char time_str[32];
         strftime(time_str, 32, "%Y:%m:%d %H:%M:%S", time_info);
         TIFFSetField(tif, EXIFTAG_DATETIMEORIGINAL, time_str);
@@ -693,13 +704,11 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
         TIFFSetDirectory(tif, 0);
         TIFFSetField(tif, TIFFTAG_EXIFIFD, offset_exififd);
 
-        LOG(2, thread_num << " Writing DNG DICT " << fn);
         TIFFWriteDirectory(tif);
         TIFFUnlinkDirectory(tif, 2);
         TIFFClose(tif);
 
-        LOG(2, thread_num << " Writing DNG TIFFClose " << fn);
-
+        console->trace("thrd: {} Writing DNG TIFFClose {}", thread_num, fn);
         return memBuf.usedSize;
     }
     catch (std::exception const &e)
@@ -718,12 +727,12 @@ size_t DngEncoder::dng_save(int thread_num,uint8_t const *mem_tiff, uint8_t cons
 void DngEncoder::encodeThread(int num)
 {
     std::chrono::duration<double> encode_time(0);
-	EncodeItem encode_item;
+    EncodeItem encode_item;
 
-	while (true)
-	{
-		{
-			std::unique_lock<std::mutex> lock(encode_mutex_);
+    while (true)
+    {
+        {
+            std::unique_lock<std::mutex> lock(encode_mutex_);
             while (true)
             {   
                 if (!encode_queue_.empty())
@@ -736,37 +745,38 @@ void DngEncoder::encodeThread(int num)
                     encode_cond_var_.wait_for(lock, 500us);
                 }
             }
-		}
+        }
 
-		frames_ = {encode_item.index};
-        LOG(1, "Thread[" << num << "] " << " encode frame: " << encode_item.index);
+        frames_ = {encode_item.index};
+        console->trace("Thread[{}] encode frame: {}", num, encode_item.index);
 
         {   
             auto start_time = std::chrono::high_resolution_clock::now();
             
             uint8_t *mem_tiff;
-            if (posix_memalign((void **)&mem_tiff, BLOCK_SIZE, BUFFER_SIZE) != 0) {
+            if (posix_memalign((void **)&mem_tiff, BLOCK_SIZE, dng_info.buffer_size) != 0) {
                 perror("Error allocating aligned memory");
                 return;
             }
-            size_t tiff_size = dng_save(num,(const uint8_t*) mem_tiff,(const uint8_t*)encode_item.mem, encode_item.info, (const uint8_t*)encode_item.lomem, encode_item.loinfo, encode_item.losize, encode_item.met, "MEM", "CINEPI-2K", options_, encode_item.index);
+            size_t tiff_size = dng_save(num,(const uint8_t*) mem_tiff,(const uint8_t*)encode_item.mem, encode_item.info, (const uint8_t*)encode_item.lomem, encode_item.loinfo, encode_item.losize, encode_item.met, encode_item.index);
             DiskItem item = { mem_tiff, tiff_size, encode_item.info, encode_item.met, encode_item.timestamp_us, encode_item.index};
 
             std::lock_guard<std::mutex> lock(disk_mutex_);
-            disk_buffer_.push_back(std::move(item));
+            disk_buffer_.push(std::move(item));
             int amount = disk_buffer_.size();
             disk_cond_var_.notify_all();
             auto end_time = std::chrono::high_resolution_clock::now();
 
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-            LOG(1, "Thread[" << num << "] " << encode_item.index << " Time taken for the encode: " << duration << " milliseconds, disk buffer count:"<< amount << " Size:" << tiff_size << std::endl);
+            console->info("Thread[{}] {} Time taken for the encode: {} milliseconds, disk buffer count:{} Size:{}", num, encode_item.index, duration, amount, tiff_size);
         }
 
         {
             input_done_callback_(nullptr);
             output_ready_callback_(encode_item.mem, encode_item.size, encode_item.timestamp_us, true);
-		}
-	}
+        }       
+
+    }
 }
 
 
@@ -775,58 +785,58 @@ void DngEncoder::diskThread(int num)
 {
     DiskItem disk_item;
 
-	while (true)
-	{
-		{
-			std::unique_lock<std::mutex> lock(disk_mutex_);
+    while (true)
+    {
+        {
+            std::unique_lock<std::mutex> lock(disk_mutex_);
             while (true)
             {
                 if (!disk_buffer_.empty())
                 {
                     disk_item = disk_buffer_.front();
-                    disk_buffer_.pop_front();
+                    disk_buffer_.pop();
                     break;
                 }
                 else{
                     disk_cond_var_.wait_for(lock, 1ms);
                 }
             }
-		}
+        }
 
-		char ft[128];
-        snprintf(ft, sizeof(ft), "%s/%s/%s_%09ld.dng", options_->mediaDest.c_str(), options_->folder.c_str(), options_->folder.c_str(), disk_item.index);
-        
-        std::string filename = std::string(ft);
+        std::ostringstream oss;
+        oss << options_->mediaDest << '/' 
+            << options_->folder << '/' 
+            << options_->folder << '_'
+            << std::setw(9) << std::setfill('0') << disk_item.index 
+            << ".dng";
+
+        std::string filename = oss.str();
     
-        LOG(1, "Thread[" << num << "] " << " Save frame to disk: " << disk_item.index);
+        console->trace("Thread[{}]  Save frame to disk: {}", num,  disk_item.index);
         
+        auto start_time = std::chrono::high_resolution_clock::now();
+        // Now save the memory buffer to disk
+        int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_DIRECT, 0644);
+        if (fd != -1) {
 
-            auto start_time = std::chrono::high_resolution_clock::now();
-            // Now save the memory buffer to disk
-            int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_DIRECT, 0644);
-            if (fd != -1) {
-
-                // Provide sequential access hint
-                posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-                posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE);
-                if(write(fd, disk_item.mem_tiff, BUFFER_SIZE) != BUFFER_SIZE) {
-                    perror("Error writing to file");
-                }
-                ftruncate(fd, disk_item.size);
-                close(fd);
-
-            } else {
-                fprintf(stderr, "Failed to open file for writing\n");
+            // Provide sequential access hint
+            posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+            posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE);
+            if(write(fd, disk_item.mem_tiff, dng_info.buffer_size) != dng_info.buffer_size) {
+                perror("Error writing to file");
             }
-            // Clean up
-            free(disk_item.mem_tiff);
-            auto end_time = std::chrono::high_resolution_clock::now();
+            ftruncate(fd, disk_item.size);
+            close(fd);
 
-            // 3. Calculate and print the difference
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-            LOG(1, "Thread[" << num << "] " << disk_item.index << " Time taken for the disk io: " << duration << " milliseconds" << std::endl);
+        } else {
+            fprintf(stderr, "Failed to open file for writing\n");
+        }
+        // Clean up
+        free(disk_item.mem_tiff);
+        auto end_time = std::chrono::high_resolution_clock::now();
+
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        console->info("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
         
-
-        still_capture = false;
-	}
+    }
 }

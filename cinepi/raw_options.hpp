@@ -35,10 +35,13 @@ struct RawOptions : public VideoOptions
 
 	uint16_t rawCrop[4];
 
+	uint8_t mic_gain;
+
 	float wb;
 	std::string sensor;
 	std::string model;
 	std::string make;
+	std::optional<std::string> ucm;
 	std::string serial;
 
 	float clipping;

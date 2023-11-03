@@ -19,8 +19,6 @@
 #include <thread>
 
 #define CONTROL_TRIGGER_RECORD "rec"
-#define CONTROL_TRIGGER_STILL "stll"
-#define CONTROL_TRIGGER_TIMELASPSE "tlps"
 
 #define CONTROL_KEY_RECORD "is_recording"
 #define CONTROL_KEY_ISO "iso"
@@ -47,16 +45,16 @@ class CinePIState
         CinePIState() : is_recording_(false), clip_number_(0), still_number_(0) {};
         ~CinePIState() {};
 
+        void setRecording(bool state){
+            is_recording_ = state;
+        }
+
         bool isRecording(){
             return is_recording_;
         }
 
         unsigned int getClipNumber(){
             return clip_number_;
-        }
-
-        unsigned int getStillNumber(){
-            return still_number_;
         }
 
     protected:

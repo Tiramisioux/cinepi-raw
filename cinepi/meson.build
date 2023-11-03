@@ -24,13 +24,22 @@ sources = [
   'cinepi_raw.cpp',
   'dng_encoder.cpp',
   'cinepi_controller.cpp',
+  'cinepi_sound.cpp',
   'cinepi_state.cpp',
   'utils.cpp'
 ]
 
-#alsa_dep = dependency('alsa')
 
-cinepi_raw_dep = [tiff_dep, hiredis_lib, redis_plus_plus_lib, boost_dep, thread_dep, libcamera_dep, libcamera_app_dep]
+spdlog_dep = dependency('spdlog')
+json_dep = dependency('jsoncpp')
+
+cinepi_raw_dep = [tiff_dep, hiredis_lib, redis_plus_plus_lib, boost_dep, thread_dep, libcamera_dep, libcamera_app_dep, spdlog_dep, json_dep]
+
+alsa_dep = dependency('alsa')
+udev_dep = dependency('libudev')
+cinepi_raw_dep += alsa_dep
+cinepi_raw_dep += udev_dep
+
 
 
 # Executable

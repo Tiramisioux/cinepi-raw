@@ -134,7 +134,7 @@ public:
 
 	void ConfigureViewfinder();
 	void ConfigureStill(unsigned int flags = FLAG_STILL_NONE);
-	void ConfigureVideo(unsigned int flags = FLAG_VIDEO_NONE, uint8_t thumbnailFactor = 3);
+	void ConfigureVideo(unsigned int flags = FLAG_VIDEO_NONE);
 	void ConfigureZsl(unsigned int still_flags = FLAG_STILL_NONE);
 
 	void Teardown();
@@ -158,10 +158,6 @@ public:
 		return GetCameras(camera_manager_.get());
 	}
 
-	libcamera::Camera *MyCameraModel() const {
-		return camera_.get();
-	}
-
 	void ShowPreview(CompletedRequestPtr &completed_request, Stream *stream);
 
 	void SetControls(const ControlList &controls);
@@ -183,6 +179,7 @@ public:
 
 	friend class BufferWriteSync;
 	friend class BufferReadSync;
+	friend struct Options;
 
 protected:
 	std::unique_ptr<Options> options_;
@@ -233,6 +230,7 @@ private:
 		Stream *stream;
 	};
 
+	void initCameraManager();
 	void setupCapture();
 	void makeRequests();
 	void queueRequest(CompletedRequest *completed_request);
@@ -245,6 +243,7 @@ private:
 	Mode selectMode(const Mode &mode) const;
 
 	std::unique_ptr<CameraManager> camera_manager_;
+	std::vector<std::shared_ptr<libcamera::Camera>> cameras_;
 	std::shared_ptr<Camera> camera_;
 	bool camera_acquired_ = false;
 	std::unique_ptr<CameraConfiguration> configuration_;

@@ -5,6 +5,9 @@
  * libcamera_encoder.cpp - libcamera video encoding class.
  */
 
+#ifndef CINEPI_RECORDER_HPP
+#define CINEPI_RECORDER_HPP
+
 #include "core/libcamera_app.hpp"
 #include "core/stream_info.hpp"
 #include "raw_options.hpp"
@@ -36,6 +39,12 @@ public:
 	{
 		assert(encoder_);
 
+		if(!encoder_->initialized()){
+			libcamera::StreamConfiguration const &cfg = stream->configuration();
+			libcamera::StreamConfiguration const &lo_cfg = lostream->configuration();
+			encoder_->setup_encoder(cfg, lo_cfg, completed_request->metadata);
+		}
+
 		StreamInfo info = GetStreamInfo(stream);
 		StreamInfo loinfo = GetStreamInfo(lostream);
 
@@ -55,6 +64,7 @@ public:
 			
 		auto ts = completed_request->metadata.get(controls::SensorTimestamp);
 		int64_t timestamp_ns = ts ? *ts : buffer->metadata().timestamp;
+		encoder_->log_ts(timestamp_ns);
 		{
 			std::lock_guard<std::mutex> lock(encode_buffer_queue_mutex_);
 			encode_buffer_queue_.push(completed_request); // creates a new reference
@@ -97,3 +107,4 @@ private:
 	EncodeOutputReadyCallback encode_output_ready_callback_;
 	MetadataReadyCallback metadata_ready_callback_;
 };
+#endif // CINEPI_RECORDER_HPP
