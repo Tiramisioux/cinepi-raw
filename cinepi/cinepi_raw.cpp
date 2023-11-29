@@ -46,22 +46,22 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 				app.StopCamera();
 				app.Teardown();
 			}
-			app.ConfigureVideo(CinePIRecorder::FLAG_VIDEO_RAW, options->thumbnailSize);
+			app.ConfigureVideo(CinePIRecorder::FLAG_VIDEO_RAW);
 			app.StartCamera();
 			controller.cameraRunning = true;
 
 			libcamera::StreamConfiguration const &cfg = app.RawStream()->configuration();
 			console->info("Raw stream: {}x{} : {} : {}", cfg.size.width, cfg.size.height, cfg.stride, cfg.pixelFormat.toString());
 			app.GetEncoder()->reset_encoder();
-			// controller.process_stream_info(cfg);
+			controller.process_stream_info(cfg);
 		}
 
 		CinePIRecorder::Msg msg = app.Wait();
 
-		if (msg.type == LibcameraApp::MsgType::Quit)
+		if (msg.type == RPiCamApp::MsgType::Quit)
 			return;
 
-		if (msg.type == LibcameraApp::MsgType::Timeout)
+		if (msg.type == RPiCamApp::MsgType::Timeout)
 		{
 			console->error("Device timeout detected, attempting a restart!!!");
 			app.StopCamera();
@@ -75,8 +75,6 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 		// parse the frame info metadata for the current frame, publish to redis stats channel
 		controller.process(completed_request);
-
-				// console->critical("SOUND LEVEL: {}:{} | {}:{}",sound.vu_meter[0], sound.vu_meter[2], sound.vu_meter[1], sound.vu_meter[3]);
 
 		// check for record trigger signal, open a new folder if rec_start or reset frame count if _rec_stop
 		int trigger = controller.triggerRec();
@@ -99,7 +97,7 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		}
 
 		// show frame on display
-		app.ShowPreview(completed_request, app.GetMainStream());       
+		// app.ShowPreview(completed_request, app.GetMainStream());       
 
 		console->info("Frame Number: {}", count);
 	}

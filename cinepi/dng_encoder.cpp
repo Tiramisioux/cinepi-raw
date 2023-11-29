@@ -23,8 +23,11 @@
 
 #include "dng_encoder.hpp"
 #include <arm_neon.h>
-#include "lj92.h"
 #include "utils.hpp"
+
+// extern "C" {
+// #include "lj92.h"
+// }
 
 #include "yuv2rgb.hpp"
 
@@ -116,6 +119,12 @@ static const std::map<PixelFormat, BayerFormat> bayer_formats =
 	{ formats::BGGR16_PISP_COMP1, { "BGGR-16-PISP", 16, TIFF_BGGR, false, true } },
 };
 
+void pack_8bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
+    for (size_t i = 0; i < num_pixels; i++) {
+        dst[0] = src[i];
+    }
+}
+
 void pack_10bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
     // 5 bytes can hold 4 10-bit pixels
     // Every iteration of the loop processes 4 pixels (40 bits)
@@ -143,17 +152,23 @@ void pack_12bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
 }
 
 void pack_14bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
-    // 4 bytes can hold 2 14-bit pixels
-    // Every iteration of the loop processes 2 pixels (28 bits)
-    for (size_t i = 0; i < num_pixels; i += 2) {
-        dst[0] = src[i] >> 6;                               // Highest 8 bits of pixel 1
-        dst[1] = (src[i] << 2) | (src[i + 1] >> 12);        // Lowest 6 bits of pixel 1 + highest 2 bits of pixel 2
-        dst[2] = (src[i + 1] >> 4);                         // Next 8 bits of pixel 2
-        dst[3] = src[i + 1] << 4;                           // Lowest 4 bits of pixel 2
+    // Ensure that we have enough pixels (must be a multiple of 4)
+    if (num_pixels % 4 != 0) return;
 
-        dst += 4; // Move to the next 4 bytes
+    // Every iteration of the loop processes 4 pixels (56 bits)
+    for (size_t i = 0; i < num_pixels; i += 4) {
+        dst[0] = (src[i] >> 6);                                  // Highest 8 bits of pixel 1
+        dst[1] = ((src[i] & 0x3F) << 2) | (src[i + 1] >> 12);    // Lowest 6 bits of pixel 1 and highest 2 bits of pixel 2
+        dst[2] = (src[i + 1] >> 4) & 0xFF;                       // Middle 8 bits of pixel 2
+        dst[3] = ((src[i + 1] & 0xF) << 4) | (src[i + 2] >> 10); // Lowest 4 bits of pixel 2 and highest 4 bits of pixel 3
+        dst[4] = (src[i + 2] >> 2) & 0xFF;                       // Middle 8 bits of pixel 3
+        dst[5] = ((src[i + 2] & 0x3) << 6) | (src[i + 3] >> 8);  // Lowest 2 bits of pixel 3 and highest 6 bits of pixel 4
+        dst[6] = src[i + 3] & 0xFF;                              // Lowest 8 bits of pixel 4
+
+        dst += 7; // Move to the next 7 bytes
     }
 }
+
 
 struct Matrix
 {
@@ -274,9 +289,10 @@ void DngEncoder::setup_encoder(libcamera::StreamConfiguration const &cfg, libcam
     console->debug("Bayer format is {}", bayer_format.name);
 
     dng_info.bits = bayer_format.bits;
+    dng_info.bits = 12;
 
     // white level
-    dng_info.white = (1 << bayer_format.bits) - 1;
+    dng_info.white = (1 << dng_info.bits) - 1;
 
     // black_level configuartion
     dng_info.black = 4096 * (1 << dng_info.bits) / 65536.0;
@@ -381,6 +397,7 @@ void DngEncoder::setup_encoder(libcamera::StreamConfiguration const &cfg, libcam
     // buffer_size calculation
     const unsigned int dng_wrapper_size = 20000; // ~20kb, much smaller in practice.  
     const unsigned int frame_size = (cfg.size.width * cfg.size.height * dng_info.bits) / 8;
+    // const unsigned int frame_size = (cfg.stride * cfg.size.height);
     const unsigned long bytes = frame_size + dng_wrapper_size + thumbnail_size;
     dng_info.buffer_size = ((bytes + ONE_MB - 1) / ONE_MB) * ONE_MB;
 
@@ -595,10 +612,10 @@ size_t DngEncoder::dng_save(int thread_num, uint8_t const *mem_tiff, uint8_t con
     
         // The main image (actually tends to show up as "sub-image 1").
         TIFFSetField(tif, TIFFTAG_SUBFILETYPE, 0);
-        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, constDngInfo.t_width);
+        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, info.stride/2);
         TIFFSetField(tif, TIFFTAG_IMAGELENGTH, constDngInfo.t_height);
         TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, constDngInfo.bits);
-        TIFFSetField(tif, TIFFTAG_COMPRESSION, COMPRESSION_NONE );
+        TIFFSetField(tif, TIFFTAG_COMPRESSION, constDngInfo.compression);
         TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_CFA);
         TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
         TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
@@ -649,25 +666,25 @@ size_t DngEncoder::dng_save(int thread_num, uint8_t const *mem_tiff, uint8_t con
             originationDate = {(uint16_t)(time_info->tm_year + 1900),  (uint16_t)(time_info->tm_mon + 1), (uint16_t)time_info->tm_mday};
         }
         
-        //TIFFSetField(tif, TIFFTAG_CAMERALABEL, "Camera A");
-        //TIFFSetField(tif, TIFFTAG_REELNAME, "A0000_001234");
-        // const double tstop = 2.0;
-        //TIFFSetField(tif, TIFFTAG_TSTOP, &tstop);
+        TIFFSetField(tif, TIFFTAG_CAMERALABEL, "Camera A");
+        TIFFSetField(tif, TIFFTAG_REELNAME, "A0000_001234");
+        const double tstop = 2.0;
+        TIFFSetField(tif, TIFFTAG_TSTOP, &tstop);
 
         console->trace("thrd: {} Writing DNG main image {}", thread_num, fn);
 
         auto main_image_start = std::chrono::high_resolution_clock::now();
 
-        const unsigned int num_pixels = constDngInfo.t_height * constDngInfo.t_width;
+        const unsigned int num_pixels = constDngInfo.t_height * (info.stride/2);
         const size_t data_size = (num_pixels * constDngInfo.bits ) / 8;
         std::vector<uint8_t> packed_data(data_size);
 
         auto packData = [&](int bits) -> uint8_t* {
-            switch(constDngInfo.bits) {
+            switch(bits) {
+                case 8:  pack_8bit_data((uint16_t*)mem, (uint8_t*)packed_data.data(), num_pixels); return (uint8_t*)packed_data.data();
                 case 10: pack_10bit_data((uint16_t*)mem, (uint8_t*)packed_data.data(), num_pixels); return (uint8_t*)packed_data.data();
                 case 12: pack_12bit_data((uint16_t*)mem, (uint8_t*)packed_data.data(), num_pixels); return (uint8_t*)packed_data.data();
                 case 14: pack_14bit_data((uint16_t*)mem, (uint8_t*)packed_data.data(), num_pixels); return (uint8_t*)packed_data.data();
-                case 8:
                 case 16:
                 default: return (uint8_t*)mem;
             }

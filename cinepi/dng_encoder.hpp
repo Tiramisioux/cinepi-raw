@@ -1,4 +1,6 @@
 #pragma once
+#ifndef DNG_ENCODER_H
+#define DNG_ENCODER_H
 
 #include <condition_variable>
 #include <mutex>
@@ -57,7 +59,7 @@ private:
 	std::shared_ptr<spdlog::logger> console;
 
 	static const int NUM_ENC_THREADS = 4;
-	static const int NUM_DISK_THREADS = 16;
+	static const int NUM_DISK_THREADS = 12;
 
 	void encodeThread(int num);
 	void diskThread(int num);
@@ -156,3 +158,5 @@ private:
 	std::condition_variable disk_cond_var_;
 	std::thread disk_thread_[NUM_DISK_THREADS];
 };
+
+#endif

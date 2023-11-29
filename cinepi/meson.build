@@ -23,6 +23,7 @@ endif
 sources = [
   'cinepi_raw.cpp',
   'dng_encoder.cpp',
+  'mjpegStreamStage.cpp',
   'cinepi_controller.cpp',
   'cinepi_sound.cpp',
   'cinepi_state.cpp',
@@ -33,10 +34,12 @@ sources = [
 spdlog_dep = dependency('spdlog')
 json_dep = dependency('jsoncpp')
 
-cinepi_raw_dep = [tiff_dep, hiredis_lib, redis_plus_plus_lib, boost_dep, thread_dep, libcamera_dep, libcamera_app_dep, spdlog_dep, json_dep]
+cinepi_raw_dep = [tiff_dep, hiredis_lib, redis_plus_plus_lib, boost_dep, thread_dep, libcamera_dep, rpicam_app_dep, spdlog_dep, json_dep]
 
 alsa_dep = dependency('alsa')
 udev_dep = dependency('libudev')
+mhd_dep = dependency('nadjieb_mjpeg_streamer', required : true)
+cinepi_raw_dep += mhd_dep
 cinepi_raw_dep += alsa_dep
 cinepi_raw_dep += udev_dep
 
@@ -46,6 +49,6 @@ cinepi_raw_dep += udev_dep
 cinepi_raw = executable('cinepi-raw', sources,
              include_directories : include_directories('..'),
              dependencies: cinepi_raw_dep,
-             link_with : libcamera_app,
+             link_with : rpicam_app,
              install : true)
 

@@ -39,6 +39,8 @@ void CinePIController::sync(){
         width_ = CP_DEF_WIDTH;
         redis_->set(CONTROL_KEY_WIDTH, to_string(width_));
     }
+
+    console->critical(1);
         
     auto height = pipe_replies.get<OptionalString>(1);
     if(height){
@@ -48,6 +50,8 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_HEIGHT, to_string(height_)); 
     }
 
+    console->critical(2);
+
     auto framerate = pipe_replies.get<OptionalString>(2);
     if(framerate){
         framerate_ = stoi(*framerate);
@@ -55,6 +59,8 @@ void CinePIController::sync(){
         framerate_ = CP_DEF_FRAMERATE;
         redis_->set(CONTROL_KEY_FRAMERATE, to_string(framerate_)); 
     }
+
+    console->critical(3);
 
     auto iso = pipe_replies.get<OptionalString>(3);
     if(iso){
@@ -64,6 +70,8 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_ISO, to_string(iso_)); 
     }
 
+    console->critical(4);
+
     auto shutter_speed = pipe_replies.get<OptionalString>(4);
     if(shutter_speed){
         shutter_speed_ = stoi(*shutter_speed);
@@ -72,6 +80,8 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_SHUTTER_SPEED, to_string(shutter_speed_)); 
     }
 
+    console->critical(5);
+
     auto awb = pipe_replies.get<OptionalString>(5);
     if(awb){
         awb_ = stoi(*awb);
@@ -79,6 +89,8 @@ void CinePIController::sync(){
         awb_ = CP_DEF_AWB;
         redis_->set(CONTROL_KEY_WB, to_string(awb_)); 
     }
+
+    console->critical(6);
     
     auto compress = pipe_replies.get<OptionalString>(7);
     if(compress){
@@ -88,6 +100,8 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_COMPRESSION, to_string(compression_));
     }
 
+    console->critical(7);
+
     char *ptr = strtok(&(*pipe_replies.get<OptionalString>(6))[0], ",");
     uint8_t i = 0;
     while(ptr != NULL){
@@ -95,6 +109,8 @@ void CinePIController::sync(){
         i++;
         ptr = strtok(NULL, ",");  
     }
+
+    console->critical(8);
 
     auto thumbnail = pipe_replies.get<OptionalString>(8);
     if(thumbnail){
@@ -104,6 +120,8 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_));
     }
 
+    console->critical(9);
+
     auto thumbnail_size = pipe_replies.get<OptionalString>(9);
     if(thumbnail_size){
         thumbnail_size_ = stoi(*thumbnail_size);
@@ -112,15 +130,21 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_size_));
     }
 
+    console->critical(10);
+
     auto log_level = pipe_replies.get<OptionalString>(10);
     if(log_level){
         spdlog::set_level(spdlog::level::from_str(*log_level));
     }
 
+    console->critical(11);
+
     auto ucm = pipe_replies.get<OptionalString>(11);
     if(ucm){
         options_->ucm = *ucm;
     }
+
+    console->critical(12);
 
     auto mic_gain = pipe_replies.get<OptionalString>(12);
     if(mic_gain){
@@ -128,20 +152,24 @@ void CinePIController::sync(){
         system(("amixer -c 1 sset 'Mic' " + *mic_gain + " > /dev/null 2>&1").c_str());
     }
 
-    std::unordered_map<std::string, std::string> m;
-    redis_->hgetall("rawCrop", std::inserter(m, m.begin()));
+    console->critical(13);
 
-    options_->rawCrop[0] = std::stoi(m["offset_y_start"]);
-    options_->rawCrop[1] = std::stoi(m["offset_y_end"]);
-    options_->rawCrop[2] = std::stoi(m["offset_x_start"]);
-    options_->rawCrop[3] = std::stoi(m["offset_x_end"]);
+    // std::unordered_map<std::string, std::string> m;
+    // redis_->hgetall("rawCrop", std::inserter(m, m.begin()));
+
+    // options_->rawCrop[0] = std::stoi(m["offset_y_start"]);
+    // options_->rawCrop[1] = std::stoi(m["offset_y_end"]);
+    // options_->rawCrop[2] = std::stoi(m["offset_x_start"]);
+    // options_->rawCrop[3] = std::stoi(m["offset_x_end"]);
+
+    console->critical(14);
 
     options_->thumbnail = thumbnail_;
     options_->thumbnailSize = thumbnail_size_;
     
     options_->compression = compression_;
-    options_->width = width_;
-    options_->height = height_;
+    // options_->width = width_;
+    // options_->height = height_;
     options_->framerate = framerate_;
     options_->gain = iso_;
 
@@ -154,8 +182,8 @@ void CinePIController::sync(){
     }
     
     options_->denoise = "off";
-    options_->lores_width = options_->width >> 2;
-    options_->lores_height = options_->height >> 2;
+    // options_->lores_width = options_->width >> 3;
+    // options_->lores_height = options_->height >> 3;
     options_->mode_string = "0:0:0:0";
 }
 

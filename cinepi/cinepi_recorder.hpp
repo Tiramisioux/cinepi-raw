@@ -8,9 +8,10 @@
 #ifndef CINEPI_RECORDER_HPP
 #define CINEPI_RECORDER_HPP
 
-#include "core/libcamera_app.hpp"
+#include "core/rpicam_app.hpp"
 #include "core/stream_info.hpp"
 #include "raw_options.hpp"
+#include <arm_neon.h>
 
 #include "dng_encoder.hpp"
 #include "encoder/encoder.hpp"
@@ -18,13 +19,13 @@
 typedef std::function<void(void *, size_t, int64_t, bool)> EncodeOutputReadyCallback;
 typedef std::function<void(libcamera::ControlList &)> MetadataReadyCallback;
 
-class CinePIRecorder : public LibcameraApp
+class CinePIRecorder : public RPiCamApp
 {
 public:
 	using Stream = libcamera::Stream;
 	using FrameBuffer = libcamera::FrameBuffer;
 
-	CinePIRecorder() : LibcameraApp(std::make_unique<RawOptions>()) {}
+	CinePIRecorder() : RPiCamApp(std::make_unique<RawOptions>()) {}
 
 	void StartEncoder()
 	{
@@ -50,8 +51,21 @@ public:
 
 		FrameBuffer *buffer = completed_request->buffers[stream];
 
-		BufferReadSync r1(this, completed_request->buffers[stream]);
-		const std::vector<libcamera::Span<uint8_t>> mem = r1.Get();
+		// BufferReadSync r1(this, completed_request->buffers[stream]);
+		// const std::vector<libcamera::Span<uint8_t>> mem = r1.Get();
+
+		auto main_image_start = std::chrono::high_resolution_clock::now();
+
+		BufferWriteSync w(this, completed_request->buffers[stream]);
+		const std::vector<libcamera::Span<uint8_t>> mem = w.Get();
+		uint16_t *ptr = (uint16_t *)mem[0].data();
+		for (unsigned int i = 0; i < mem[0].size(); i += 2)
+			*(ptr++) >>= 4;
+
+		auto main_image_end = std::chrono::high_resolution_clock::now();
+        auto main_image_duration = std::chrono::duration_cast<std::chrono::milliseconds>(main_image_end - main_image_start).count();
+
+        LOG(1,"main image written to dng: " << main_image_duration << "ms");
 
 		BufferReadSync r2(this, completed_request->buffers[lostream]);
 		const std::vector<libcamera::Span<uint8_t>> lomem = r2.Get();

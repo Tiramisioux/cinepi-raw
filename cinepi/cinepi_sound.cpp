@@ -135,7 +135,7 @@ CinePISound::CinePISound(CinePIRecorder *app) :
     record_(false),
     recording_(false),
     canRecordAudio(false),
-    defaultDevice("hw:0,0"),
+    defaultDevice(""),
     options_(app->GetOptions()) 
 {
     console = spdlog::stdout_color_mt("cinepi_sound");
@@ -422,9 +422,9 @@ void CinePISound::detectRecordingDevices() {
         size_t start = result.find("card ");
         size_t end = result.find(":", start);
         defaultDevice = "hw:" + result.substr(start + 5, 1) + ",0"; // assumes single-digit card numbers
+        canRecordAudio = true;
     }
 
-    canRecordAudio = true;
     console->debug("{}", defaultDevice);
 }
 

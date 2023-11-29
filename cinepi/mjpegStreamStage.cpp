@@ -2,28 +2,48 @@
 #include <mutex>
 #include <vector>
 #include <time.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <unistd.h>
 
 #include <libcamera/stream.h>
 
 #include "core/frame_info.hpp"
-#include "core/libcamera_app.hpp"
+#include "core/rpicam_app.hpp"
 #include "post_processing_stages/post_processing_stage.hpp"
 
 #include <jpeglib.h>
 #include <nadjieb/mjpeg_streamer.hpp>
 
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+#define PROJECT_ID 127
+
+typedef struct {
+    int active_buffer;  // 0 for buffer1, 1 for buffer2
+    int fds[2];
+    unsigned int fdSize[2];
+    int fdsRGB[2];
+    int fdsSizeRGB[2];
+    int procid;
+    unsigned int width;
+    unsigned int height;
+}SharedMemoryBuffer;
+
 using Stream = libcamera::Stream;
 using MJPEGStreamer = nadjieb::MJPEGStreamer;
 
-class networkPreviewStage : public PostProcessingStage
+class mjpegStreamStage : public PostProcessingStage
 {
 public:
-    networkPreviewStage(LibcameraApp *app);
-    ~networkPreviewStage();
+    mjpegStreamStage(RPiCamApp *app);
+    ~mjpegStreamStage();
 
     char const *Name() const override;
     void Read(boost::property_tree::ptree const &params) override;
@@ -35,6 +55,12 @@ public:
 private:
     Stream *stream_;
     StreamInfo info_;
+
+    std::shared_ptr<spdlog::logger> console;
+
+    int segment_id;
+    SharedMemoryBuffer* shared_data;  // Add this line
+    key_t segment_key;
 
     int port_;
     bool running_ = true;
@@ -49,12 +75,12 @@ private:
 
 #define NAME "networkPreview"
 
-char const *networkPreviewStage::Name() const
+char const *mjpegStreamStage::Name() const
 {
     return NAME;
 }
 
-void networkPreviewStage::compressToJPEG(libcamera::Span<uint8_t> &inputBuffer, std::vector<uint8_t> &outputBuffer)
+void mjpegStreamStage::compressToJPEG(libcamera::Span<uint8_t> &inputBuffer, std::vector<uint8_t> &outputBuffer)
 {
     const bool is_yuv = (stream_->configuration().pixelFormat == libcamera::formats::YUV420);
 
@@ -74,7 +100,7 @@ void networkPreviewStage::compressToJPEG(libcamera::Span<uint8_t> &inputBuffer, 
 
     jpeg_set_defaults(&cinfo);
     cinfo.raw_data_in = is_yuv ? TRUE : FALSE;
-    jpeg_set_quality(&cinfo, 100, TRUE); // Assuming a quality of 75, adjust as needed.
+    jpeg_set_quality(&cinfo, 60, TRUE); // Assuming a quality of 75, adjust as needed.
 
     uint8_t* encoded_buffer = nullptr;
     unsigned long jpeg_mem_len;
@@ -128,40 +154,74 @@ void networkPreviewStage::compressToJPEG(libcamera::Span<uint8_t> &inputBuffer, 
 }
 
 
-void networkPreviewStage::Read(boost::property_tree::ptree const &params)
+void mjpegStreamStage::Read(boost::property_tree::ptree const &params)
 {
     port_ = params.get<int>("port", port_);
 }
 
-networkPreviewStage::networkPreviewStage(LibcameraApp *app) : PostProcessingStage(app) 
+mjpegStreamStage::mjpegStreamStage(RPiCamApp *app) : PostProcessingStage(app), shared_data(nullptr) 
 {
     // Constructor initialization if needed.
+    console = spdlog::stdout_color_mt("mjpegStreamStage");
+
+    const int size = sizeof(SharedMemoryBuffer);
+    
+    // Generate a unique key for the shared memory segment
+    segment_key = ftok("/tmp", PROJECT_ID);
+
+    // Check if a segment with this key already exists
+    segment_id = shmget(segment_key, size, IPC_CREAT | S_IRUSR | S_IWUSR);
+
+    if (segment_id != -1) {
+        // Segment already exists, remove it
+        shmctl(segment_id, IPC_RMID, NULL);
+    }
+
+    // Allocate a new shared memory segment
+    segment_id = shmget(segment_key, size, IPC_CREAT | IPC_EXCL | S_IRUSR | S_IWUSR);
+    if (segment_id == -1) {
+        // Handle error
+    }
+
+    // Attach the shared memory segment
+    shared_data = (SharedMemoryBuffer*)shmat(segment_id, NULL, 0);
+    if (shared_data == (void*) -1) {
+        // Handle error
+    }
+
+    shared_data->active_buffer = 0;
+    shared_data->procid = getpid();
 }
 
-networkPreviewStage::~networkPreviewStage() 
+mjpegStreamStage::~mjpegStreamStage() 
 {
+    // Detach the shared memory segment
+    shmdt(shared_data);
+    // Deallocate the shared memory segment
+    shmctl(segment_id, IPC_RMID, NULL);
 }
 
-void networkPreviewStage::Teardown(){
+void mjpegStreamStage::Teardown(){
     streamer_.stop();
 }
 
 
-void networkPreviewStage::Configure()
+void mjpegStreamStage::Configure()
 {
-    stream_ = app_->LoresStream();
+    // stream_ = app_->LoresStream();
     // stream_ = app_->GetMainStream();
-    // if (!stream_ || stream_->configuration().pixelFormat != libcamera::formats::YUV420)
-    //     throw std::runtime_error("networkPreviewStage: only YUV420 format supported");
+    stream_ = app_->RawStream();
     info_ = app_->GetStreamInfo(stream_);
-    LOG(1, "networkPreviewStage:" << info_.width << "x" << info_.height << " " << info_.stride);
-    LOG(1, "Setting up NetworkPreview on port: " << port_);
+    shared_data->width = info_.stride / 2;
+    shared_data->height = info_.height;
+    console->info("networkPreviewStage: {}x{} {}", info_.width, info_.height, info_.stride);
+    console->info("Setting up NetworkPreview on port: {}", port_);
     streamer_.start(port_, 8);
 }
 
 #include <chrono>
 
-bool networkPreviewStage::Process(CompletedRequestPtr &completed_request)
+bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
 {
     auto startOverall = std::chrono::high_resolution_clock::now();
 
@@ -170,35 +230,44 @@ bool networkPreviewStage::Process(CompletedRequestPtr &completed_request)
     auto endWriteSync = std::chrono::high_resolution_clock::now();
     libcamera::Span<uint8_t> buffer = w.Get()[0];
 
+    {
+        shared_data->active_buffer = !shared_data->active_buffer;
+        shared_data->fds[shared_data->active_buffer] = completed_request->buffers[stream_]->planes()[0].fd.get();
+        shared_data->fdSize[shared_data->active_buffer] = completed_request->buffers[stream_]->planes()[0].length;
+        shared_data->fdsRGB[shared_data->active_buffer] = completed_request->buffers[app_->GetMainStream()]->planes()[0].fd.get();
+        shared_data->fdsSizeRGB[shared_data->active_buffer] = completed_request->buffers[app_->GetMainStream()]->planes()[0].length;
+    }
+
     auto startCompression = std::chrono::high_resolution_clock::now();
     // Compress the buffer using libjpeg-turbo
     std::vector<uint8_t> jpegBuffer;
-    compressToJPEG(buffer, jpegBuffer);
+    // compressToJPEG(buffer, jpegBuffer);
     auto endCompression = std::chrono::high_resolution_clock::now();
 
-    // LOG(1, "Sending JPEG buffer size:" << jpegBuffer.size());
+    console->trace("Sending JPEG buffer size: {}", jpegBuffer.size());
 
     auto startPublish = std::chrono::high_resolution_clock::now();
-    if(streamer_.isRunning()){
-        // Publish the JPEG buffer to the streamer
-        streamer_.publish("/stream", std::string(jpegBuffer.begin(), jpegBuffer.end()));
-    }
+    // if(streamer_.isRunning()){
+    //     // Publish the JPEG buffer to the streamer
+    //     streamer_.publish("/stream", std::string(jpegBuffer.begin(), jpegBuffer.end()));
+    // }
     auto endPublish = std::chrono::high_resolution_clock::now();
 
     auto endOverall = std::chrono::high_resolution_clock::now();
 
     // Logging the durations
-    // LOG(2, "Duration of WriteSync: " << std::chrono::duration_cast<std::chrono::microseconds>(endWriteSync - startWriteSync).count() << " microseconds.");
-    // LOG(2, "Duration of Compression: " << std::chrono::duration_cast<std::chrono::microseconds>(endCompression - startCompression).count() << " microseconds.");
-    // LOG(2, "Duration of Publish: " << std::chrono::duration_cast<std::chrono::microseconds>(endPublish - startPublish).count() << " microseconds.");
-    // LOG(2, "Overall Duration: " << std::chrono::duration_cast<std::chrono::microseconds>(endOverall - startOverall).count() << " microseconds.");
+    console->trace("Duration of WriteSync: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endWriteSync - startWriteSync).count());
+    console->trace("Duration of Compression: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endCompression - startCompression).count());
+    console->trace("Duration of Publish: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endPublish - startPublish).count());
+    console->debug("Overall Duration: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endOverall - startOverall).count());
+
 
     return false;
 }
 
-static PostProcessingStage *Create(LibcameraApp *app)
+static PostProcessingStage *Create(RPiCamApp *app)
 {
-    return new networkPreviewStage(app);
+    return new mjpegStreamStage(app);
 }
 
 static RegisterStage reg(NAME, &Create);

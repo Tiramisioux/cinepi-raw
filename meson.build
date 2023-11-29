@@ -1,10 +1,10 @@
-project('libcamera-apps', 'c', 'cpp',
+project('rpicam-apps', 'c', 'cpp',
         meson_version : '>= 0.64.0',
-        version : '1.3.0',
+        version : '1.4.1',
         default_options : [
             'werror=false',
             'warning_level=3',
-            'cpp_std=c++20',
+            'cpp_std=c++17',
             'c_std=c11',
             'buildtype=release',
         ],
@@ -39,8 +39,8 @@ summary({
         },
         section : 'libcamera')
 
-libcamera_app_src = []
-libcamera_app_dep = [libcamera_dep]
+rpicam_app_src = []
+rpicam_app_dep = [libcamera_dep]
 
 subdir('core')
 subdir('encoder')
@@ -52,19 +52,23 @@ subdir('utils')
 
 add_project_arguments(cpp_arguments, language : 'cpp')
 
-libcamera_app = library(
-    'libcamera_app',
-    libcamera_app_src,
+rpicam_app = library(
+    'rpicam_app',
+    rpicam_app_src,
     soversion : meson.project_version(),
     include_directories : include_directories('.'),
     install : true,
     name_prefix : '',
-    dependencies : libcamera_app_dep,
+    dependencies : rpicam_app_dep,
 )
 
-subdir('cinepi')
+# Install a symlink to the old library name for legacy purposes.
+install_symlink('libcamera_app.so',
+                install_dir: get_option('libdir'),
+                pointing_to: 'rpicam_app.so')
 
-subdir('apps')
+subdir('cinepi')
+# subdir('apps')
 
 summary({
             'libav encoder' : enable_libav,
