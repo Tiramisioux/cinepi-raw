@@ -12,10 +12,10 @@ using namespace std::chrono;
 #define CP_DEF_COMPRESS 0
 #define CP_DEF_THUMBNAIL 1
 #define CP_DEF_THUMBNAIL_SIZE 3
+#define CONTROL_KEY_FRAME_DURATION "frame_duration"
+
 
 void CinePIController::sync(){
-    // getAllKeysAndValuesFromRedis();
-
     auto pipe = redis_->pipeline();
     auto pipe_replies = pipe.get(CONTROL_KEY_WIDTH)
                             .get(CONTROL_KEY_HEIGHT)
@@ -27,6 +27,7 @@ void CinePIController::sync(){
                             .get(CONTROL_KEY_COMPRESSION)
                             .get(CONTROL_KEY_THUMBNAIL)
                             .get(CONTROL_KEY_THUMBNAIL_SIZE)
+                            .get(CONTROL_KEY_FRAME_DURATION)
                             .get("log_level")
                             .get("ucm")
                             .get("mic_gain")
@@ -132,27 +133,39 @@ void CinePIController::sync(){
 
     console->critical(10);
 
-    auto log_level = pipe_replies.get<OptionalString>(10);
-    if(log_level){
-        spdlog::set_level(spdlog::level::from_str(*log_level));
+    auto frame_duration = pipe_replies.get<OptionalString>(10);
+    if (frame_duration) {
+        long int durationValues[2] = { static_cast<long int>(stoi(*frame_duration)),
+                                       static_cast<long int>(stoi(*frame_duration)) };
+        libcamera::Span<const long int, 2> durationRange(durationValues, 2);
+        libcamera::ControlList cl;
+        cl.set(libcamera::controls::FrameDurationLimits, durationRange);
+        app_->SetControls(cl);
     }
 
     console->critical(11);
 
-    auto ucm = pipe_replies.get<OptionalString>(11);
-    if(ucm){
-        options_->ucm = *ucm;
+    auto log_level = pipe_replies.get<OptionalString>(11);
+    if(log_level){
+        spdlog::set_level(spdlog::level::from_str(*log_level));
     }
 
     console->critical(12);
 
-    auto mic_gain = pipe_replies.get<OptionalString>(12);
+    auto ucm = pipe_replies.get<OptionalString>(12);
+    if(ucm){
+        options_->ucm = *ucm;
+    }
+
+    console->critical(13);
+
+    auto mic_gain = pipe_replies.get<OptionalString>(13);
     if(mic_gain){
         options_->mic_gain = stoi(*mic_gain);
         system(("amixer -c 1 sset 'Mic' " + *mic_gain + " > /dev/null 2>&1").c_str());
     }
 
-    console->critical(13);
+    console->critical(14);
 
     // std::unordered_map<std::string, std::string> m;
     // redis_->hgetall("rawCrop", std::inserter(m, m.begin()));
@@ -161,8 +174,6 @@ void CinePIController::sync(){
     // options_->rawCrop[1] = std::stoi(m["offset_y_end"]);
     // options_->rawCrop[2] = std::stoi(m["offset_x_start"]);
     // options_->rawCrop[3] = std::stoi(m["offset_x_end"]);
-
-    console->critical(14);
 
     libcamera::ControlList cl;
     cl.set(libcamera::controls::rpi::StatsOutputEnable, true);
@@ -202,7 +213,6 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
     data["frameCount"] = app_->GetEncoder()->getFrameCount();
     data["bufferSize"] = app_->GetEncoder()->bufferSize();
     redis_->publish(CHANNEL_STATS, data.toStyledString());
-    
 }
 
 void CinePIController::mainThread(){
@@ -213,6 +223,16 @@ void CinePIController::mainThread(){
     using MessageHandler = std::function<void(const std::optional<std::string>&)>;
 
     std::unordered_map<std::string, MessageHandler> handlers = {
+        { CONTROL_KEY_FRAME_DURATION, [this](const std::optional<std::string>& r) {
+            if (r) {
+                long int durationValues[2] = { static_cast<long int>(stoi(*r)),
+                                               static_cast<long int>(stoi(*r)) };
+                libcamera::Span<const long int, 2> durationRange(durationValues, 2);
+                libcamera::ControlList cl;
+                cl.set(libcamera::controls::FrameDurationLimits, durationRange);
+                app_->SetControls(cl);
+            }
+        }},
         { CONTROL_KEY_RAW_CROP, [this](const std::optional<std::string>& r) {
             std::unordered_map<std::string, std::string> m;
             redis_->hgetall("rawCrop", std::inserter(m, m.begin()));
@@ -224,18 +244,6 @@ void CinePIController::mainThread(){
         }},
         { CONTROL_KEY_RECORD, [this](const std::optional<std::string>& r) {
             if(r) {
-                // int rec = stoi(*r);
-                // switch(rec){
-                //     case 1:
-                //         trigger_ = rec;
-                //         is_recording_ = (bool)rec;
-                //     case 0:
-                //         trigger_ = 0;
-                //         is_recording_ = (bool)rec;
-                //     case -1:
-                //         trigger_ = rec;
-                //         is_recording_ = false;
-                // };
                 trigger_ = !is_recording_ ? 1 : -1;
                 is_recording_ = (bool)stoi(*r);
             }
@@ -317,7 +325,7 @@ void CinePIController::mainThread(){
                 options_->framerate = framerate_;
 
                 long int durationValues[2] = { static_cast<long int>(1000000.0 / framerate_),
-                                            static_cast<long int>(1000000.0 / framerate_) };
+                                               static_cast<long int>(1000000.0 / framerate_) };
 
                 libcamera::Span<const long int, 2> durationRange(durationValues, 2);
                 libcamera::ControlList cl;
@@ -351,7 +359,6 @@ void CinePIController::mainThread(){
             }
         }}
     };
-
 
     sub.on_message([this, &handlers](std::string channel, std::string msg) {
         console->trace("{} from: {}", msg, channel);
