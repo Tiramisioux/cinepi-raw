@@ -192,13 +192,16 @@ void CinePIController::process(CompletedRequestPtr &completed_request) {
     CinePIFrameInfo info(completed_request->metadata);
 
     Json::Value data;
-    Json::Value histo;
     data["framerate"] = completed_request->framerate;
     data["colorTemp"] = info.colorTemp;
     data["focus"] = info.focus;
     data["frameCount"] = app_->GetEncoder()->getFrameCount();
     data["bufferSize"] = app_->GetEncoder()->bufferSize();
+    data["sensorTimestamp"] = info.ts;
+
     redis_->publish(CHANNEL_STATS, data.toStyledString());
+    
+    //console->debug("Published data: {}", data.toStyledString());
 }
 
 void CinePIController::mainThread() {
