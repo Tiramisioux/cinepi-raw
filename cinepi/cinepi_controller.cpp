@@ -201,6 +201,7 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
     data["focus"] = info.focus;
     data["frameCount"] = app_->GetEncoder()->getFrameCount();
     data["bufferSize"] = app_->GetEncoder()->bufferSize();
+    data["sensorTimestamp"] = info.ts;
     redis_->publish(CHANNEL_STATS, data.toStyledString());
     
 }

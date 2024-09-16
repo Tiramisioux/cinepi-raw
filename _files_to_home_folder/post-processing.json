@@ -1,0 +1,6 @@
+{
+    "sharedContext":{},
+    "mjpegPreview":{
+        "port":8000
+    }
+}
