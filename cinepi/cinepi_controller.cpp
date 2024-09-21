@@ -119,10 +119,10 @@ void CinePIController::sync(){
 void CinePIController::process(CompletedRequestPtr &completed_request){
     CinePIFrameInfo info(completed_request->metadata);
 
-    redis_->publish(CHANNEL_STATS, to_string(completed_request->framerate));
+    redis_->publish(CHANNEL_STATS, "framerate:" + to_string(completed_request->framerate));
     redis_->publish(CHANNEL_STATS, to_string(info.colorTemp));
     redis_->publish(CHANNEL_STATS, to_string(info.focus));
-    redis_->publish(CHANNEL_STATS, to_string(app_->GetEncoder()->getFrameCount()));
+    redis_->publish(CHANNEL_STATS, "framecount:" + to_string(app_->GetEncoder()->getFrameCount()));
     redis_->publish(CHANNEL_STATS, to_string(app_->GetEncoder()->bufferSize()));
     
     #ifdef LIBCAMERA_CINEPI_CONTROLS 
