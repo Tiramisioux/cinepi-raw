@@ -497,18 +497,18 @@ int myTIFFCloseProc(thandle_t fd) {
 }
 
 
-size_t DngEncoder::dng_save(int thread_num, uint8_t const *mem_tiff, uint8_t const *mem, StreamInfo const &info, uint8_t const *lomem, StreamInfo const &loinfo, size_t losize,
-              ControlList const &metadata, uint64_t fn)
-{
-    const DngInfo& constDngInfo = dng_info;
+    size_t DngEncoder::dng_save(int thread_num, uint8_t const *mem_tiff, uint8_t const *mem, StreamInfo const &info, uint8_t const *lomem, StreamInfo const &loinfo, size_t losize,
+                ControlList const &metadata, uint64_t fn)
+    {
+        const DngInfo& constDngInfo = dng_info;
 
-    // get raw unique value as sensor timestamp
-    std::array<uint8_t, 8> rawUniq = {};
-    if (auto rU = metadata.get(libcamera::controls::SensorTimestamp)) {
-        std::copy_n(reinterpret_cast<uint8_t*>(&*rU), rawUniq.size(), rawUniq.begin());
-    }
+        // get raw unique value as sensor timestamp
+        std::array<uint8_t, 8> rawUniq = {};
+        if (auto rU = metadata.get(libcamera::controls::SensorTimestamp)) {
+            std::copy_n(reinterpret_cast<uint8_t*>(&*rU), rawUniq.size(), rawUniq.begin());
+        }
 
-    // get shutter speed
+        // get shutter speed
     auto exp = metadata.get(controls::ExposureTime);
     float exp_time = 10000;
     if (exp)
