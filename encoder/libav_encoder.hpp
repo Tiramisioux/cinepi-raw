@@ -75,4 +75,7 @@ private:
 
 	std::mutex drm_queue_lock_;
 	std::queue<std::unique_ptr<AVDRMFrameDescriptor>> drm_frame_queue_;
+
+	std::string output_file_;
+	bool output_initialised_;
 };
