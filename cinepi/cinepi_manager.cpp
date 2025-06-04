@@ -1,0 +1,1 @@
+#include "cinepi_manager.hpp"
