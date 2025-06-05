@@ -22,16 +22,14 @@ using namespace std::placeholders;
 libcamera::ControlList emptyMetadata;
 
 // The main even loop for the application.
-static void event_loop(CinePIRecorder &app, CinePIController &controller)
+static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePISound &sound)
 {
 	controller.start();
 	controller.sync();
 
-	//sound.start();
+	sound.start();
 
 	static auto console = spdlog::stdout_color_mt("event_loop"); 
-
-	// RawOptions const *options = app.GetOptions();
 	
 	CinePiOptions *options = app.GetOptions();
 
@@ -93,10 +91,10 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller)
 		if(trigger > 0){
 			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
 			app.GetEncoder()->resetFrameCount();
-			//sound.record_start();
+			sound.record_start();
 		} else if (trigger < 0){
 			controller.folderOpen = false;
-			//sound.record_stop();
+			sound.record_stop();
 		}
 
 		// send frame to dng encoder and save to disk
@@ -120,12 +118,8 @@ int main(int argc, char *argv[])
 	try
 	{
 		CinePIRecorder app;
-		//CinePISound sound(&app);
+		CinePISound sound(&app);
 		CinePIController controller(&app);
-
-		// libcamera::logSetTarget(libcamera::LoggingTargetNone);
-
-		// RawOptions *options = app.GetOptions();
 		
 		CinePiOptions *options = app.GetOptions();
 
@@ -140,7 +134,7 @@ int main(int argc, char *argv[])
 			if (options->verbose >= 2)
 				options->Print();
 
-			event_loop(app, controller);
+			event_loop(app, controller, sound);
 		}
 	}
 	catch (std::exception const &e)
