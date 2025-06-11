@@ -26,6 +26,7 @@
  #include <sys/mman.h>              // O_DIRECT
  #include <sys/types.h>
  #include <sys/stat.h>
+ #include <sys/time.h>
  #include <fcntl.h>
  #include <unistd.h>
 
@@ -40,7 +41,7 @@
 namespace fs = std::filesystem;
 
 #define ONE_MB 1048576
-#define BLOCK_SIZE 4096 
+#define BLOCK_SIZE 4096*16 
 
 using namespace libcamera;
 
@@ -276,180 +277,6 @@ void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const 
     }
 }
 
-void DngEncoder::setup_encoder(libcamera::StreamConfiguration const &cfg, libcamera::StreamConfiguration const &lo_cfg, CompletedRequest::ControlList const &metadata)
-{
-    auto bayer_it = bayer_formats.find(cfg.pixelFormat);
-    auto mono_it = mono_formats.find(cfg.pixelFormat);
-    
-
-    if (bayer_it != bayer_formats.end()) {
-        const BayerFormat &bayer_format = bayer_it->second;
-        dng_info.bits = bayer_format.bits;
-        console->debug("Bayer format: {} ({})", bayer_format.name, cfg.pixelFormat.toString());
-        dng_info.white = (1 << dng_info.bits) - 1;
-        dng_info.photometric = PHOTOMETRIC_CFA;
-        dng_info.samples_per_pixel = 1;
-        memcpy(dng_info.bayer_order, bayer_format.order, 4);
-        dng_info.cfa_repeat_pattern_dim[0] = 2;
-        dng_info.cfa_repeat_pattern_dim[1] = 2;
-        dng_info.black_level_repeat_dim[0] = 2;
-        dng_info.black_level_repeat_dim[1] = 2;
-        mono_ = false;
-        console->debug("Pixel format is Bayer: {} ({}-bit)", bayer_format.name, dng_info.bits);
-    }
-    else if (auto mit = mono_formats.find(cfg.pixelFormat); mit != mono_formats.end()) {
-        dng_info.bits = mit->second;
-        dng_info.white = (1 << dng_info.bits) - 1;
-        dng_info.photometric = PHOTOMETRIC_MINISBLACK;
-        dng_info.samples_per_pixel = 1;
-        mono_ = true;
-        dng_info.cfa_repeat_pattern_dim[0] = 0;
-        dng_info.cfa_repeat_pattern_dim[1] = 0;
-        memset(dng_info.bayer_order, 0, 4);
-        dng_info.black_level_repeat_dim[0] = 1;
-        dng_info.black_level_repeat_dim[1] = 1;
-        console->debug("Pixel format is Monochrome: {}-bit", dng_info.bits);
-    }
-    else {
-        throw std::runtime_error("Unsupported pixel format: " + cfg.pixelFormat.toString());
-    }
-    
-
-    // white level -----------------------------------------------------
-    dng_info.white = (1 << dng_info.bits) - 1;
-
-    /* ---------------------------------------------------------------
-    * black level – choose a sensible constant                        *
-    *  - 12-bit RAW  :  64   (16 DN × 4)                              *
-    *  - 16-bit RAW  : 256   (16 DN × 16)   ← IMX585 linear mode      *
-    * -------------------------------------------------------------- */
-    dng_info.black = 256;            // <<< place it right here
-
-    auto bl = metadata.get(controls::SensorBlackLevels);
-    if (bl && bl->size()>=4)
-        std::copy(bl->begin(), bl->end(), dng_info.black_levels);
-    else std::fill(...,256);
-
-
-    // AnalogBalance -- Nuetral setup
-    std::fill(std::begin(dng_info.NEUTRAL), std::end(dng_info.NEUTRAL), 1);
-    std::fill(std::begin(dng_info.ANALOGBALANCE), std::end(dng_info.ANALOGBALANCE), 1);
-
-
-    // CCM Configuration
-    Matrix WB_GAINS(1, 1, 1);
-    auto cg = metadata.get(controls::ColourGains);
-    if (cg)
-    {
-        dng_info.NEUTRAL[0] = 1.0 / (*cg)[0];
-        dng_info.NEUTRAL[2] = 1.0 / (*cg)[1];
-        WB_GAINS = Matrix((*cg)[0], 1, (*cg)[1]);
-    }
-
-    // Use a slightly plausible default CCM in case the metadata doesn't have one (it should!).
-    Matrix CCM(1.90255, -0.77478, -0.12777,
-               -0.31338, 1.88197, -0.56858,
-               -0.06001, -0.61785, 1.67786);
-    auto ccm = metadata.get(controls::ColourCorrectionMatrix);
-    if (ccm)
-    {
-        CCM = Matrix((*ccm)[0], (*ccm)[1], (*ccm)[2], (*ccm)[3], (*ccm)[4], (*ccm)[5], (*ccm)[6], (*ccm)[7], (*ccm)[8]);
-    }
-    else
-        console->error("WARNING: no CCM metadata found");
-
-    // This maxtrix from http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
-    Matrix RGB2XYZ(0.4124564, 0.3575761, 0.1804375,
-                   0.2126729, 0.7151522, 0.0721750,
-                   0.0193339, 0.1191920, 0.9503041);
-    Matrix CAM_XYZ = (RGB2XYZ * CCM * WB_GAINS).Inv();
-    std::copy(std::begin(CAM_XYZ.m), std::end(CAM_XYZ.m), std::begin(dng_info.CAM_XYZ));
-
-    // cfa
-    dng_info.cfa_repeat_pattern_dim[0] = 2;
-    dng_info.cfa_repeat_pattern_dim[1] = 2;
-    dng_info.black_level_repeat_dim[0] = 2;
-    dng_info.black_level_repeat_dim[1] = 2;
-
-    // offsets
-    // dng_info.offset_y_start = options_->rawCrop[0];
-    // dng_info.offset_y_end = options_->rawCrop[1];
-    // dng_info.offset_x_start = options_->rawCrop[2];
-    // dng_info.offset_x_end = options_->rawCrop[3];
-
-    dng_info.offset_y_start = 0;
-    dng_info.offset_y_end = 0;
-    dng_info.offset_x_start = 0;
-    dng_info.offset_x_end = 0;
-
-    // const float bppf = (dng_bits/8);
-    // const uint16_t byte_offset_x = (bppf * offset_x_start) / sizeof(uint64_t); 
-    // // const uint16_t read_length_x = (1.5 * (info.width - (offset_x_start+offset_x_end))) / sizeof(uint64_t);
-    dng_info.t_height = (cfg.size.height - (dng_info.offset_y_start+dng_info.offset_y_end));
-    dng_info.t_width = (cfg.size.width - (dng_info.offset_x_start+dng_info.offset_x_end));
-
-    // thumbnail config
-    dng_info.thumbType = options_->thumbnail;
-    dng_info.thumbWidth = 32;
-    dng_info.thumbHeight = 32;
-    dng_info.thumbPhotometric = PHOTOMETRIC_MINISBLACK;
-    dng_info.thumbBitsPerSample = 8;
-    dng_info.thumbSamplesPerPixel = 1;
-    unsigned int thumbnail_size = dng_info.thumbWidth * dng_info.thumbHeight;
-
-    switch(dng_info.thumbType){
-        case 1:
-            dng_info.thumbWidth = lo_cfg.stride;
-            dng_info.thumbHeight = lo_cfg.size.height;
-            thumbnail_size = dng_info.thumbWidth * dng_info.thumbHeight;
-            break;
-        case 2:
-            dng_info.thumbWidth = lo_cfg.size.width;
-            dng_info.thumbHeight = lo_cfg.size.height;
-            dng_info.thumbSamplesPerPixel = 3;
-            dng_info.thumbPhotometric = PHOTOMETRIC_RGB;
-            thumbnail_size = lo_cfg.stride*3*lo_cfg.size.height;
-            break;
-    }
-
-    // buffer_size calculation
-    const unsigned int dng_wrapper_size = 20000; // ~20kb, much smaller in practice.  
-    const unsigned int frame_size = (cfg.size.width * cfg.size.height * dng_info.bits) / 8;
-    // const unsigned int frame_size = (cfg.stride * cfg.size.height);
-    const unsigned long bytes = frame_size + dng_wrapper_size + thumbnail_size;
-    dng_info.buffer_size = ((bytes + ONE_MB - 1) / ONE_MB) * ONE_MB;
-
-    // compression and other
-    dng_info.compression = COMPRESSION_NONE;
-
-    // extra metadata
-    dng_info.make = "EQUNIOX V1";
-    dng_info.model = "SONY IMX585-AAQJ1";
-    dng_info.serial = getHwId();
-    dng_info.software = "Libcamera;cinepi-raw";
-    dng_info.ucm = "ALTCINE EQUNIOX";
-
-    // adjust disk_buffer
-    const double MAX_RAM_FRACTION = 2.0 / 3.0;
-    std::ifstream meminfo("/proc/meminfo");
-    std::string content((std::istreambuf_iterator<char>(meminfo)), std::istreambuf_iterator<char>());
-
-    std::regex memAvailRegex(R"(MemAvailable:\s+(\d+)\s+kB)");
-    std::smatch match;
-
-    size_t totalRam = 0;
-    if (std::regex_search(content, match, memAvailRegex)) {
-        totalRam = std::stoull(match[1]) * 1024;  // Convert kilobytes to bytes
-    }
-    max_buffer_frames = (MAX_RAM_FRACTION * totalRam) / dng_info.buffer_size;
-
-    console->debug("Max Frames in Buffer: {}", max_buffer_frames);
-
-    encoder_initialized_ = true;
-    console->info("DngEncoder is setup!");
-}
-
-
 void encode_rational_array(const float *src, int count, int32_t *dst, int32_t scale = 10000)
 {
     for (int i = 0; i < count; ++i)
@@ -468,227 +295,231 @@ void encode_rational_array(const float *src, int count, int32_t *dst, int32_t sc
     }
 }
 
-size_t DngEncoder::dng_save(int              thread_num,
-                            const uint8_t   *mem_buf,
-                            const uint8_t   *raw,
-                            const StreamInfo &info,
-                            const uint8_t   *lomem,
-                            const StreamInfo &loinfo,
-                            size_t           losize,
-                            const libcamera::ControlList &metadata,
-                            uint64_t         fn)
+/* ────────────────────────────────────────────────────────────── */
+/*  Helper – power‑of‑two align                                   */
+/* ────────────────────────────────────────────────────────────── */
+static inline uint32_t align_up(uint32_t v,uint32_t a){ return (v+a-1)&~(a-1); }
+
+/* ────────────────────────────────────────────────────────────── */
+/*  Public: setup_encoder                                         */
+/* ────────────────────────────────────────────────────────────── */
+void DngEncoder::setup_encoder(const StreamConfiguration &cfg,
+                               const StreamConfiguration &lo_cfg,
+                               const ControlList         &metadata)
 {
-    /* ------------------------------------------------------------ *
-    * 1.  Set-up memory writer & TIFF header                       *
-    * ------------------------------------------------------------ */
-    MemoryBuffer memBuf{};
-    memBuf.buffer    = const_cast<uint8_t *>(mem_buf);
-    memBuf.offset    = 0;
-    memBuf.usedSize  = 0;
-    memBuf.totalSize = dng_info.buffer_size;
+    /* Pixel format – Bayer only (mono paths removed) */
+    auto it = bayer_formats.find(cfg.pixelFormat);
+    if(it == bayer_formats.end())
+        throw std::runtime_error("Unsupported Bayer format " + cfg.pixelFormat.toString());
 
-    write_pod (memBuf, "II", 2);      // little-endian
-    write_uint16(memBuf, 42);         // TIFF magic
-    write_uint32(memBuf, 0);          // first-IFD offset (patched later)
+    const BayerFormat &bf = it->second;
+    dng_info.bits        = bf.bits;
+    dng_info.white       = (1u<<bf.bits) - 1u;
+    dng_info.photometric = PHOTOMETRIC_CFA;
+    dng_info.samples_per_pixel = 1;
+    std::memcpy(dng_info.bayer_order,bf.order,4);
+    dng_info.black_level_repeat_dim[0] = 2;
+    dng_info.black_level_repeat_dim[1] = 2;
 
-    /* ------------------------------------------------------------ *
-    * 2.  Write thumbnail pixels                                   *
-    * ------------------------------------------------------------ */
-    const uint32_t thumbOffset   = memBuf.offset;
-    const uint32_t thumbRowBytes = dng_info.thumbWidth * dng_info.thumbSamplesPerPixel;
-    const uint32_t thumbSize     = thumbRowBytes * dng_info.thumbHeight;
+    /* Sensor black levels (4‑channel) – default 256 DN for 16‑bit scale */
+    std::fill(std::begin(dng_info.black_levels),std::end(dng_info.black_levels),256.f);
+    if(auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size()>=4)
+        std::copy(bl->begin(),bl->end(),dng_info.black_levels);
 
-    for (uint32_t y = 0; y < dng_info.thumbHeight; ++y)
-        write_pod(memBuf, lomem + y * loinfo.stride, thumbRowBytes);
-
-    /* ------------------------------------------------------------ *
-    * 3.  Write full-resolution RAW pixels                         *
-    * ------------------------------------------------------------ */
-    const uint32_t rawOffset   = memBuf.offset;
-    const uint32_t rawRowBytes = (dng_info.bits == 12)
-                            ? info.width * 2
-                            : (info.width * dng_info.bits + 7) / 8;
-    const uint32_t rawSize     = rawRowBytes * info.height;
-
-    for (uint32_t y = 0; y < info.height; ++y)
-        write_pod(memBuf, raw + y * info.stride, rawRowBytes);
-
-    /* ------------------------------------------------------------ *
-    * 4.  Build SubIFD[0]  →  THUMBNAIL                            *
-    * ------------------------------------------------------------ */
-    IFDBuilder thumbIFD(dng_info.thumbWidth, dng_info.thumbHeight);
-    thumbIFD.baseOffset = memBuf.usedSize;
-
-    /* geometry / opcode tags (thumbnail) ------------------------- */
-    {
-        uint32_t activeArea[4] =
-            { dng_info.offset_y_start,
-            dng_info.offset_x_start,
-            dng_info.offset_y_start + dng_info.thumbHeight,
-            dng_info.offset_x_start + dng_info.thumbWidth };
-        uint32_t cropOrigin[2] = { 0, 0 };
-        uint32_t cropSize [2]  = { dng_info.thumbWidth, dng_info.thumbHeight };
-        uint8_t  opcodeDummy   = 0;
-
-        thumbIFD.addEntry(0xC68E, TIFF_LONG, 4, activeArea);
-        thumbIFD.addEntry(0xC68C, TIFF_LONG, 2, cropOrigin);
-        thumbIFD.addEntry(0xC68D, TIFF_LONG, 2, cropSize);
-        thumbIFD.addEntry(0xC68B, TIFF_BYTE, 0, &opcodeDummy);
+    /* White‑balance gains & CCM */
+    std::fill(std::begin(dng_info.NEUTRAL),std::end(dng_info.NEUTRAL),1.f);
+    Matrix wb(1,1,1);
+    if(auto cg=metadata.get(controls::ColourGains); cg){
+        dng_info.NEUTRAL[0]=1.f/(*cg)[0];
+        dng_info.NEUTRAL[2]=1.f/(*cg)[1];
+        wb = Matrix((*cg)[0],1,(*cg)[1]);
     }
 
-    uint32_t subfileTypeThumb = 1;          // reduced-res / preview
-    uint16_t thumbBps         = dng_info.thumbBitsPerSample;
-    uint16_t thumbFormat      = SAMPLEFORMAT_UINT;
-    uint16_t planar           = 1;          // chunky
-    uint16_t tWidth  = static_cast<uint16_t>(dng_info.thumbWidth);
-    uint16_t tHeight = static_cast<uint16_t>(dng_info.thumbHeight);
-    uint16_t tRows   = static_cast<uint16_t>(dng_info.thumbHeight);
+    Matrix ccm(1.90255,-0.77478,-0.12777,
+               -0.31338,1.88197,-0.56858,
+               -0.06001,-0.61785,1.67786);
+    if(auto m = metadata.get(controls::ColourCorrectionMatrix); m)
+        ccm = Matrix((*m)[0],(*m)[1],(*m)[2],
+                     (*m)[3],(*m)[4],(*m)[5],
+                     (*m)[6],(*m)[7],(*m)[8]);
 
-    thumbIFD.addEntry(254,  TIFF_LONG , 1, &subfileTypeThumb);
-    thumbIFD.addEntry(256,  TIFF_SHORT, 1, &tWidth);
-    thumbIFD.addEntry(257,  TIFF_SHORT, 1, &tHeight);
-    thumbIFD.addEntry(258,  TIFF_SHORT, 1, &thumbBps);
-    thumbIFD.addEntry(259,  TIFF_SHORT, 1, &dng_info.compression);
-    thumbIFD.addEntry(262,  TIFF_SHORT, 1, &dng_info.thumbPhotometric);
-    thumbIFD.addEntry(273,  TIFF_LONG , 1, &thumbOffset);
-    thumbIFD.addEntry(278,  TIFF_SHORT, 1, &tRows);
-    thumbIFD.addEntry(279,  TIFF_LONG , 1, &thumbSize);
-    thumbIFD.addEntry(277,  TIFF_SHORT, 1, &dng_info.thumbSamplesPerPixel);
-    thumbIFD.addEntry(284,  TIFF_SHORT, 1, &planar);          // PlanarConfiguration
-    thumbIFD.addEntry(339,  TIFF_SHORT, 1, &thumbFormat);     // SampleFormat
+    Matrix rgb2xyz(0.4124564,0.3575761,0.1804375,
+                   0.2126729,0.7151522,0.0721750,
+                   0.0193339,0.1191920,0.9503041);
+    Matrix cam_xyz = (rgb2xyz*ccm*wb).Inv();
+    std::copy(std::begin(cam_xyz.m),std::end(cam_xyz.m),dng_info.CAM_XYZ);
 
-    /* usual strings & DNG header tags */
-    uint8_t dngVer [4] = { 1, 4, 0, 0 };
-    uint8_t dngBack[4] = { 1, 4, 0, 0 };
-    std::string make  = dng_info.make    + '\0';
-    std::string model = dng_info.model   + '\0';
-    std::string soft  = dng_info.software+ '\0';
+    /* Thumbnail (mono 8‑bit – Y‑plane) */
+    dng_info.thumbWidth           = lo_cfg.size.width;
+    dng_info.thumbHeight          = lo_cfg.size.height;
+    dng_info.thumbSamplesPerPixel = 1;
+    dng_info.thumbBitsPerSample   = 8;
+    dng_info.thumbPhotometric     = 1; // MINISBLACK
 
-    thumbIFD.addEntry(271, TIFF_ASCII, make .size(), make .data());
-    thumbIFD.addEntry(272, TIFF_ASCII, model.size(), model.data());
-    thumbIFD.addEntry(305, TIFF_ASCII, soft .size(), soft .data());
-    thumbIFD.addEntry(0xC612, TIFF_BYTE, 4, dngVer);
-    thumbIFD.addEntry(0xC613, TIFF_BYTE, 4, dngBack);
-    thumbIFD.addEntry(0xC614, TIFF_ASCII, model.size(), model.data());   // UniqueCameraModel
+    /* Buffer sizing */
+    const uint32_t frame  = (cfg.size.width*cfg.size.height*dng_info.bits)/8;
+    const uint32_t thumb  = lo_cfg.stride * lo_cfg.size.height;
+    dng_info.buffer_size  = align_up(frame + thumb + 20*1024, ONE_MB);
 
-    thumbIFD.sortEntries();
-    thumbIFD.build(memBuf);
-    const uint32_t thumbIFDOffset = thumbIFD.baseOffset;
+    /* Static strings */
+    dng_info.make     = "Raspberry Pi";
+    dng_info.model    = "SONY IMX585‑AAQJ1";
+    dng_info.software = "Libcamera;cinepi‑raw";
+    dng_info.ucm      = "CinePi";
+    dng_info.serial   = getHwId();
+    dng_info.compression = COMPRESSION_NONE;
 
-    /* ------------------------------------------------------------ *
-    * 5.  Build IFD-0  →  FULL-RES RAW                             *
-    * ------------------------------------------------------------ */
-    IFDBuilder ifd0(info.width, info.height);
-    ifd0.baseOffset = memBuf.usedSize;
-
-    /* ---------- Resolve geometry tags ---------- */
-    {
-        uint32_t activeArea[4] =
-            { dng_info.offset_y_start,
-            dng_info.offset_x_start,
-            dng_info.offset_y_start + info.height,
-            dng_info.offset_x_start + info.width };
-
-        uint32_t cropOrigin[2] = { 0, 0 };
-        uint32_t cropSize  [2] = { info.width, info.height };
-        uint8_t  opcodeDummy   = 0;
-
-        ifd0.addEntry(0xC68E, TIFF_LONG, 4, activeArea);
-        ifd0.addEntry(0xC68C, TIFF_LONG, 2, cropOrigin);
-        ifd0.addEntry(0xC68D, TIFF_LONG, 2, cropSize);
-        ifd0.addEntry(0xC68B, TIFF_BYTE, 0, &opcodeDummy);
-    }
-
-    /* image basics ------------------------------------------------ */
-    uint16_t sampleFormat = SAMPLEFORMAT_UINT;
-    ifd0.addEntry(256, TIFF_LONG , 1, &info.width);
-    ifd0.addEntry(257, TIFF_LONG , 1, &info.height);
-    ifd0.addEntry(258, TIFF_SHORT, 1, &dng_info.bits);
-    ifd0.addEntry(259, TIFF_SHORT, 1, &dng_info.compression);
-    ifd0.addEntry(273, TIFF_LONG , 1, &rawOffset);
-    ifd0.addEntry(278, TIFF_LONG , 1, &info.height);
-    ifd0.addEntry(279, TIFF_LONG , 1, &rawSize);
-    ifd0.addEntry(277, TIFF_SHORT, 1, &dng_info.samples_per_pixel);
-    ifd0.addEntry(339, TIFF_SHORT, 1, &sampleFormat);
-
-    /* DNG header -------------------------------------------------- */
-    ifd0.addEntry(0xC612, TIFF_BYTE, 4, dngVer);
-    ifd0.addEntry(0xC613, TIFF_BYTE, 4, dngBack);
-
-    /* black & white levels --------------------------------------- */
-    int32_t blackRat[8];
-    if (mono_) {
-        blackRat[0] = static_cast<int32_t>(dng_info.black);
-        blackRat[1] = 1;
-        ifd0.addEntry(0xC61A, TIFF_RATIONAL, 1, blackRat);
-    } else {
-        for (int i = 0; i < 4; ++i) { blackRat[2*i] = dng_info.black; blackRat[2*i+1] = 1; }
-        ifd0.addEntry(0xC61A, TIFF_RATIONAL, 4, blackRat);
-    }
-    uint16_t whiteLevel = static_cast<uint16_t>(dng_info.white);
-    ifd0.addEntry(0xC61D, TIFF_SHORT, 1, &whiteLevel);
-
-    /* profile & colour stuff ------------------------------------- */
-    int32_t matrix1[18];  encode_rational_array(dng_info.CAM_XYZ, 9, matrix1);
-    int32_t neutral[6];   encode_rational_array(dng_info.NEUTRAL, 3, neutral);
-    int32_t analog [6];   encode_rational_array(dng_info.ANALOGBALANCE, 3, analog);
-
-    ifd0.addEntry(0xC621, TIFF_SRATIONAL, 9, matrix1);     // ColorMatrix1
-    ifd0.addEntry(0xC622, TIFF_SRATIONAL, 9, matrix1);     // ColorMatrix2
-
-    uint16_t illum = 21, illum2 = 21;                      // both D65
-    ifd0.addEntry(0xC65A, TIFF_SHORT, 1, &illum);          // CalibrationIlluminant1
-    ifd0.addEntry(0xC65B, TIFF_SHORT, 1, &illum2);         // CalibrationIlluminant2
-
-    ifd0.addEntry(0xC628, TIFF_RATIONAL , 3, neutral);     // AsShotNeutral
-    ifd0.addEntry(0xC627, TIFF_RATIONAL , 3, analog);      // AnalogBalance
-
-    /* CFA / mono handling ---------------------------------------- */
-    uint32_t subfileType0 = 0;                             // full-res
-    ifd0.addEntry(254, TIFF_LONG, 1, &subfileType0);
-
-    uint16_t photometric = PHOTOMETRIC_CFA;
-    ifd0.addEntry(262, TIFF_SHORT, 1, &photometric);
-
-    if (mono_) {
-        uint16_t repMono[2] = { 1, 1 }; uint8_t cfaMono[1] = { 0 };
-        ifd0.addEntry(0x828D, TIFF_SHORT, 2, repMono);
-        ifd0.addEntry(0x828E, TIFF_BYTE , 1, cfaMono);
-        ifd0.addEntry(0xC619, TIFF_SHORT, 2, repMono);
-    } else {
-        ifd0.addEntry(0xC619, TIFF_SHORT, 2, dng_info.black_level_repeat_dim);
-        ifd0.addEntry(0x828D, TIFF_SHORT, 2, dng_info.cfa_repeat_pattern_dim);
-        ifd0.addEntry(0x828E, TIFF_BYTE , 4, dng_info.bayer_order);
-    }
-
-    /* frame rate -------------------------------------------------- */
-    static int32_t frameRate[2];
-    frameRate[0] = static_cast<int32_t>(*options_->framerate * 1000);
-    frameRate[1] = 1000;
-    ifd0.addEntry(0xC764, TIFF_SRATIONAL, 1, frameRate);
-
-    /* camera strings --------------------------------------------- */
-    ifd0.addEntry(271, TIFF_ASCII, make .size(), make .data());
-    ifd0.addEntry(272, TIFF_ASCII, model.size(), model.data());
-    ifd0.addEntry(305, TIFF_ASCII, soft .size(), soft .data());
-
-    /* link thumbnail as SubIFD ----------------------------------- */
-    ifd0.addEntry(0x014A, TIFF_LONG, 1, &thumbIFDOffset);  // SubIFDs[0]
-
-    ifd0.sortEntries();
-    ifd0.build(memBuf);
-    const uint32_t ifd0Offset = ifd0.baseOffset;
-
-    /* ------------------------------------------------------------ *
-    * 6.  Patch TIFF header & return size                          *
-    * ------------------------------------------------------------ */
-    *reinterpret_cast<uint32_t *>(memBuf.buffer + 4) = ifd0Offset;
-    return memBuf.usedSize;
-
+    encoder_initialized_ = true;
+    console->info("Encoder configured – {}×{} {}‑bit, buffer {} MB", cfg.size.width,cfg.size.height,dng_info.bits,dng_info.buffer_size/ONE_MB);
 }
 
+/* ────────────────────────────────────────────────────────────── */
+/*  Private: dng_save – build TIFF in‑memory                      */
+/* ────────────────────────────────────────────────────────────── */
+size_t DngEncoder::dng_save(int                    /*thread_num*/,
+                            const uint8_t         *mem_buf,
+                            const uint8_t         *raw,
+                            const StreamInfo      &info,
+                            const uint8_t         *lomem,
+                            const StreamInfo      &loinfo,
+                            size_t                 /*losize*/,
+                            const ControlList     &metadata,
+                            uint64_t               /*fn*/)
+{
+    /* Memory writer */
+    MemoryBuffer buf{const_cast<uint8_t*>(mem_buf),0,0,static_cast<uint32_t>(dng_info.buffer_size)};
+    write_pod(buf,"II",2); write_uint16(buf,42); write_uint32(buf,0); // header
 
+    /* 1. Thumbnail copy (mono 8‑bit) */
+    const uint32_t thumbOff   = buf.offset;
+    const uint32_t thumbBytes = dng_info.thumbWidth; // one byte per pixel
+    for(uint32_t y=0;y<dng_info.thumbHeight;++y)
+        write_pod(buf,lomem + y*loinfo.stride, thumbBytes);
+    const uint32_t thumbSize = thumbBytes * dng_info.thumbHeight;
 
+    /* 2. Raw image copy (stride‑aware) */
+    const uint32_t rawOff = buf.offset;
+    const uint32_t rrb    = (info.width * dng_info.bits + 7)/8; // packed/unpacked – assume stride >= rrb
+    for(uint32_t y=0;y<info.height;++y)
+        write_pod(buf, raw + y*info.stride, rrb);
+    const uint32_t rawSize = rrb * info.height;
+
+    /* 3. Black level per‑channel (ordered per CFA) */
+    uint16_t black[4]{};
+    auto ord = bayer_formats.find(info.pixel_format)->second.order;
+    auto bl  = metadata.get(controls::SensorBlackLevels);
+    if(bl && bl->size()>=4) {
+        for(int i=0;i<4;++i){
+            int c = ord[i]==0?0 : ord[i]==2?3 : 1 + (i&1); // map to R,G1,G2,B
+            black[c] = static_cast<uint16_t>((*bl)[i] * dng_info.white / 65535.f + 0.5f);
+        }
+    } else std::fill(std::begin(black),std::end(black),256);
+
+    /* 4. Prepare matrices */
+    int32_t matrixXY[18]; encode_rational_array(dng_info.CAM_XYZ,9,matrixXY);
+    int32_t neutral[6];   encode_rational_array(dng_info.NEUTRAL,3,neutral);
+
+    /* 5. Build thumbnail IFD (SubIFD[0]) */
+    IFDBuilder sub(dng_info.thumbWidth,dng_info.thumbHeight); sub.baseOffset = buf.usedSize;
+    uint32_t subType=1; uint16_t planar=1, sampFmt=SAMPLEFORMAT_UINT;
+    sub.addEntry(254 ,TIFF_LONG ,1,&subType);
+    sub.addEntry(256 ,TIFF_SHORT,1,&dng_info.thumbWidth);
+    sub.addEntry(257 ,TIFF_SHORT,1,&dng_info.thumbHeight);
+    sub.addEntry(258 ,TIFF_SHORT,1,&dng_info.thumbBitsPerSample);
+    sub.addEntry(259 ,TIFF_SHORT,1,&dng_info.compression);
+    sub.addEntry(262 ,TIFF_SHORT,1,&dng_info.thumbPhotometric);
+    sub.addEntry(273 ,TIFF_LONG ,1,&thumbOff);
+    sub.addEntry(278 ,TIFF_SHORT,1,&dng_info.thumbHeight);
+    sub.addEntry(279 ,TIFF_LONG ,1,&thumbSize);
+    sub.addEntry(277 ,TIFF_SHORT,1,&dng_info.thumbSamplesPerPixel);
+    sub.addEntry(284 ,TIFF_SHORT,1,&planar);
+    sub.addEntry(339 ,TIFF_SHORT,1,&sampFmt);
+
+    static const uint8_t v[4]={1,4,0,0};
+    sub.addEntry(0xC612,TIFF_BYTE,4,v);
+    sub.addEntry(0xC613,TIFF_BYTE,4,v);
+    std::string ucm = dng_info.ucm + '\0';
+    sub.addEntry(0xC614,TIFF_ASCII,ucm.size(),ucm.data());
+    sub.sortEntries(); sub.build(buf);
+    const uint32_t subIFDoff = sub.baseOffset;
+
+    /* 6. Build main IFD‑0 */
+    IFDBuilder ifd(info.width,info.height); ifd.baseOffset = buf.usedSize;
+    uint32_t typeFull = 0; uint16_t phot=PHOTOMETRIC_CFA;
+    ifd.addEntry(254 ,TIFF_LONG ,1,&typeFull);
+    ifd.addEntry(256 ,TIFF_LONG ,1,&info.width);
+    ifd.addEntry(257 ,TIFF_LONG ,1,&info.height);
+    ifd.addEntry(258 ,TIFF_SHORT,1,&dng_info.bits);
+    ifd.addEntry(259 ,TIFF_SHORT,1,&dng_info.compression);
+    ifd.addEntry(262 ,TIFF_SHORT,1,&phot);
+    ifd.addEntry(273 ,TIFF_LONG ,1,&rawOff);
+    ifd.addEntry(278 ,TIFF_LONG ,1,&info.height);
+    ifd.addEntry(279 ,TIFF_LONG ,1,&rawSize);
+    ifd.addEntry(277 ,TIFF_SHORT,1,&dng_info.samples_per_pixel);
+    ifd.addEntry(284 ,TIFF_SHORT,1,&planar);
+    ifd.addEntry(339 ,TIFF_SHORT,1,&sampFmt);
+    ifd.addEntry(0x014A,TIFF_LONG ,1,&subIFDoff);
+    ifd.addEntry(0xC612,TIFF_BYTE ,4,v);
+    ifd.addEntry(0xC613,TIFF_BYTE ,4,v);
+
+    /* black/white */
+    int32_t blackRat[8]; for(int i=0;i<4;++i){ blackRat[2*i]=black[i]; blackRat[2*i+1]=1; }
+    ifd.addEntry(0xC61A,TIFF_RATIONAL,4,blackRat);
+    uint16_t white16 = static_cast<uint16_t>(dng_info.white);
+    ifd.addEntry(0xC61D,TIFF_SHORT,1,&white16);
+
+    /* colour matrices */
+    ifd.addEntry(0xC621,TIFF_SRATIONAL,9,matrixXY);
+    ifd.addEntry(0xC622,TIFF_SRATIONAL,9,matrixXY);
+    uint16_t illum=21; ifd.addEntry(0xC65A,TIFF_SHORT,1,&illum);
+    ifd.addEntry(0xC65B,TIFF_SHORT,1,&illum);
+    ifd.addEntry(0xC628,TIFF_RATIONAL,3,neutral);
+
+    /* CFA pattern */
+    ifd.addEntry(0xC619,TIFF_SHORT,2,dng_info.black_level_repeat_dim);
+    ifd.addEntry(0x828D,TIFF_SHORT,2,dng_info.black_level_repeat_dim); // CFARepeatPatternDim (2,2)
+    ifd.addEntry(0x828E,TIFF_BYTE ,4,dng_info.bayer_order);
+
+    /* Strings */
+    std::string make  = dng_info.make  + '\0';
+    std::string model = dng_info.model + '\0';
+    std::string soft  = dng_info.software + '\0';
+    ifd.addEntry(271,TIFF_ASCII,make .size(),make .data());
+    ifd.addEntry(272,TIFF_ASCII,model.size(),model.data());
+    ifd.addEntry(305,TIFF_ASCII,soft .size(),soft .data());
+    ifd.addEntry(0xC614,TIFF_ASCII,ucm.size(),ucm.data());
+
+    /* Frame‑rate & timecode */
+    int32_t fpsRat[2]={25000,1000};
+    if(auto fd=metadata.get(controls::FrameDuration); fd && *fd>0){
+        double fps = 1e9 / static_cast<double>(*fd);
+        fpsRat[0] = static_cast<int32_t>(fps * 1000 + 0.5);
+        fpsRat[1] = 1000;
+    }
+    ifd.addEntry(0xC764,TIFF_SRATIONAL,1,fpsRat);
+
+    /* Timecode (BCD) */
+    struct timeval tv; gettimeofday(&tv,nullptr);
+    struct tm *lt = localtime(&tv.tv_sec);
+    int fps = fpsRat[0]/fpsRat[1];
+    int frame = (tv.tv_usec * fps)/1'000'000;
+    uint8_t tc[8] = {
+        static_cast<uint8_t>(((frame/10)<<4)|(frame%10)),
+        static_cast<uint8_t>(((lt->tm_sec/10)<<4)|(lt->tm_sec%10)),
+        static_cast<uint8_t>(((lt->tm_min/10)<<4)|(lt->tm_min%10)),
+        static_cast<uint8_t>(((lt->tm_hour/10)<<4)|(lt->tm_hour%10)),
+        0,0,0,0
+    };
+    ifd.addEntry(0xC763,TIFF_BYTE,8,tc);
+
+    /* DateTimeOriginal */
+    char dateStr[20]; strftime(dateStr,sizeof(dateStr),"%Y:%m:%d %H:%M:%S",lt);
+    ifd.addEntry(0x9003,TIFF_ASCII,20,dateStr);
+
+    ifd.sortEntries(); ifd.build(buf);
+    *reinterpret_cast<uint32_t*>(buf.buffer+4) = ifd.baseOffset;
+    return buf.usedSize;
+}
 
 //Encoding image buffer
 void DngEncoder::encodeThread(int num)

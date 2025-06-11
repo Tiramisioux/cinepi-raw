@@ -102,7 +102,8 @@ private:
 	uint16_t black_level_repeat_dim[2];
 	char bayer_order[4];
 
-	float CAM_XYZ[9];
+    float CAM_XYZ[9];     // daylight matrix
+    float CAM_XYZ2[9];    // tungsten / second matrix   ← NEW
 
 	uint16_t offset_y_start;
 	uint16_t offset_y_end;
