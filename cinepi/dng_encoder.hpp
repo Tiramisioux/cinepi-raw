@@ -10,6 +10,7 @@
 #include <array>
 #include <memory> // for std::shared_ptr
 #include <string>
+#include <atomic>
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -78,6 +79,13 @@ public:
 	std::array<uint16_t, 3> originationDate;
 
 private:
+
+    /* ──  NEW: in-RAM buffer accounting  ─────────────────────── */
+    std::atomic<size_t>   ram_buffers_{0};   /* # TIFF blocks living in RAM   */
+    size_t                max_ram_buffers_;  /* hard cap calculated at setup  */
+    std::mutex            ram_mtx_;
+    std::condition_variable ram_cv_;
+	
 	std::shared_ptr<spdlog::logger> console;
 
 	static const int NUM_ENC_THREADS = 2;
