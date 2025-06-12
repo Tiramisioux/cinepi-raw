@@ -103,6 +103,7 @@ static const std::map<PixelFormat, BayerFormat> bayer_formats =
 	// Currently not in the main libcamera branch
 	{ formats::R12_CSI2P, { "BGGR-12", 12, CFA_BGGR, true } },
 	{ formats::R12, { "BGGR-12", 12, CFA_BGGR, false, false } },
+    { formats::R16, { "BGGR-16", 16, CFA_BGGR, false, false } },
 
 	/* PiSP compressed formats. */
 	{ formats::RGGB_PISP_COMP1, { "RGGB-16-PISP", 16, CFA_RGGB, false, true } },
@@ -111,10 +112,14 @@ static const std::map<PixelFormat, BayerFormat> bayer_formats =
 	{ formats::BGGR_PISP_COMP1, { "BGGR-16-PISP", 16, CFA_BGGR, false, true } },
 };
 
-static const std::map<PixelFormat, int> mono_formats = {
-    { formats::R12_CSI2P, 12 },
-    { formats::R16,       16 }
+// mono_formats should stay *empty* for these raw formats
+static const std::map<PixelFormat,int> mono_formats = {
+    /* leave genuine true-mono formats here, e.g. GREY8 if you ever use it */
 };
+
+
+bool mono_ = false;   // add as a private member of DngEncoder
+
 
 
 void pack_8bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
@@ -301,7 +306,6 @@ static inline void encode_rational_array(const float *src,
     }
 }
 
-
 /* ────────────────────────────────────────────────────────────── */
 /*  Helper – power-of-two align                                   */
 /* ────────────────────────────────────────────────────────────── */
@@ -330,6 +334,7 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     std::memcpy(dng_info.bayer_order, bf.order, 4);
     dng_info.black_level_repeat_dim[0] = 2;
     dng_info.black_level_repeat_dim[1] = 2;
+
 
     /* ──  Black-level defaults (16-bit = 256 DN)  ─────────────── */
     std::fill(std::begin(dng_info.black_levels),
@@ -444,12 +449,17 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
         write_pod(buf, lomem + y * loinfo.stride, thumbBytes);
     const uint32_t thumbSize = thumbBytes * dng_info.thumbHeight;
 
-    /* ──  2.  Raw image copy (stride-aware)  ──────────────────── */
+    /* 2. Raw image copy (stride-aware) */
     const uint32_t rawOff = buf.offset;
-    const uint32_t rrb    = (info.width * dng_info.bits + 7) / 8;
+
+    /* exact pixel bytes per row: 2 bytes for 16-bit, 1.5 for 12-bit, … */
+    const uint32_t rrb = (info.width * dng_info.bits + 7) / 8;
+
     for (uint32_t y = 0; y < info.height; ++y)
         write_pod(buf, raw + y * info.stride, rrb);
-    const uint32_t rawSize = rrb * info.height;
+
+    const uint32_t rawSize = buf.offset - rawOff;   // <- exact size we just wrote
+
 
     /* ──  3.  Per-channel black-level  ────────────────────────── */
     uint16_t black[4] {};
@@ -502,17 +512,20 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
     sub.sortEntries(); sub.build(buf);
     const uint32_t subIFDoff = sub.baseOffset;
 
-    /* ──  6.  Build main IFD-0  ───────────────────────────────── */
+    /* ──  6.  Build main IFD-0  ──────────────────────────────── */
     IFDBuilder ifd(info.width, info.height);
     ifd.baseOffset = buf.usedSize;
 
+    uint16_t bits       = dng_info.bits;
+    uint32_t bitsPacked = bits;        // upper word = 0
+
     uint32_t typeFull = 0;
-    uint16_t phot     = PHOTOMETRIC_CFA;
+    uint16_t phot     = mono_ ? PHOTOMETRIC_MINISBLACK : PHOTOMETRIC_CFA;
 
     ifd.addEntry(254 , TIFF_LONG , 1, &typeFull);
     ifd.addEntry(256 , TIFF_LONG , 1, &info.width);
     ifd.addEntry(257 , TIFF_LONG , 1, &info.height);
-    ifd.addEntry(258 , TIFF_SHORT, 1, &dng_info.bits);
+    ifd.addEntry(258 , TIFF_SHORT, 1, &bitsPacked);
     ifd.addEntry(259 , TIFF_SHORT, 1, &dng_info.compression);
     ifd.addEntry(262 , TIFF_SHORT, 1, &phot);
     ifd.addEntry(273 , TIFF_LONG , 1, &rawOff);
