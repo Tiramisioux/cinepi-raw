@@ -11,6 +11,7 @@ CinePiOptions::CinePiOptions()
         : RawOptions()
         , same_hdmi(false)
         , redis_channel("cp_controls")
+        , keep16(false)
 {}
 
 // -----------------------------------------------------------------------------
@@ -37,6 +38,11 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                 throw std::runtime_error("--redis-channel needs a value");
             redis_channel = argv[++i];
         }
+        else if (arg == "--keep16")
+        {
+            keep16 = true;
+        }
+
         else
         {
             // Not one of ours – forward it to RawOptions.

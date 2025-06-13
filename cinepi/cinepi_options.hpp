@@ -15,4 +15,5 @@ public:
         /* --- extra flags ---------------------------------------------- */
         bool        same_hdmi;        // force both apps to one output
         std::string redis_channel;    // channel to publish preview id
+        bool        keep16;           // NEW : do not down-pack 16-bit streams
 };

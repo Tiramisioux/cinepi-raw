@@ -97,6 +97,7 @@ struct Options
 	Options()
 	: hdmi_port(-1),                    /* ‑1 = let DRM decide   */
 		set_default_lens_position(false), af_on_capture(false),
+		keep16(false),                           // ← NEW default
 		options_("Valid options are", 120, 80), app_(nullptr)
 	{
 		using namespace boost::program_options;
@@ -106,6 +107,9 @@ struct Options
 			value<int>(&hdmi_port)->default_value(-1),
 			"For DRM preview choose HDMI socket "
 			"(0 = HDMI‑0, 1 = HDMI‑1, -1 = automatic)")
+			("keep16",
+			value<bool>(&keep16)->default_value(false)->implicit_value(true),
+			"Write full 16-bit DNG files (disable 12-bit packing of 16-bit streams)")
 			("help,h", value<bool>(&help)->default_value(false)->implicit_value(true),
 			 "Print this help message")
 			("version", value<bool>(&version)->default_value(false)->implicit_value(true),
@@ -299,6 +303,8 @@ struct Options
 	*   0 = HDMI‑0  (RPi “main”)
 	*   1 = HDMI‑1  (RPi “aux”)  */
 	int hdmi_port;
+
+	bool keep16;          ///< store RAW as full 16-bit DNG, skip down-pack
 
 	virtual bool Parse(int argc, char *argv[]);
 	virtual void Print() const;

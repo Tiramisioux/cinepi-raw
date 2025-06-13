@@ -172,6 +172,27 @@ void pack_14bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
     }
 }
 
+#include <vector>   // one new header
+
+/* ────────────────────────────────────────────────────────────── */
+/*  Helper: pack a single 16-bit row → 12-bit packed               */
+/*  width must be even (IMX585 gives even pixel counts).          */
+/* ────────────────────────────────────────────────────────────── */
+static inline void pack_row_12bit(const uint16_t *src,
+                                  uint8_t       *dst,
+                                  uint32_t       width)
+{
+    for (uint32_t x = 0; x < width; x += 2)
+    {
+        uint16_t p0 = src[x];
+        uint16_t p1 = src[x + 1];
+        dst[0] =  p0 >> 4;                     /* upper 8 bits of pixel 0      */
+        dst[1] = (p0 << 4) | (p1 >> 8);        /* lower 4 + upper 4            */
+        dst[2] =  p1;                          /* lower 8 bits of pixel 1       */
+        dst += 3;
+    }
+}
+
 
 struct Matrix
 {
@@ -226,6 +247,7 @@ Matrix(float m0, float m1, float m2,
 
 DngEncoder::DngEncoder(RawOptions const *options)
     : Encoder(options), // Assuming you're calling the base class constructor
+      write12bit_(false),
       encoder_initialized_(false),
       encodeCheck_(false),
       abortEncode_(false), 
@@ -334,6 +356,25 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     std::memcpy(dng_info.bayer_order, bf.order, 4);
     dng_info.black_level_repeat_dim[0] = 2;
     dng_info.black_level_repeat_dim[1] = 2;
+
+    /* By default we pack 16-bit streams to 12-bit unless user said --keep16 */
+    write12bit_ = (bf.bits == 16) && !options_->keep16;
+
+    if (write12bit_) {
+        dng_info.bits  = 12;
+        dng_info.white = (1u << 12) - 1u;
+
+        /* rescale black levels already in the array */
+        for (float &bl : dng_info.black_levels)
+            bl = bl * dng_info.white / 65535.f;
+    }
+    else {
+        dng_info.white = (1u << dng_info.bits) - 1u;   // 65 535 for true 16-bit
+    }
+
+
+    for (float &bl : dng_info.black_levels)          // already filled earlier
+    bl = bl * dng_info.white / 65535.f;          // 16-bit → 12-bit scale
 
 
     /* ──  Black-level defaults (16-bit = 256 DN)  ─────────────── */
@@ -449,16 +490,52 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
         write_pod(buf, lomem + y * loinfo.stride, thumbBytes);
     const uint32_t thumbSize = thumbBytes * dng_info.thumbHeight;
 
-    /* 2. Raw image copy (stride-aware) */
+    /* 2. Raw image copy (packing if 12-bit) ----------------------- */
     const uint32_t rawOff = buf.offset;
 
-    /* exact pixel bytes per row: 2 bytes for 16-bit, 1.5 for 12-bit, … */
-    const uint32_t rrb = (info.width * dng_info.bits + 7) / 8;
+    if (write12bit_)          /* source 16-bit, we emit packed 12-bit */
+    {
+        const uint32_t rowPacked = (info.width * 12 + 7) / 8;
+        std::vector<uint8_t> rowBuf(rowPacked);
 
-    for (uint32_t y = 0; y < info.height; ++y)
-        write_pod(buf, raw + y * info.stride, rrb);
+        for (uint32_t y = 0; y < info.height; ++y) {
+            const uint16_t *src = reinterpret_cast<const uint16_t *>(
+                                    raw + y * info.stride);
+            /* trim 4 LSB then pack */
+            for (uint32_t x = 0; x < info.width; x += 2) {
+                uint16_t p0 = src[x]     >> 4;
+                uint16_t p1 = src[x + 1] >> 4;
+                rowBuf[3*x/2 + 0] =  p0 >> 4;
+                rowBuf[3*x/2 + 1] = (p0 << 4) | (p1 >> 8);
+                rowBuf[3*x/2 + 2] =  p1;
+            }
+            write_pod(buf, rowBuf.data(), rowPacked);
+        }
+    }
+    else if (dng_info.bits == 12)
+    {
+        const uint32_t rowPacked = (info.width * 12 + 7) / 8;   /* 1.5 B / px */
+        std::vector<uint8_t> rowBuf(rowPacked);
 
-    const uint32_t rawSize = buf.offset - rawOff;   // <- exact size we just wrote
+        for (uint32_t y = 0; y < info.height; ++y)
+        {
+            const uint16_t *src = reinterpret_cast<const uint16_t *>(
+                                    raw + y * info.stride);
+            pack_row_12bit(src, rowBuf.data(), info.width);
+            write_pod(buf, rowBuf.data(), rowPacked);
+        }
+    }
+    else
+    {
+        /* 10-, 14- or 16-bit → copy verbatim, one active row each */
+        const uint32_t rowBytes = (info.width * dng_info.bits + 7) / 8;
+        for (uint32_t y = 0; y < info.height; ++y)
+            write_pod(buf, raw + y * info.stride, rowBytes);
+    }
+
+    /* exact size we really wrote */
+    const uint32_t rawSize = buf.offset - rawOff;
+
 
 
     /* ──  3.  Per-channel black-level  ────────────────────────── */
