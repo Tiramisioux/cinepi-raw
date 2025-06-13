@@ -33,6 +33,7 @@ sources = [
   'cinepi_options.cpp',
 ]
 
+
 spdlog_dep = dependency('spdlog')
 json_dep = dependency('jsoncpp')
 
