@@ -4,8 +4,6 @@
 #include <libcamera/formats.h>
 #include <sys/time.h> // Required for gettimeofday
 
-#include "cinepi_options.hpp"
-
 
 bool is_mounted(const char *mount_point) {
     FILE *fp = fopen("/proc/mounts", "r");
@@ -32,16 +30,11 @@ bool is_mounted(const char *mount_point) {
     return found;
 }
 
-// bool disk_mounted(RawOptions const *options){
-
-bool disk_mounted(const CinePiOptions *options){
-
+bool disk_mounted(RawOptions const *options){
 	return fs::exists(fs::path(options->mediaDest)) && is_mounted(options->mediaDest.c_str());
 }
 
-// void generate_filename(RawOptions *options, unsigned int clip_number,
-
-void generate_filename(CinePiOptions *options, unsigned int clip_number,
+void generate_filename(RawOptions *options, unsigned int clip_number,
                        const libcamera::ControlList &metadata)
 {
     char filename[128];
@@ -83,37 +76,23 @@ void generate_filename(CinePiOptions *options, unsigned int clip_number,
 }
 
 
-// bool create_clip_folder(RawOptions *options, unsigned int clip_number)
-
-bool create_clip_folder(CinePiOptions *options, unsigned int clip_number)
+bool create_clip_folder(RawOptions *options, unsigned int clip_number)
 {
 	if(!disk_mounted(options))
 		return false;
-	
-    // generate_filename(options, clip_number);
-	
-    libcamera::ControlList dummy;                 // no metadata available here
-    generate_filename(options, clip_number, dummy);
-    
-    return fs::create_directories(options->mediaDest + std::string("/") + options->folder);
+	generate_filename(options, clip_number);
+	return fs::create_directories(options->mediaDest + std::string("/") + options->folder);
 }
 
 
-// bool create_stills_folder(RawOptions *options, unsigned int still_number)
-
-bool create_stills_folder(CinePiOptions *options, unsigned int still_number)
+bool create_stills_folder(RawOptions *options, unsigned int still_number)
 {
 	if(!disk_mounted(options))
 		return false;
 	std::string stillsPath = options->mediaDest + std::string("/stills");
 	bool exists = fs::exists(fs::path(stillsPath));
-
-    // generate_filename(options, still_number);
-
-    libcamera::ControlList dummy;
-    generate_filename(options, still_number, dummy);
-
-    if(!exists){
+	generate_filename(options, still_number);
+	if(!exists){
 		return fs::create_directories(options->mediaDest + std::string("/stills"));
 	}
 	return exists;
@@ -147,4 +126,4 @@ std::string getHwId() {
     }
 
     return "UNKNOWN"; // As a final fallback
-} 
+}
