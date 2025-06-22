@@ -817,6 +817,13 @@ void DngEncoder::diskThread(int num)
         // Clean up
         free(disk_item.mem_buf);
 
+        {
+            std::lock_guard<std::mutex> lk(ram_mtx_);
+            if (ram_buffers_ > 0)
+                --ram_buffers_;
+            ram_cv_.notify_all();
+        }
+
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
         console->info("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
