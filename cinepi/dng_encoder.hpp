@@ -67,12 +67,13 @@ public:
 	void reset_encoder(){
 		encoder_initialized_ = false;
 	}
-	bool buffer_full(){
-		return (disk_buffer_.size() > max_buffer_frames);
-	}
+    bool buffer_full()           // inline definition
+    {
+        std::lock_guard<std::mutex> lk(ram_mtx_);
+        return ram_buffers_ + 2 >= max_ram_buffers_;
+    }
 
 	bool mono_ = false;
-
 
 	std::vector<int64_t> timestamps;
 	std::array<uint8_t, 8> originationTimeCode;

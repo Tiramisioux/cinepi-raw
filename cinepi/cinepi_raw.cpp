@@ -102,7 +102,9 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			// check to make sure our buffer is not full, stop recording if so. 
 			if(app.GetEncoder()->buffer_full()){
 				controller.setRecording(false);
+				console->warn("RAM pool exhausted – recording stopped");
 			}
+			
 			app.EncodeBuffer(completed_request, app.RawStream(), app.LoresStream());
 		}
 

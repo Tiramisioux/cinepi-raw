@@ -38,6 +38,10 @@
 #include <unistd.h>
 #include <sys/time.h>
 
+#ifdef __GLIBC__
+    #include <malloc.h>     // declares malloc_trim
+#endif
+
 namespace fs = std::filesystem;
 
 #define ONE_MB 1048576
@@ -680,7 +684,9 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
     return buf.usedSize;
 }
 
-//Encoding image buffer
+// ──────────────────────────────────────────────────────────────
+//  Encoding image buffer
+// ──────────────────────────────────────────────────────────────
 void DngEncoder::encodeThread(int num)
 {
     std::chrono::duration<double> encode_time(0);
@@ -688,52 +694,70 @@ void DngEncoder::encodeThread(int num)
 
     while (true)
     {
+        /* ──  Get the next job from the queue  ───────────────── */
         {
             std::unique_lock<std::mutex> lock(encode_mutex_);
             while (true)
-            {   
+            {
                 if (!encode_queue_.empty())
                 {
                     encode_item = encode_queue_.front();
                     encode_queue_.pop();
                     break;
                 }
-                else {
-                    encode_cond_var_.wait_for(lock, 500us);
-                }
+                encode_cond_var_.wait_for(lock, 500us);
             }
         }
 
-        frames_ = {encode_item.index};
+        frames_ = encode_item.index;
         console->trace("Thread[{}] encode frame: {}", num, encode_item.index);
 
-        /* ──  RAM back-pressure  ───────────────────────── */
+        /* ────────────────────────────────────────────────────── */
+        /*  RAM back-pressure + aligned allocation               */
+        /* ────────────────────────────────────────────────────── */
+        uint8_t *mem_buf = nullptr;
+
         {
+            /* wait until a permit is available */
             std::unique_lock<std::mutex> lk(ram_mtx_);
-            ram_cv_.wait(lk, [this]{ return ram_buffers_ < max_ram_buffers_; });
-            ++ram_buffers_;                       /* we’re about to allocate */
+            ram_cv_.wait(lk, [this] { return ram_buffers_ < max_ram_buffers_; });
+            lk.unlock();                              // don’t block others while malloc runs
         }
 
+        if (posix_memalign(reinterpret_cast<void **>(&mem_buf),
+                           BLOCK_SIZE,
+                           dng_info.buffer_size) != 0)
         {
-            auto start_time = std::chrono::high_resolution_clock::now();
+            /* Allocation failed – permit was not consumed, wake another waiter */
+            perror("posix_memalign");
+            ram_cv_.notify_one();
+            continue;
+        }
 
-            uint8_t *mem_buf;
-            if (posix_memalign((void **)&mem_buf, BLOCK_SIZE, dng_info.buffer_size) != 0) {
-                perror("Error allocating aligned memory");
-                continue;
-            }
+        /* Allocation succeeded – now *really* consume the permit */
+        {
+            std::lock_guard<std::mutex> lk(ram_mtx_);
+            ++ram_buffers_;
+        }
 
-            size_t tiff_size = dng_save(
-                num,
-                static_cast<const uint8_t *>(mem_buf),
-                static_cast<const uint8_t *>(encode_item.mem),
-                encode_item.info,
-                static_cast<const uint8_t *>(encode_item.lomem),
-                encode_item.loinfo,
-                encode_item.losize,
-                encode_item.met,
-                encode_item.index);
+        /* ────────────────────────────────────────────────────── */
+        /*  Build the TIFF/DNG into the new buffer               */
+        /* ────────────────────────────────────────────────────── */
+        auto start_time = std::chrono::high_resolution_clock::now();
 
+        size_t tiff_size = dng_save(
+            num,
+            static_cast<const uint8_t *>(mem_buf),
+            static_cast<const uint8_t *>(encode_item.mem),
+            encode_item.info,
+            static_cast<const uint8_t *>(encode_item.lomem),
+            encode_item.loinfo,
+            encode_item.losize,
+            encode_item.met,
+            encode_item.index);
+
+        /* queue for disk writer */
+        {
             DiskItem item = {
                 mem_buf,
                 tiff_size,
@@ -743,22 +767,25 @@ void DngEncoder::encodeThread(int num)
                 encode_item.index
             };
 
-            {
-                std::lock_guard<std::mutex> lock(disk_mutex_);
-                disk_buffer_.push(std::move(item));
-                disk_cond_var_.notify_all();
-            }
-
-            auto end_time = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-            console->info("Thread[{}] {} Time taken for the encode: {} milliseconds, disk buffer count:{} Size:{}",
-                         num, encode_item.index, duration, disk_buffer_.size(), tiff_size);
+            std::lock_guard<std::mutex> lock(disk_mutex_);
+            disk_buffer_.push(std::move(item));
+            disk_cond_var_.notify_all();
         }
 
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        console->info("Thread[{}] {} Time taken for the encode: {} ms, disk queue:{}  Size:{}",
+                      num, encode_item.index, duration, disk_buffer_.size(), tiff_size);
+
+        /* mark the camera buffer as reusable */
         input_done_callback_(nullptr);
-        output_ready_callback_(encode_item.mem, encode_item.size, encode_item.timestamp_us, true);
+        output_ready_callback_(encode_item.mem,
+                               encode_item.size,
+                               encode_item.timestamp_us,
+                               true);
     }
 }
+
 
 //Flushing data to disk
 void DngEncoder::diskThread(int num)
@@ -803,6 +830,8 @@ void DngEncoder::diskThread(int num)
             // Provide sequential access hint
             posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
             posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE);
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // drop file pages ASAP
+
 
             // Always use actual used size returned by dng_save
             ssize_t bytes_written = write(fd, disk_item.mem_buf, disk_item.size);
@@ -820,9 +849,15 @@ void DngEncoder::diskThread(int num)
         {
             std::lock_guard<std::mutex> lk(ram_mtx_);
             if (ram_buffers_ > 0)
-                --ram_buffers_;
+                --ram_buffers_;          // <-- give permit back
             ram_cv_.notify_all();
         }
+
+        /* push any cached arenas back to the kernel */
+        #ifdef __GLIBC__
+            // hand empty arenas back to the kernel
+            malloc_trim(0);
+        #endif
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
