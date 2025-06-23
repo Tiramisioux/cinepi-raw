@@ -820,6 +820,8 @@ void DngEncoder::diskThread(int num)
         std::string filename = oss.str();
     
         console->trace("Thread[{}]  Save frame to disk: {}", num, disk_item.index);
+
+        console->info("DNG written: {}", filename);
         
         auto start_time = std::chrono::high_resolution_clock::now();
         
