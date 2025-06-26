@@ -723,10 +723,33 @@ void RPiCamApp::StartCamera()
 		}
 	}
 
+	/* ------------------------------------------------------------------
+	*  Manual exposure / gain
+	*  ------------------------------------------------------------------
+	*  libcamera 0.5 introduced two new ways to turn AGC off:
+	*     • set AeEnable = false   (convenience flag)
+	*     • or set ExposureTimeMode / AnalogueGainMode = Manual
+	*  If you skip these, the AGC rewrites the numbers you push below.
+	* ------------------------------------------------------------------ */
+	// if (!controls_.get(controls::AeEnable) && (options_->shutter || options_->gain))
+	// 	controls_.set(controls::AeEnable, false);          // one-liner that covers both
+
+	// --OR, if you prefer to be explicit: -------------------------------
+	if (!controls_.get(controls::ExposureTimeMode))
+	    controls_.set(controls::ExposureTimeMode, controls::ExposureTimeModeManual);
+	if (!controls_.get(controls::AnalogueGainMode))
+	    controls_.set(controls::AnalogueGainMode, controls::AnalogueGainModeManual);
+	// -------------------------------------------------------------------
+
+	/* Numeric values – unchanged */
 	if (!controls_.get(controls::ExposureTime) && options_->shutter)
-		controls_.set(controls::ExposureTime, options_->shutter.get<std::chrono::microseconds>());
+		controls_.set(controls::ExposureTime,
+					options_->shutter.get<std::chrono::microseconds>());
+
 	if (!controls_.get(controls::AnalogueGain) && options_->gain)
 		controls_.set(controls::AnalogueGain, options_->gain);
+
+	/* Everything else stays exactly as before */
 	if (!controls_.get(controls::AeMeteringMode))
 		controls_.set(controls::AeMeteringMode, options_->metering_index);
 	if (!controls_.get(controls::AeExposureMode))
@@ -735,9 +758,10 @@ void RPiCamApp::StartCamera()
 		controls_.set(controls::ExposureValue, options_->ev);
 	if (!controls_.get(controls::AwbMode))
 		controls_.set(controls::AwbMode, options_->awb_index);
-	if (!controls_.get(controls::ColourGains) && options_->awb_gain_r && options_->awb_gain_b)
+	if (!controls_.get(controls::ColourGains) &&
+		options_->awb_gain_r && options_->awb_gain_b)
 		controls_.set(controls::ColourGains,
-					  libcamera::Span<const float, 2>({ options_->awb_gain_r, options_->awb_gain_b }));
+					libcamera::Span<const float, 2>({ options_->awb_gain_r, options_->awb_gain_b }));
 	if (!controls_.get(controls::Brightness))
 		controls_.set(controls::Brightness, options_->brightness);
 	if (!controls_.get(controls::Contrast))
@@ -747,8 +771,9 @@ void RPiCamApp::StartCamera()
 	if (!controls_.get(controls::Sharpness))
 		controls_.set(controls::Sharpness, options_->sharpness);
 	if (!controls_.get(controls::HdrMode) &&
-	    (options_->hdr == "auto" || options_->hdr == "single-exp"))
+		(options_->hdr == "auto" || options_->hdr == "single-exp"))
 		controls_.set(controls::HdrMode, controls::HdrModeSingleExposure);
+
 
 	// AF Controls, where supported and not already set
 	if (!controls_.get(controls::AfMode) && camera_->controls().count(&controls::AfMode) > 0)
