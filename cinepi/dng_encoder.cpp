@@ -866,3 +866,22 @@ void DngEncoder::diskThread(int num)
         console->info("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
     }
 }
+
+void DngEncoder::clearPool()
+{
+    // 1) Drain any pending disk items (free their mem_bufs)
+    {
+        std::lock_guard<std::mutex> lock(disk_mutex_);
+        while (!disk_buffer_.empty()) {
+            auto &item = disk_buffer_.front();
+            free(item.mem_buf);
+            // return permit
+            {
+                std::lock_guard<std::mutex> lk(ram_mtx_);
+                if (ram_buffers_ > 0) --ram_buffers_;
+            }
+            disk_buffer_.pop();
+        }
+        ram_cv_.notify_all();
+    }
+}

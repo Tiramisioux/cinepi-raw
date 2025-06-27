@@ -79,6 +79,10 @@ public:
 	std::array<uint8_t, 8> originationTimeCode;
 	std::array<uint16_t, 3> originationDate;
 
+	/// Drain any queued frames and free their buffers so that
+	/// buffer_full() will return false again.
+	void clearPool();
+
 private:
 
     /* ──  NEW: in-RAM buffer accounting  ─────────────────────── */

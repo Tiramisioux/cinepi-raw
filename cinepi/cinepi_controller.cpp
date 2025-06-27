@@ -222,24 +222,29 @@ void CinePIController::mainThread(){
             options_->rawCrop[2] = std::stoi(m["offset_x_start"]);
             options_->rawCrop[3] = std::stoi(m["offset_x_end"]);
         }},
-        { CONTROL_KEY_RECORD, [this](const std::optional<std::string>& r) {
-            if(r) {
-                // int rec = stoi(*r);
-                // switch(rec){
-                //     case 1:
-                //         trigger_ = rec;
-                //         is_recording_ = (bool)rec;
-                //     case 0:
-                //         trigger_ = 0;
-                //         is_recording_ = (bool)rec;
-                //     case -1:
-                //         trigger_ = rec;
-                //         is_recording_ = false;
-                // };
-                trigger_ = !is_recording_ ? 1 : -1;
-                is_recording_ = (bool)stoi(*r);
-            }
+        
+        { CONTROL_KEY_RECORD, [this](const std::optional<std::string> &r) {
+            if (!r) return;                               // nothing to do
+
+            bool level = std::stoi(*r);                   // 0 or 1
+
+            /* ● rise --------------------------------------------------------- */
+            if (level && !is_recording_)                  // 0 → 1
+                trigger_ = +1;
+
+            /* ● fall --------------------------------------------------------- */
+            else if (!level && is_recording_)             // 1 → 0
+                trigger_ = -1;
+
+            /* ● duplicate write – ignore ------------------------------------ */
+            else
+                trigger_ = 0;
+
+            /* finally remember the level we’re in */
+            is_recording_ = level;
         }},
+
+            
         { CONTROL_KEY_ISO, [this](const std::optional<std::string>& r) {
             if(r) {
                 iso_ = (unsigned int)(stoi(*r)/100.0);

@@ -59,6 +59,23 @@ class CinePIController : public CinePIState
 
         void sync();
 
+               /* -------------------------------------------------------------
+        *  announceReady()
+        *  – write a one-shot “cinepi_ready_camX = 1” key to Redis
+        *    the *first* time it is called; subsequent calls are NOPs.
+        * ----------------------------------------------------------- */
+       void announceReady(const std::string &key)
+       {
+           if (!ready_announced_ && redis_)          // only once
+           {
+               redis_->set(key, "1");               // value must be a string
+               ready_announced_ = true;
+           }
+       }
+
+       [[nodiscard]] bool readyAnnounced() const noexcept
+       { return ready_announced_; }
+
         void setShutterAngle(float angle){
             shutter_angle_ = angle;
             shutter_speed_ = 1.0 / ((framerate_ * 360.0) / shutter_angle_);
@@ -88,18 +105,96 @@ class CinePIController : public CinePIState
             return c;
         }
 
-        int triggerRec()
+    int triggerRec()
+    {
+        /* ── 0.  Bail out early if no medium mounted. ──────────────────────── */
+        if (!disk_mounted(options_))
+            return 0;
+
+        /* helper: guarantee we have a writable directory (race-safe) */
+        auto ensure_folder = [this]()
         {
-            if (!disk_mounted(options_))
-                return 0;
-    
+            if (!folderOpen)                                            // first cam
+                folderOpen = create_clip_folder(app_->GetOptions(),
+                                                getClipNumber());
+            /*  after the change in utils.cpp create_clip_folder() now returns
+                true even if the directory already exists, so the second camera
+                will immediately get folderOpen == true as well. */
+        };
+
+        /* ── 1. EDGE-trigger coming from UI / GPIO ─────────────────────────── */
+        if (trigger_ != 0)
+        {
             int state = trigger_;
-            if (state < 0)
-                clip_number_++;
-    
-            trigger_ = 0;
-            return state;
+            trigger_  = 0;                          // consume edge
+
+            if (state > 0)                          /* ↑ start */
+            {
+                ensure_folder();
+                setRecording(true);
+                is_recording_  = true;
+                baseline_flag_ = 1;                 // keep level in sync
+                return +1;
+            }
+            if (state < 0)                          /* ↓ stop  */
+            {
+                setRecording(false);
+                is_recording_  = false;
+                baseline_flag_ = 0;
+                clip_number_++;                     // next take → new folder
+                folderOpen     = false;
+                return -1;
+            }
         }
+
+        /* ── 2.  Safety-net: act on Redis level changes only. ─────────────── */
+        int rec_flag = 0;
+        if (auto v = redis_->get("is_recording"); v && !v->empty())
+            rec_flag = std::stoi(*v);               // 0 or 1
+
+        /* ── first invocation: establish baseline, possibly join late. ────── */
+        static bool first_call = true;
+        if (first_call)
+        {
+            baseline_flag_ = rec_flag;
+            first_call     = false;
+
+            if (rec_flag && !is_recording_)         // already rolling → join
+            {
+                ensure_folder();
+                setRecording(true);
+                is_recording_ = true;
+                return +1;
+            }
+            return 0;
+        }
+
+        /* ── subsequent calls: react only on transitions. ─────────────────── */
+        if (rec_flag != baseline_flag_)
+        {
+            baseline_flag_ = rec_flag;
+
+            if (rec_flag && !is_recording_)         /* rising edge → start */
+            {
+                console->info("Safety-net started recording (late-join).");
+                ensure_folder();
+                setRecording(true);
+                is_recording_ = true;
+                return +1;
+            }
+            if (!rec_flag && is_recording_)         /* falling edge → stop */
+            {
+                console->info("Safety-net stopped recording (others stopped).");
+                setRecording(false);
+                is_recording_ = false;
+                clip_number_++;                     // prepare for next take
+                folderOpen     = false;
+                return -1;
+            }
+        }
+
+        return 0;                                   // steady state, nothing to do
+    }
 
 
     protected:
@@ -118,6 +213,10 @@ class CinePIController : public CinePIState
         //         }
         //     }
         // }
+
+        bool ready_announced_ = false;
+
+        int baseline_flag_{0};          // remembers last seen is_recording level
 
         std::shared_ptr<spdlog::logger> console;
 

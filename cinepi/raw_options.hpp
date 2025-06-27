@@ -1,49 +1,55 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
- * Copyright (C) 2020, Raspberry Pi (Trading) Ltd.
- *
- * still_video.hpp - video capture program options
+ * raw_options.hpp – common run-time options for cinepi-raw
  */
 
 #pragma once
 
-#include <cstdio>
-
+#include <cstdint>
+#include <optional>
 #include <string>
 
 #include "core/video_options.hpp"
 
 struct RawOptions : public VideoOptions
-{   
-    RawOptions() : VideoOptions()
-	{
-		using namespace boost::program_options;
-		options_.add_options();
-	}
+{
+    RawOptions()
+        : VideoOptions()
+        , keep16(false)                     // NEW → default = pack to 12-bit
+    {
+        using namespace boost::program_options;
+        options_.add_options();
+    }
 
-	std::optional<std::string> redis;
+    /* ─── generic / redis ─────────────────────────────────────── */
+    std::optional<std::string> redis;
 
-	uint32_t clip_number;
-	std::string mediaDest;
-	std::string folder;
+    /* ─── clip organisation ───────────────────────────────────── */
+    uint32_t       clip_number{};
+    std::string    mediaDest;
+    std::string    folder;
 
-	bool awbEn;
-	int compression;
+    /* sensor-local port name (“cam0” / “cam1”) – NEW */
+    std::string    camPort;                 // filled by CinePiProcess
 
-	int thumbnail;
-	int thumbnailSize;
+    /* ─── capture parameters ──────────────────────────────────── */
+    bool        awbEn{};
+    int         compression{};
+    int         thumbnail{};
+    int         thumbnailSize{};
+    uint16_t    rawCrop[4]{};
 
-	uint16_t rawCrop[4];
+    uint8_t     mic_gain{};
 
-	uint8_t mic_gain;
+    float       wb{};
+    std::string sensor;
+    std::string model;
+    std::string make;
+    std::optional<std::string> ucm;
+    std::string serial;
 
-	float wb;
-	std::string sensor;
-	std::string model;
-	std::string make;
-	std::optional<std::string> ucm;
-	std::string serial;
+    float       clipping{};
 
-	float clipping;
-
+    /* keep full 16-bit raw instead of packing – NEW */
+    bool keep16;                           // set by --keep16 in CinePiOptions
 };

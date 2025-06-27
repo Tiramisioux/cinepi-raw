@@ -37,52 +37,60 @@ bool disk_mounted(RawOptions const *options){
 void generate_filename(RawOptions *options, unsigned int clip_number,
                        const libcamera::ControlList &metadata)
 {
-    char filename[128];
-
-    // Capture current time with microsecond precision
+    /* 1. Time stamp -------------------------------------------------------- */
     struct timeval tv;
     gettimeofday(&tv, nullptr);
 
-    // Extract seconds and microseconds
-    std::time_t raw_time = tv.tv_sec;        // Seconds since epoch
-    long microseconds = tv.tv_usec;          // Microseconds within the current second
+    std::time_t    raw_time     = tv.tv_sec;
+    long           microseconds = tv.tv_usec;
 
-    // Format time into a string
     char time_string[32];
     std::tm *time_info = std::localtime(&raw_time);
     std::strftime(time_string, sizeof(time_string), "%y-%m-%d_%H%M%S", time_info);
 
-    // Default frame rate
-    double frameRate = 24.0;
+    /* 2. Frame number inside the current second (FF) ----------------------- */
+    double frameRate = 24.0;                       // fallback
+    if (!metadata.empty())
+        if (auto fd = metadata.get(libcamera::controls::FrameDuration);
+            fd && *fd > 0)
+            frameRate = 1e6 / static_cast<double>(*fd);      // µs
 
-    // Retrieve frame rate from metadata
-    if (!metadata.empty()) {
-        auto frameDuration = metadata.get(libcamera::controls::FrameDuration);
-        if (frameDuration && *frameDuration > 0) {
-            frameRate = 1e6 / static_cast<double>(*frameDuration); // Convert nanoseconds to microseconds
-        } else {
-            std::cerr << "WARNING: FrameDuration not available. Using default frame rate: "
-                      << frameRate << std::endl;
-        }
-    }
+    int frameNumber = static_cast<int>(
+                        (microseconds) / (1'000'000 / frameRate)) %
+                      static_cast<int>(frameRate);
 
-    // Calculate frame number within the current second (0 to frameRate - 1)
-    int frameNumber = static_cast<int>((microseconds) / (1'000'000 / frameRate)) % static_cast<int>(frameRate);
+    /* 3. Assemble filename, incl. camera suffix ---------------------------- */
+    char filename[160];                            // plenty of room
+    const char *suffix = options->camPort.empty()
+                           ? "camX"                // debug default
+                           : options->camPort.c_str();
 
-    // Add HHMMSS and frame number (FF) to filename
-    snprintf(filename, sizeof(filename), "CINEPI_%s_F%02d_C%05d", time_string, frameNumber, clip_number);
+    snprintf(filename, sizeof(filename),
+             "CINEPI_%s_F%02d_C%05d_%s",
+             time_string, frameNumber, clip_number, suffix);
 
-    options->folder = std::string(filename);
+    options->folder = filename;                    // store for later
 }
+
 
 
 bool create_clip_folder(RawOptions *options, unsigned int clip_number)
 {
-	if(!disk_mounted(options))
-		return false;
-	generate_filename(options, clip_number);
-	return fs::create_directories(options->mediaDest + std::string("/") + options->folder);
+    if (!disk_mounted(options))
+        return false;
+
+    generate_filename(options, clip_number);
+
+    std::string dir = options->mediaDest + "/" + options->folder;
+
+    /* ← NEW: succeed if the folder is already there (parallel camera). */
+    if (fs::exists(dir))
+        return true;
+
+    return fs::create_directories(dir);
 }
+
+
 
 
 bool create_stills_folder(RawOptions *options, unsigned int still_number)

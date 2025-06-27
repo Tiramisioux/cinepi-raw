@@ -17,9 +17,12 @@
 #include "cinepi_options.hpp"
 
 
+
 using namespace std::placeholders;
 
 libcamera::ControlList emptyMetadata;
+
+static bool wasRecording = false;
 
 // The main even loop for the application.
 static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePISound &sound)
@@ -60,6 +63,18 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 			libcamera::StreamConfiguration const &cfg = app.RawStream()->configuration();
 			console->info("Raw stream: {}x{} : {} : {}", cfg.size.width, cfg.size.height, cfg.stride, cfg.pixelFormat.toString());
+
+			/* ------------------------------------------------------------------ *
+			*  Announce that this cinepi-raw instance is fully initialised.      *
+			*  Key:  cinepi_ready_<camPort>   (e.g. cinepi_ready_cam0)           *
+			* ------------------------------------------------------------------ */
+
+			if (!controller.readyAnnounced())          // still unannounced?
+			{
+				std::string key = "cinepi_ready_" + options->camPort;   // <-- NEW
+				controller.announceReady(key);          // store one-shot flag
+			}
+
 			app.GetEncoder()->reset_encoder();
 			controller.process_stream_info(cfg);
 		}
@@ -88,25 +103,42 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 		// check for record trigger signal, open a new folder if rec_start or reset frame count if _rec_stop
 		int trigger = controller.triggerRec();
-		if(trigger > 0){
-			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
-			app.GetEncoder()->resetFrameCount();
-			sound.record_start();
-		} else if (trigger < 0){
-			controller.folderOpen = false;
-			sound.record_stop();
-		}
+
+        if (trigger > 0) {                       // recording just started
+            app.GetEncoder()->resetFrameCount(); // folder already open
+			app.GetEncoder()->reset_encoder(); 
+            sound.record_start();
+        }
+        else if (trigger < 0) {                  // recording stopped
+            sound.record_stop();
+        }
 
 		// send frame to dng encoder and save to disk
-		if(controller.isRecording() && controller.folderOpen){
-			// check to make sure our buffer is not full, stop recording if so. 
-			if(app.GetEncoder()->buffer_full()){
-				controller.setRecording(false);
-				console->warn("RAM pool exhausted – recording stopped");
+		bool nowRecording = controller.isRecording();
+		bool justStarted  = nowRecording && !wasRecording;
+
+		if (nowRecording && controller.folderOpen)
+		{
+			if (app.GetEncoder()->buffer_full())
+			{
+				if (justStarted)
+				{
+					// first frame after you hit Record: clear and go on
+					app.GetEncoder()->clearPool();
+					console->warn("RAM pool was full at start — cleared and continuing");
+				}
+				else
+				{
+					controller.setRecording(false);
+					console->warn("RAM pool exhausted — recording stopped");
+				}
 			}
-			
 			app.EncodeBuffer(completed_request, app.RawStream(), app.LoresStream());
 		}
+
+		// update for next iteration
+		wasRecording = nowRecording;
+
 
 		// show frame on display
 		app.ShowPreview(completed_request, app.LoresStream());//app.GetMainStream());
