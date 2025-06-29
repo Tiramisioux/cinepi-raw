@@ -1,4 +1,3 @@
-// cinepi_options.cpp
 #include "cinepi_options.hpp"
 
 #include <cstdlib>
@@ -6,63 +5,98 @@
 #include <string>
 #include <vector>
 #include <spdlog/spdlog.h>
+#include <boost/program_options.hpp>
+
+using namespace boost::program_options;
 
 CinePiOptions::CinePiOptions()
-        : RawOptions()
-        , same_hdmi(false)
-        , redis_channel("cp_controls")
-        , keep16(false)
-{}
+    : RawOptions()
+    , same_hdmi(false)
+    , keep16(false)
+    , hdmi_port(-1)
+{
+    // CinePi-only flags grouped separately
+    options_description cinepi_group("CinePi-raw specific options");
+    cinepi_group.add_options()
+        ("cam-port",
+            value<std::string>(&camPort)->implicit_value(""),
+            "Physical camera port to use (e.g. cam0 or cam1)")
+        ("hdmi-port",
+            value<int>(&hdmi_port)->default_value(-1),
+            "For DRM preview choose HDMI socket (0 = HDMI-0, 1 = HDMI-1, -1 = automatic)")
+        ("same-hdmi",
+            value<bool>(&same_hdmi)->default_value(false)->implicit_value(true),
+            "Force both apps to use the same HDMI output")
+        ("keep16",
+            value<bool>(&keep16)->default_value(false)->implicit_value(true),
+            "Write full 16-bit DNG files (disable 12-bit packing)");
 
-/* ──────────────────────────────────────────────────────────────── *
- *  Parse CinePi-specific CLI flags, then forward the remainder     *
- *  to RawOptions::Parse.                                           *
- * ──────────────────────────────────────────────────────────────── */
+    // Inject into the main options_description
+    options_.add(cinepi_group);
+}
+
 bool CinePiOptions::Parse(int argc, char *argv[])
 {
     std::vector<char *> forward;
     forward.reserve(argc);
-    forward.push_back(argv[0]);                       // argv[0] == binary name
+    forward.push_back(argv[0]);  // program name
 
-    for (int i = 1; i < argc; ++i)
-    {
+    // Manually extract CinePi flags, support both --flag value and --flag=value
+    for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
-        if (arg == "--same-hdmi")        { same_hdmi = true;           continue; }
-        if (arg == "--keep16")           { keep16    = true;           continue; }
-
-        if (arg == "--redis-channel")
-        {
-            if (i + 1 >= argc)
-                throw std::runtime_error("--redis-channel requires a value");
-            redis_channel = argv[++i];
+        if (arg.rfind("--cam-port=", 0) == 0) {
+            camPort = arg.substr(sizeof("--cam-port=") - 1);
             continue;
         }
-
-        if (arg == "--cam-port")                           // NEW  ★
-        {
+        if (arg == "--cam-port") {
             if (i + 1 >= argc)
                 throw std::runtime_error("--cam-port requires a value");
-            camPort = argv[++i];                           // RawOptions member
+            camPort = argv[++i];
             continue;
         }
 
-        /* Not one of ours – forward to RawOptions parser. */
+        if (arg.rfind("--hdmi-port=", 0) == 0) {
+            hdmi_port = std::stoi(arg.substr(sizeof("--hdmi-port=") - 1));
+            continue;
+        }
+        if (arg == "--hdmi-port") {
+            if (i + 1 >= argc)
+                throw std::runtime_error("--hdmi-port requires a value");
+            hdmi_port = std::stoi(argv[++i]);
+            continue;
+        }
+
+        if (arg == "--same-hdmi") {
+            same_hdmi = true;
+            continue;
+        }
+        if (arg == "--keep16") {
+            keep16 = true;
+            continue;
+        }
+
+        // Not a CinePi flag – forward to RawOptions parser
         forward.push_back(argv[i]);
     }
 
-    /* Call base-class parser with stripped argv. */
-    int  new_argc = static_cast<int>(forward.size());
-    bool ok       = RawOptions::Parse(new_argc, forward.data());
+    // Base parse handles all other flags (and help/version)
+    int new_argc = static_cast<int>(forward.size());
+    bool ok = RawOptions::Parse(new_argc, forward.data());
 
-    /* Quick sanity log. */
+    // Derive default camPort if not explicitly set
+    if (camPort.empty()) {
+        camPort = "cam" + std::to_string(camera);
+    }
+
+    // Log configuration
     spdlog::info(
-        "cinepi-cli: camPort='{}'  hdmi_port={}  same_hdmi={}  redis_channel='{}'",
-        camPort.empty() ? "<unset>" : camPort.c_str(),
+        "cinepi-cli: camPort='{}'  hdmi_port={}  same_hdmi={}",
+        camPort,
         hdmi_port,
-        same_hdmi ? "true" : "false",
-        redis_channel
+        same_hdmi ? "true" : "false"
     );
 
-    return ok && !redis_channel.empty();
+    return ok;
+    // return ok && !redis_channel.empty();
 }

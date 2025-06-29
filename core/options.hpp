@@ -103,13 +103,6 @@ struct Options
 		using namespace boost::program_options;
 		// clang-format off
 		options_.add_options()
-			("hdmi-port",
-			value<int>(&hdmi_port)->default_value(-1),
-			"For DRM preview choose HDMI socket "
-			"(0 = HDMI‑0, 1 = HDMI‑1, -1 = automatic)")
-			("keep16",
-			value<bool>(&keep16)->default_value(false)->implicit_value(true),
-			"Write full 16-bit DNG files (disable 12-bit packing of 16-bit streams)")
 			("help,h", value<bool>(&help)->default_value(false)->implicit_value(true),
 			 "Print this help message")
 			("version", value<bool>(&version)->default_value(false)->implicit_value(true),

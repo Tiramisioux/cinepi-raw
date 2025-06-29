@@ -527,5 +527,4 @@ void Options::Print() const
 		std::cerr << "    viewfinder-buffer-count: " << viewfinder_buffer_count << std::endl;
 	std::cerr << "    metadata: " << metadata << std::endl;
 	std::cerr << "    metadata-format: " << metadata_format << std::endl;
-	std::cerr << "    hdmi-port: " << hdmi_port << std::endl;
 }
