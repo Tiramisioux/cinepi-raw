@@ -1,80 +1,138 @@
-# cinepi-raw
+![cp_raw_banner](https://github.com/cinepi/cinepi-raw/assets/25234407/71591abc-f9b2-467e-806f-30557bcd1491)
 
-Small, **libcamera‑based** utilities for driving Raspberry Pi cameras with CinePi
+*fork of rpicam-apps that builds upon the rpicam-raw app, offering cinema dng recording capabillities and integration with REDIS offering an abstract "API" like layer for custom integrations / controls.*
 
-> **Heads‑up**  
-> The upstream tools were renamed from `libcamera-*` ➜ `rpicam-*`.  
-> This fork goes one step further and re‑brands the whole tree as **cinepi‑raw**, while adding features required by the CinePi project.  
+Requirements
+-----
+Please install the below requirements before continuing with the rest of the build process:
 
-## What’s new in in CineMate fork
+[Redis](https://github.com/redis/redis)
 
-### Multi‑instance multi‑HDMI routing
+[Hiredis](https://github.com/redis/hiredis)
 
-CinePi can <em>several</em> `cinepi-raw` instances in parallel – for example, two IMX585 sensors on a Raspberry Pi 5, each with its own monitor.  
+[Redis++](https://github.com/sewenew/redis-plus-plus)
 
-ith the new <code>--hdmi-port</code> / <code>--same-hdmi</code> logic every instance can now claim a **specific** HDMI socket (0 = left, 1 = right) and keep its preview there, regardless of the order in which the programs start.
+Build
+-----
+For usage and build instructions, see the [below.](https://github.com/Tiramisioux/cinepi-raw/edit/rpicam-apps_1.7_custom_encoder/README.md#build--install)
 
-If you give only the first instance a port number and add <code>--same-hdmi</code> to the rest, they’ll automatically follow that choice.
-</details>
+License
+-------
 
-| Feature | Flag | Notes |
-|---------|------|-------|
-| Force preview to a specific HDMI socket | `--hdmi-port <0\|1>` | Pi 4 / Pi 5 with dual HDMI; **‑1 or omit** ➜ let KMS choose |
-| Keep *all* apps on the same HDMI output | `--same-hdmi` | First app decides, the rest follow |
+The source code is made available under the simplified [BSD 2-Clause license](https://spdx.org/licenses/BSD-2-Clause.html).
 
-The new flags are parsed by **`CinePiOptions`**, translated to a DRM *connector‑id* in `hdmi_utils.cpp`, and enforced by the revamped `drm_preview` backend.  
-Everything else (stills, video, raw pipelines) is untouched rpicam‑apps code.
+---
 
-## Quick usage – IMX477 example
-    cinepi-raw \
-    --mode 2028:1080:12:U \
-    --width 2028 --height 1080 \
-    --lores-width 1280 --lores-height 720 \
-    -p "0,30,1920,1020" \
-    --shutter 20000 \
-    --awbgains "2.5,2.0" \
-    --awb auto \
-    --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json \
-    --hdmi-port 1
+# CineMate fork
 
-_Captures RAW DNG while forcing the preview onto the second HDMI socket._
+- Adapted to libcamera 0.5 / rpicam-apps 1.0.7.
+
+## Additional flags
+
+The following flags extend the base `rpicam-apps` functionality with CinePi-raw–specific features:
+
+| Flag                    | Default           | Description                                                                                          |
+|-------------------------|-------------------|------------------------------------------------------------------------------------------------------|
+| `--cam-port <string>`   | `""`              | Physical camera port to use (e.g. `cam0` or `cam1`).                                         |
+| `--hdmi-port <int>`     | `-1`              | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
+| `--same-hdmi`           | `false`           | Force both CinePi apps (capture & controller) to share the same HDMI output.                        |
+| `--keep16`              | `false`           | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit streams.                            |
+
+## Manual DNG encoder
+
+- Manual writing of DNG tags. 
+
+- Frames are written uncompressed, for simple I/O.
+
+- Packs the 16 bit files to 12 bit, unless `--keep16` is used.
+
+- Supports both IMX 585 color and mono variants.
+  
+## Audio recording
+
+- Places WAV output alongside  DNG take (`media/RAW/<folder>.wav`).
+
+- Compatible with USB 16 bit mono and RODE Videomic 24bit stereo microphone using `dsnoop`.
+
+### .asoundrc Setup
+
+For `dsnoop` support, create a `~/.asoundrc` in home directory:
+
+```bash
+nano ~/.asoundrc
+```
+
+```bash
+
+    pcm.dsnoop_24bit {
+        type dsnoop
+        ipc_key 2048
+        slave {
+            pcm "hw:Device,0"
+            channels 2
+            rate 48000
+            format S24_3LE
+            period_size 1024
+            buffer_size 4096
+        }
+    }
+
+    pcm.dsnoop_16bit {
+        type dsnoop
+        ipc_key 2049
+        slave {
+            pcm "hw:Device,0"
+            channels 1
+            rate 48000
+            format S16_LE
+            period_size 1024
+            buffer_size 4096
+        }
+    }
+
+    pcm.mic_24bit {
+        type plug
+        slave.pcm "dsnoop_24bit"
+    }
+
+    pcm.mic_16bit {
+        type plug
+        slave.pcm "dsnoop_16bit"
+    }
+
+```
+
+Exit nano editor using ctrl+x.
+
+---
 
 ## Build & Install
 
-### 0 . Prerequisites
+### 0 . Prerequisites
 
-    sudo apt update
-    sudo apt install -y python3-pip git python3-jinja2 python3-ply python3-yaml \
-                    libboost-dev libgnutls28-dev openssl libtiff-dev pybind11-dev \
-                    qtbase5-dev libqt5core5a libqt5gui5 libqt5widgets5 \
-                    meson ninja-build cmake libglib2.0-dev \
-                    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-                    libavdevice59 libavdevice-dev libdrm-dev libexif-dev \
-                    libjpeg-dev libpng-dev libtiff5-dev \
-                    build-essential redis-server libhiredis-dev libjsoncpp-dev
+If you run Raspberry Pi OS Lite, begin by installing the following packages:
+
+```bash
+sudo apt install -y python-pip git python3-jinja2
+````
+
+```bash
+sudo apt install -y libboost-dev
+sudo apt install -y libgnutls28-dev openssl libtiff-dev pybind11-dev
+sudo apt install -y qtbase5-dev libqt5core5a libqt5widgets
+sudo apt install -y meson cmake
+sudo apt install -y python3-yaml python3-ply
+sudo apt install -y libglib2.0-dev libgstreamer-plugins-base1.0-dev
+```
+
+### 1 . Build & install libcamera
+
+    git clone https://github.com/raspberrypi/libcamera
+    sudo meson setup build --buildtype=release -Dpipelines=rpi/vc4,rpi/pisp -Dipas=rpi/vc4,rpi/pisp -Dv4l2=true -Dgstreamer=enabled -Dtest=false -Dlc-compliance=disabled -Dcam=disabled -Dqcam=disabled -Ddocumentation=disabled -Dpycamera=enabled
+    ninja -C build install
     sudo ldconfig
 
-### 1 . Build & install libcamera
-
-    git clone https://github.com/Tiramisioux/libcamera.git --branch cinepi-sdk-002
-    sudo find libcamera -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod +x {} \;
-    cd libcamera
-    sudo meson setup build --buildtype=release \
-        -Dpipelines=rpi/vc4,rpi/pisp \
-        -Dipas=rpi/vc4,rpi/pisp \
-        -Dv4l2=true -Dgstreamer=enabled \
-        -Dtest=false -Dlc-compliance=disabled -Dcam=disabled -Dqcam=disabled \
-        -Ddocumentation=disabled -Dpycamera=enabled
-    sudo ninja -C build install
-    cd ..
-
-Tiff dev quirk – on some images one header is missing a soname symlink:
-
-    sudo ln -sf $(ldconfig -p | grep libtiff.so | head -n1 | awk '{print $4}') \
-           /usr/lib/aarch64-linux-gnu/libtiff.so.5
-    sudo ldconfig
-
-### 2 . Install redis-plus-plus (C++ Redis client)
+### 2 . Install redis-plus-plus (C++ Redis client)
     git clone https://github.com/sewenew/redis-plus-plus.git
     cd redis-plus-plus && mkdir build && cd build
     cmake .. && make -j$(nproc)
@@ -82,47 +140,64 @@ Tiff dev quirk – on some images one header is missing a soname symlink:
     cd ../..
     sudo ldconfig
 
-### 3 . Clone, build & install cinepi‑raw
-    git clone https://github.com/Tiramisioux/cinepi-raw.git --branch cinepi-sdk-002_cinemate-v3
+### 3 . Clone, build & install cinepi‑raw
+    git clone https://github.com/Tiramisioux/cinepi-raw.git --rpicam-apps_1.7_custom_encoder
     cd cinepi-raw
-    meson setup build --buildtype=release     # no sudo – build in user space
-    ninja -C build                            # ⏳
+    sudo meson setup build --buildtype=release     
+    ninja -C build                            
     sudo meson install -C build
     sudo ldconfig
 
+---
 
-### Redis bootstrap (optional)
+## Quick usage
 
-If you use the CinePi controller’s Redis interface, pre‑seed a few keys:
+Here is an example using IMX477 camera connected to cam0 while forcing the preview onto the second HDMI socket.
 
-    redis-cli --pipe <<'EOF'
-    SET fps_actual          24
-    PUBLISH cp_controls     fps
-    SET shutter_a           180
-    PUBLISH cp_controls     shutter_a
-    SET shutter_a_nom       180
-    PUBLISH cp_controls     shutter_a_nom
-    SET is_recording        0
-    PUBLISH cp_controls     is_recording
-    SET is_writing          0
-    PUBLISH cp_controls     is_writing
-    SET sensor              imx477
-    PUBLISH cp_controls     sensor
-    SET sensor_mode         0
-    PUBLISH cp_controls     sensor_mode
-    SET is_writing_buf      0
-    SET current_sensor_mode 0
-    PUBLISH cp_controls     current_sensor_mode
-    SET fps_max             50
-    PUBLISH cp_controls     fps_max
-    SET trigger_mode        0
-    PUBLISH cp_controls     trigger_mode
-    SET is_buffering        0
-    PUBLISH cp_controls     is_buffering
-    SET fps_user            24
-    PUBLISH fps_user        0
-    SET fps_last            24
-    PUBLISH fps_user        0
-    EOF
+In `/boot/firmware/config.txt`, set
 
+`dtoverlay=imx477,cam0`
+
+reboot
+
+then
+
+```bash
+cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0 
+```
+
+
+## Controlling recording via Redis
+
+_Same as the original cinepi-raw but thought I should include it here for easy reference._
+
+Cinepi-raw records to drives (SSD or NVME) mounted as /media/RAW/. 
+
+Start and stop recording by publishing to the `is_recording` key.
+
+1. Open a second SSH session  
+
+2. Launch the Redis CLI
+
+```bash
+redis-cli
+```
+you’ll see a prompt like:
+
+```bash
+127.0.0.1:6379>
+```
+
+3. Start recording
+
+```bash
+SET is_recording 1
+PUBLISH cp_controls is_recording
+```
+
+4. Stop recording
+```bash
+SET is_recording 0
+PUBLISH cp_controls is_recording
+```
 
