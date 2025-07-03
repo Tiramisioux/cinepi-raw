@@ -105,11 +105,13 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		int trigger = controller.triggerRec();
 
         if (trigger > 0) {                       // recording just started
+			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
             app.GetEncoder()->resetFrameCount(); // folder already open
 			app.GetEncoder()->reset_encoder(); 
             sound.record_start();
         }
         else if (trigger < 0) {                  // recording stopped
+			controller.folderOpen = false;
             sound.record_stop();
         }
 

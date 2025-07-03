@@ -189,6 +189,7 @@ void CinePIController::sync(){
     // options_->lores_width = options_->width >> 3;
     // options_->lores_height = options_->height >> 3;
     options_->mode_string = "0:0:0:0";
+
 }
 
 void CinePIController::process(CompletedRequestPtr &completed_request){
@@ -224,25 +225,40 @@ void CinePIController::mainThread(){
         }},
         
         { CONTROL_KEY_RECORD, [this](const std::optional<std::string> &r) {
-            if (!r) return;                               // nothing to do
+            if (!r) return;
 
-            bool level = std::stoi(*r);                   // 0 or 1
+            bool level = std::stoi(*r);
 
-            /* ● rise --------------------------------------------------------- */
-            if (level && !is_recording_)                  // 0 → 1
-                trigger_ = +1;
-
-            /* ● fall --------------------------------------------------------- */
-            else if (!level && is_recording_)             // 1 → 0
-                trigger_ = -1;
-
-            /* ● duplicate write – ignore ------------------------------------ */
-            else
+            if (level != is_recording_) {
+                trigger_ = level ? +1 : -1;
+            } else {
                 trigger_ = 0;
+            }
 
-            /* finally remember the level we’re in */
             is_recording_ = level;
         }},
+
+
+        // { CONTROL_KEY_RECORD, [this](const std::optional<std::string> &r) {
+        //     if (!r) return;                               // nothing to do
+
+        //     bool level = std::stoi(*r);                   // 0 or 1
+
+        //     /* ● rise --------------------------------------------------------- */
+        //     if (level && !is_recording_)                  // 0 → 1
+        //         trigger_ = +1;
+
+        //     /* ● fall --------------------------------------------------------- */
+        //     else if (!level && is_recording_)             // 1 → 0
+        //         trigger_ = -1;
+
+        //     /* ● duplicate write – ignore ------------------------------------ */
+        //     else
+        //         trigger_ = 0;
+
+        //     /* finally remember the level we’re in */
+        //     is_recording_ = level;
+        // }},
 
             
         { CONTROL_KEY_ISO, [this](const std::optional<std::string>& r) {
