@@ -16,6 +16,10 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <sched.h>      // sched_setaffinity / pthread_setaffinity_np
+#include <pthread.h>
+
+#define FPS_DIVIDER 4
 
 using Stream = libcamera::Stream;
 using MJPEGStreamer = nadjieb::MJPEGStreamer;
@@ -37,10 +41,14 @@ private:
     Stream *stream_;
     StreamInfo info_;
 
+    int div = FPS_DIVIDER;
+
     std::shared_ptr<spdlog::logger> console;
 
     int port_;
     bool running_ = true;
+
+    std::vector<int> cpus_;
 
     MJPEGStreamer streamer_;
 
@@ -128,12 +136,19 @@ void mjpegStreamStage::compressToJPEG(libcamera::Span<uint8_t> &inputBuffer, std
     free(encoded_buffer);
 
     jpeg_destroy_compress(&cinfo);
+    
 }
 
 
 void mjpegStreamStage::Read(boost::property_tree::ptree const &params)
 {
     port_ = params.get<int>("port", port_);
+
+    // Parse optional cpuAffinity array
+    cpus_.clear();
+    if (auto arr = params.get_child_optional("cpuAffinity"))
+        for (auto &v : *arr)
+            cpus_.push_back(v.second.get_value<int>());
 }
 
 mjpegStreamStage::mjpegStreamStage(RPiCamApp *app) : PostProcessingStage(app)
@@ -153,17 +168,37 @@ void mjpegStreamStage::Teardown(){
 
 void mjpegStreamStage::Configure()
 {
-    stream_ = app_->GetMainStream();
+    stream_ = app_->LoresStream();
     info_ = app_->GetStreamInfo(stream_);
     console->info("networkPreviewStage: {}x{} {}", info_.width, info_.height, info_.stride);
     console->info("Setting up NetworkPreview on port: {}", port_);
-    streamer_.start(port_, 8);
+    /* -------------------------------------------------------- */
+    /*  Start streamer in its own std::thread so we can pin it  */
+    /* -------------------------------------------------------- */
+    std::thread([this] {
+        /* -- if an affinity mask was supplied, apply it NOW -- */
+        if (!cpus_.empty())
+        {
+            cpu_set_t set; CPU_ZERO(&set);
+            for (int c : cpus_) CPU_SET(c, &set);
+
+            if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set))
+                perror("pthread_setaffinity_np (mjpegPreview)");
+        }
+
+        /* mjpeg-streamer’s own blocking run-loop */
+        streamer_.start(port_, 8);        // 8 = max clients
+    }).detach();
 }
 
 #include <chrono>
 
 bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
 {
+
+    div--;
+    if (div == 0){
+    div = FPS_DIVIDER;
     auto startOverall = std::chrono::high_resolution_clock::now();
 
     auto startWriteSync = std::chrono::high_resolution_clock::now();
@@ -192,8 +227,8 @@ bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
     console->trace("Duration of WriteSync: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endWriteSync - startWriteSync).count());
     console->trace("Duration of Compression: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endCompression - startCompression).count());
     console->trace("Duration of Publish: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endPublish - startPublish).count());
-    console->debug("Overall Duration: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endOverall - startOverall).count());
-
+    console->debug("mJPEG Overall Duration: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endOverall - startOverall).count());
+   }
     return false;
 }
 
