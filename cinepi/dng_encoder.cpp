@@ -15,15 +15,15 @@
  #include <stdexcept>
  #include <iomanip>
  
- #include <sstream>                 // ostringstream for filenames
- #include <fstream>                 // /proc/meminfo parsing
- #include <regex>                   // extract MemAvailable
+ #include <sstream>                 
+ #include <fstream>                 
+ #include <regex>                   
  
- #include "dng_encoder.hpp"         // This file's class definition
- #include "utils.hpp"               // You call getHwId() from here
- #include "ifd_builder.hpp"         // Used in dng_save() for TIFF/IFD writing
+ #include "dng_encoder.hpp"        
+ #include "utils.hpp"               
+ #include "ifd_builder.hpp"         
  
- #include <sys/mman.h>              // O_DIRECT
+ #include <sys/mman.h>              
  #include <sys/types.h>
  #include <sys/stat.h>
  #include <fcntl.h>
@@ -649,15 +649,23 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
     ifd.addEntry(305, TIFF_ASCII, soft .size(), soft .data());
     ifd.addEntry(0xC614, TIFF_ASCII, ucm.size(), ucm.data());
 
-    /* frame-rate from metadata */
-    int32_t fpsRat[2] = { 25000, 1000 };                 /* default 25 fps */
+    /* ▸ CinemaDNG tag 0xC764  –  FrameRate (SRATIONAL) */
+
+    // fallback: use CLI --framerate (same behaviour as old encoder)
+    int32_t fpsRat[2] = {
+        static_cast<int32_t>(*options_->framerate + 0.5),   // numerator
+        1000                                                      // denominator
+    };
+
+    // preferred: per-frame value from libcamera metadata
     if (auto fd = metadata.get(controls::FrameDuration); fd && *fd > 0)
     {
-        double fps = 1e9 / static_cast<double>(*fd);
-        fpsRat[0] = static_cast<int32_t>(fps * 1000 + 0.5);
-        fpsRat[1] = 1000;
+        double fps = 1e9 / static_cast<double>(*fd);              // ns → fps
+        fpsRat[0] = static_cast<int32_t>(fps + 0.5);       // numerator
     }
+
     ifd.addEntry(0xC764, TIFF_SRATIONAL, 1, fpsRat);
+
 
     /* time-code (BCD) */
     struct timeval tv;  gettimeofday(&tv, nullptr);
