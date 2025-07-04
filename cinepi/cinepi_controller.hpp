@@ -51,6 +51,8 @@ class CinePIController : public CinePIState
             main_thread_.join();
         };
 
+        bool buffer_size_sent_ = false;
+
         void start(){
             redis_ = std::make_unique<sw::redis::Redis>(options_->redis.value_or(REDIS_DEFAULT));
             console->debug(redis_->ping());

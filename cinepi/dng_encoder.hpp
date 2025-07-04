@@ -79,6 +79,9 @@ public:
 	std::array<uint8_t, 8> originationTimeCode;
 	std::array<uint16_t, 3> originationDate;
 
+	/* ---- PUBLIC: number of frame buffers that fit in RAM ---- */
+	size_t maxRamBuffers() const { return max_ram_buffers_; }
+
 	/// Drain any queued frames and free their buffers so that
 	/// buffer_full() will return false again.
 	void clearPool();

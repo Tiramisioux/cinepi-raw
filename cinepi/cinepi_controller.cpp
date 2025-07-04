@@ -195,6 +195,15 @@ void CinePIController::sync(){
 void CinePIController::process(CompletedRequestPtr &completed_request){
     CinePIFrameInfo info(completed_request->metadata);
 
+    /* -------------------------------------------------------- *
+    *  Publish max_ram_buffers_ exactly once per configuration *
+    * -------------------------------------------------------- */
+   if (!buffer_size_sent_ && app_->GetEncoder()->initialized()) {
+       size_t max_buf = app_->GetEncoder()->maxRamBuffers();
+       redis_->set("buffer_size", std::to_string(max_buf));
+       buffer_size_sent_ = true;
+    }
+
     Json::Value data;
     Json::Value histo;
     data["framerate"] = completed_request->framerate;
@@ -330,6 +339,7 @@ void CinePIController::mainThread(){
                 compression_ = stoi(*r);
                 options_->compression = compression_;
                 cameraInit_ = true;
+                buffer_size_sent_ = false;
             }
         }},
         { "lv_zoom", [this](const std::optional<std::string>& r) {
