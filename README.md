@@ -37,6 +37,8 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--hdmi-port <int>`     | `-1`              | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
 | `--same-hdmi`           | `false`           | Force both CinePi apps (capture & controller) to share the same HDMI output.                        |
 | `--keep16`              | `false`           | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit streams.                            |
+| `--zoom <float>`       | `1.0`             | Centre-crop digital zoom for streams **0** (viewfinder/encode) and **2** (lo-res).<br>`0.5` = zoom-out, `2.0` = 200 % punch-in. If `--scaler-crops` is present it takes precedence. |
+
 
 ## Manual DNG encoder
 
@@ -166,38 +168,35 @@ then
 cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0 
 ```
 
-
 ## Controlling recording via Redis
 
-_Same as the original cinepi-raw but thought I should include it here for easy reference._
+CinePi-raw listens for recording commands through a **single string key**  `is_recording` and the **`cp_controls` pub-sub channel**.  
 
-Cinepi-raw records to drives (SSD or NVME) mounted as /media/RAW/. 
+The mechanism in the CineMate fork is edge-driven: only **transitions** 0 → 1 or 1 → 0 start or stop a take; duplicate writes are ignored.
 
-Start and stop recording by publishing to the `is_recording` key.
-
-1. Open a second SSH session  
-
-2. Launch the Redis CLI
-
-```bash
-redis-cli
-```
-you’ll see a prompt like:
+| Transition | What CinePi-raw does |
+|------------|----------------------|
+| **0 → 1**  | Creates a new take folder under `/media/RAW/YYYYMMDD/clip_###/` and starts writing CinemaDNG frames (plus WAV if audio is enabled). |
+| **1 → 0**  | Closes the current take and stops encoding. |
+| **0 → 0** or **1 → 1** | No effect (debounce). |
 
 ```bash
-127.0.0.1:6379>
+# Start recording
+redis-cli SET is_recording 1
+redis-cli PUBLISH cp_controls is_recording    # triggers 0 → 1 edge
+
+# Stop recording
+redis-cli SET is_recording 0
+redis-cli PUBLISH cp_controls is_recording    # triggers 1 → 0 edge
 ```
 
-3. Start recording
+## Live digital zoom via Redis
 
 ```bash
-SET is_recording 1
-PUBLISH cp_controls is_recording
+SET zoom 1.8
+PUBLISH cp_controls zoom
 ```
 
-4. Stop recording
-```bash
-SET is_recording 0
-PUBLISH cp_controls is_recording
-```
+The value is a simple float matching the --zoom CLI flag. CinePi-raw applies the new crop in the very next frame — no restart needed.
+
 
