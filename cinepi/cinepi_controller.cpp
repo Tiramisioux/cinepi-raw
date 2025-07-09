@@ -483,6 +483,7 @@ void CinePIController::mainThread(){
 
 
             console->info("⇢ live zoom now {:.2f}×", z);
+
         }},   // end CONTROL_KEY_ZOOM
 
     };

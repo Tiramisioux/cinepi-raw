@@ -31,7 +31,7 @@ public:
         bool               Keep16()         const { return keep16;   }
         float Zoom()  const { return zoom_factor; }
         void  SetZoom(float z) { zoom_factor = z; }
-        bool  ZoomRaw()  const { return zoom_raw; }
+        bool  ZoomRaw() const { return zoom_raw; }   // <-- bring this back
         void  SetZoomRaw(bool v) { zoom_raw = v; }
 
         
