@@ -39,6 +39,8 @@
 
 #define CONTROL_KEY_CAMERAINIT "cam_init"
 
+#define CONTROL_KEY_ZOOM "zoom"
+
 class CinePIState
 {
     public:

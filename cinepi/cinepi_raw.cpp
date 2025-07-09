@@ -15,6 +15,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include "cinepi_options.hpp"
+#include <libcamera/controls.h>
 
 
 
@@ -58,6 +59,38 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			}
 			app.ConfigureVideo(CinePIRecorder::FLAG_VIDEO_RAW, 0);
                         //app.ConfigureViewfinder();
+
+
+            if (!options->ScalerCrops().empty())
+            {
+                const libcamera::StreamConfiguration &raw_cfg =
+                        app.RawStream()->configuration();   // already valid here
+                uint32_t sensor_w = raw_cfg.size.width;
+                uint32_t sensor_h = raw_cfg.size.height;
+
+				// How many ISP streams did libcamera create?
+				size_t isp_streams = cameras[0]->streams().size();   // usually 3
+
+				// Make a working copy so we can resize without touching options
+				auto fracs = options->ScalerCrops();
+				fracs.resize(isp_streams, {0.f,0.f,0.f,0.f});          // pad with empties
+
+                std::vector<libcamera::Rectangle> pixelRects;
+				for (auto const &f : fracs)
+				{
+					pixelRects.emplace_back(
+						f[0] * sensor_w,
+						f[1] * sensor_h,
+						f[2] * sensor_w,
+						f[3] * sensor_h);
+				}
+
+
+                libcamera::ControlList ctrls(cameras[0]->controls());
+                ctrls.set(controls::rpi::ScalerCrops, pixelRects);
+                app.SetControls(std::move(ctrls));          // queues for frame #0
+            }
+
 			app.StartCamera();
 			controller.cameraRunning = true;
 
@@ -71,7 +104,7 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 			if (!controller.readyAnnounced())          // still unannounced?
 			{
-				std::string key = "cinepi_ready_" + options->camPort;   // <-- NEW
+				std::string key = "cinepi_ready_" + options->CamPort();
 				controller.announceReady(key);          // store one-shot flag
 			}
 
