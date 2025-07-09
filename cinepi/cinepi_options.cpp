@@ -41,7 +41,10 @@ CinePiOptions::CinePiOptions()
                         ->default_value(1.0f),
                     "Digital zoom factor for streams 0 & 2 "
                     "(1.0 = full frame, 2.0 = 200 % centre-crop)")
-
+                ("zoom-raw",
+                        value<bool>()->default_value(false)->implicit_value(true),
+                        "Apply --zoom crop to the RAW stream as well")
+                        ;
                 ("scaler-crops",
                     value<std::string>()->implicit_value(""),
                     "Per-stream crop rectangles as fractions:\n"
@@ -116,6 +119,10 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                         continue;
                 }
 
+                /* --zoom-raw ----------------------------------------------------------- */
+                if (arg == "--zoom-raw") { zoom_raw = true; continue; }
+
+
                 if (arg.rfind("--scaler-crops=", 0) == 0) {
                         scaler_crops_str = arg.substr(sizeof("--scaler-crops=") - 1);
                         continue;
@@ -147,17 +154,19 @@ bool CinePiOptions::Parse(int argc, char *argv[])
         }
         if (scaler_crops_rects.empty() && Zoom() != 1.0f)
         {
-                float w = 1.0f / Zoom();
-                if (w > 1.0f) w = 1.0f;                      // clamp zoom-out
-                float h = w;
-                float x = (1.0f - w) / 2.0f;
-                float y = (1.0f - h) / 2.0f;
+        float w = 1.0f / Zoom();
+        float h = w;
+        float x = (1.0f - w) / 2.0f;
+        float y = x;
+        std::array<float,4> r = {x,y,w,h};
 
-                /* three-stream layout: [0]=viewfinder, [1]=RAW, [2]=lo-res */
-                scaler_crops_rects.resize(3, {0.f,0.f,0.f,0.f});
-                scaler_crops_rects[0] = {x,y,w,h};
-                scaler_crops_rects[2] = {x,y,w,h};
+        scaler_crops_rects = {
+                r,                              // stream 0 – preview
+                ZoomRaw() ? r : std::array<float,4>{0,0,1,1},   // stream-1 RAW
+                r                               // stream 2 – lo-res
+        };
         }
+
 
         /* Derive default camPort if user left it blank */
         if (camPort.empty())

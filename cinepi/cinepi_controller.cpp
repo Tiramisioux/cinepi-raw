@@ -226,7 +226,7 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
 }
 
 void CinePIController::mainThread(){
-
+    spdlog::set_level(spdlog::level::debug); 
     console->info("CinePIController Started!");
     auto sub = redis_->subscriber();
 
@@ -419,39 +419,73 @@ void CinePIController::mainThread(){
                 system(("amixer -c 1 sset 'Mic' " + *r + " > /dev/null 2>&1").c_str());
             }
         }},
-            { CONTROL_KEY_ZOOM, [this](const std::optional<std::string> &r) {
-            if (!r) return;
+        { CONTROL_KEY_ZOOM, [this](const std::optional<std::string> &r)
+        {
+            if (!r)                // empty publish → ignore
+                return;
 
-            /* 1. Parse & clamp ---------------------------------------------------- */
-            double z = std::max(0.1, std::stod(*r));   // prevent divide-by-zero
-            options_->SetZoom(z);
+            /* ─────────── 0. parse & deduplicate ─────────── */
+            static double last_z = 1.0;                         // remember previous
+            double z = std::clamp(std::stod(*r), 0.10, 25.0);   // keep sane range
 
-            /* 2. Build fractional rectangles for streams 0 & 2 ------------------- */
-            float w = 1.0 / z;
-            if (w > 1.0f) w = 1.0f;                    // prevent zoom-out > 100 %
-            float h = w;
-            float x = (1.0f - w) / 2.0f;
-            float y = (1.0f - h) / 2.0f;
+            console->debug("ZOOM raw='{}'  parsed={:.3f}  prev={:.3f}",
+                        *r, z, last_z);
 
-            size_t isp_streams = app_->GetCameras()[0]->streams().size();
+            if (std::abs(z - last_z) < 1e-3) {                  // no real change
+                console->debug("… duplicate – ignored");
+                return;
+            }
+            last_z = z;
+            options_->SetZoom(z);                               // store for CLI / save
+
+            /* ─────────── 1. active sensor area ──────────── */
+            libcamera::Rectangle sensor =
+                app_->GetCameras()[0]->properties()
+                    .get(libcamera::properties::ScalerCropMaximum)
+                    .value_or(libcamera::Rectangle());          // fallback 0,0,0,0
+
+            uint32_t Sw = sensor.width;                         // e.g. 3856
+            uint32_t Sh = sensor.height;                        // e.g. 2180
+            console->debug("Sensor active {}×{}  {}", Sw, Sh, sensor.toString());
+
+            /* ─────────── 2. requested FoV (pixels) ──────── */
+            float w_frac = 1.f / z;
+            float h_frac = w_frac;
+            float x_frac = (1.f - w_frac) / 2.f;
+            float y_frac = x_frac;
+
+            uint32_t x = static_cast<uint32_t>(x_frac * Sw) & ~1U;   // even align
+            uint32_t y = static_cast<uint32_t>(y_frac * Sh) & ~1U;
+            uint32_t w = static_cast<uint32_t>(w_frac * Sw) & ~1U;
+            uint32_t h = static_cast<uint32_t>(h_frac * Sh) & ~1U;
+
+            libcamera::Rectangle crop(x, y, w, h);
+            console->debug("Crop rect {}", crop.toString());
+
+            /* ─────────── 3. per-stream rectangles ───────── */
+            const auto &streams = app_->GetCameras()[0]->streams();
             std::vector<libcamera::Rectangle> rects;
-            rects.reserve(isp_streams);
+            rects.reserve(streams.size());
 
-            for (size_t i = 0; i < isp_streams; ++i) {
-                if (i == 0 || i == 2)          // crop streams 0 & 2
-                    rects.emplace_back(x * 65536, y * 65536,
-                                    w * 65536, h * 65536);   // fp16 units
-                else                           // RAW or any extra streams
-                    rects.emplace_back();      // empty rectangle
+            for (size_t i = 0; i < streams.size(); ++i)
+            {
+                bool crop_this = (i == 0 || i == 2) ||               // preview & lo-res
+                                (i == 1 && options_->ZoomRaw());    // RAW if flag
+                rects.emplace_back(crop_this ? crop : sensor);
+                console->debug("· stream {}  {}", i, rects.back().toString());
             }
 
-            /* 3. Push to the camera ---------------------------------------------- */
+            /* ─────────── 4. push to ISP ─────────────────── */
             libcamera::ControlList cl(app_->GetCameras()[0]->controls());
-            cl.set(libcamera::controls::rpi::ScalerCrops, rects);
+            cl.set(controls::ScalerCrop, crop);          //  ← no “rpi::”
+            cl.set(controls::rpi::StatsOutputEnable, true);
             app_->SetControls(cl);
-        }},
-    };
 
+
+            console->info("⇢ live zoom now {:.2f}×", z);
+        }},   // end CONTROL_KEY_ZOOM
+
+    };
 
     sub.on_message([this, &handlers](std::string channel, std::string msg) {
         console->trace("{} from: {}", msg, channel);

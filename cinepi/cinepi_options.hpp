@@ -31,6 +31,9 @@ public:
         bool               Keep16()         const { return keep16;   }
         float Zoom()  const { return zoom_factor; }
         void  SetZoom(float z) { zoom_factor = z; }
+        bool  ZoomRaw()  const { return zoom_raw; }
+        void  SetZoomRaw(bool v) { zoom_raw = v; }
+
         
         /* Vector of crop rectangles (fractions) in stream order.        */
         const std::vector<std::array<float,4>> &ScalerCrops() const
@@ -43,5 +46,6 @@ private:
         bool         keep16;
         int          hdmi_port;
         std::vector<std::array<float,4>> scaler_crops_rects;    
-        float zoom_factor { 1.0f };     
+        float zoom_factor { 1.0f };  
+        bool         zoom_raw    { false };   
 };

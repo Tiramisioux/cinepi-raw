@@ -6,6 +6,7 @@
  */
 
 #include <chrono>
+#include <vector>
 #include "cinepi_sound.hpp"
 #include "cinepi_controller.hpp"
 
@@ -60,36 +61,42 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			app.ConfigureVideo(CinePIRecorder::FLAG_VIDEO_RAW, 0);
                         //app.ConfigureViewfinder();
 
+			if (!options->ScalerCrops().empty())
+			{
+				/* 1. grab the set */
+				const auto &streamSet = cameras[0]->streams();   // std::set<Stream*>
 
-            if (!options->ScalerCrops().empty())
-            {
-                const libcamera::StreamConfiguration &raw_cfg =
-                        app.RawStream()->configuration();   // already valid here
-                uint32_t sensor_w = raw_cfg.size.width;
-                uint32_t sensor_h = raw_cfg.size.height;
+				/* 2. copy into a vector so we can use [i] */
+				std::vector<libcamera::Stream *> streams(streamSet.begin(), streamSet.end());
 
-				// How many ISP streams did libcamera create?
-				size_t isp_streams = cameras[0]->streams().size();   // usually 3
+				/* 3. build per-stream rectangles */
+				auto fracs = options->ScalerCrops();             // already padded
+				std::vector<libcamera::Rectangle> pixelRects;
 
-				// Make a working copy so we can resize without touching options
-				auto fracs = options->ScalerCrops();
-				fracs.resize(isp_streams, {0.f,0.f,0.f,0.f});          // pad with empties
-
-                std::vector<libcamera::Rectangle> pixelRects;
-				for (auto const &f : fracs)
+				for (size_t i = 0; i < streams.size(); ++i)
 				{
-					pixelRects.emplace_back(
-						f[0] * sensor_w,
-						f[1] * sensor_h,
-						f[2] * sensor_w,
-						f[3] * sensor_h);
+					libcamera::Stream *s = streams[i];           // now index-able
+					const auto &cfg      = s->configuration();
+
+					uint32_t W = cfg.size.width;
+					uint32_t H = cfg.size.height;
+
+					const auto &f = fracs[i];                    // {x,y,w,h} 0-1
+					uint32_t x = static_cast<uint32_t>(f[0] * W) & ~1U;
+					uint32_t y = static_cast<uint32_t>(f[1] * H) & ~1U;
+					uint32_t w = static_cast<uint32_t>(f[2] * W) & ~1U;
+					uint32_t h = static_cast<uint32_t>(f[3] * H) & ~1U;
+
+					pixelRects.emplace_back(x, y, w, h);
 				}
 
+				/* 4. push the control list */
+				libcamera::ControlList ctrls(cameras[0]->controls());
+				ctrls.set(controls::rpi::ScalerCrops, pixelRects);
+				ctrls.set(controls::rpi::StatsOutputEnable, true);   // enable AGC on new FoV
+				app.SetControls(std::move(ctrls));
+			}
 
-                libcamera::ControlList ctrls(cameras[0]->controls());
-                ctrls.set(controls::rpi::ScalerCrops, pixelRects);
-                app.SetControls(std::move(ctrls));          // queues for frame #0
-            }
 
 			app.StartCamera();
 			controller.cameraRunning = true;
