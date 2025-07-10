@@ -226,7 +226,7 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
 }
 
 void CinePIController::mainThread(){
-    spdlog::set_level(spdlog::level::debug); 
+    // spdlog::set_level(spdlog::level::debug); 
     console->info("CinePIController Started!");
     auto sub = redis_->subscriber();
 
