@@ -12,20 +12,74 @@ Please install the below requirements before continuing with the rest of the bui
 
 [Redis++](https://github.com/sewenew/redis-plus-plus)
 
-Build
------
-For usage and build instructions, see the [below.](https://github.com/Tiramisioux/cinepi-raw/edit/rpicam-apps_1.7_custom_encoder/README.md#build--install)
-
 License
 -------
 
 The source code is made available under the simplified [BSD 2-Clause license](https://spdx.org/licenses/BSD-2-Clause.html).
 
----
+
+
+## Build & Install
+
+### 0 . Prerequisites
+
+If you run Raspberry Pi OS Lite, begin by installing the following packages:
+
+```bash
+sudo apt install -y python-pip git python3-jinja2
+````
+
+```bash
+sudo apt install -y libboost-dev
+sudo apt install -y libgnutls28-dev openssl libtiff-dev pybind11-dev
+sudo apt install -y qtbase5-dev libqt5core5a libqt5widgets
+sudo apt install -y meson cmake
+sudo apt install -y python3-yaml python3-ply
+sudo apt install -y libglib2.0-dev libgstreamer-plugins-base1.0-dev
+```
+
+### 1 . Build & install libcamera
+
+    git clone https://github.com/raspberrypi/libcamera
+    sudo meson setup build --buildtype=release -Dpipelines=rpi/vc4,rpi/pisp -Dipas=rpi/vc4,rpi/pisp -Dv4l2=true -Dgstreamer=enabled -Dtest=false -Dlc-compliance=disabled -Dcam=disabled -Dqcam=disabled -Ddocumentation=disabled -Dpycamera=enabled
+    ninja -C build install
+    sudo ldconfig
+
+### 2 . Install redis-plus-plus (C++ Redis client)
+    git clone https://github.com/sewenew/redis-plus-plus.git
+    cd redis-plus-plus && mkdir build && cd build
+    cmake .. && make -j$(nproc)
+    sudo make install
+    cd ../..
+    sudo ldconfig
+
+### 3 . Clone, build & install cinepi‑raw
+    git clone https://github.com/Tiramisioux/cinepi-raw.git --rpicam-apps_1.7_custom_encoder
+    cd cinepi-raw
+    sudo meson setup build --buildtype=release     
+    ninja -C build                            
+    sudo meson install -C build
+    sudo ldconfig
+
+## Quick usage
+
+Here is an example using IMX477 camera connected to cam0 while forcing the preview onto the second HDMI socket.
+
+In `/boot/firmware/config.txt`, set
+
+`dtoverlay=imx477,cam0`
+
+reboot
+
+then
+
+```bash
+cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0 
+```
 
 # CineMate fork
 
-- Adapted to libcamera 0.5 / rpicam-apps 1.0.7.
+_Adapted to libcamera 0.5 / rpicam-apps 1.0.7._
 
 ## Additional flags
 
@@ -37,7 +91,6 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--hdmi-port <int>`     | `-1`              | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
 | `--same-hdmi`           | `false`           | Force both CinePi apps (capture & controller) to share the same HDMI output.                        |
 | `--keep16`              | `false`           | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit streams.                            |
-| `--zoom <float>`       | `1.0`             | Centre-crop digital zoom for streams **0** (viewfinder/encode) and **2** (lo-res).<br>`0.5` = zoom-out, `2.0` = 200 % punch-in. If `--scaler-crops` is present it takes precedence. |
 
 
 ## Manual DNG encoder
@@ -106,68 +159,6 @@ nano ~/.asoundrc
 
 Exit nano editor using ctrl+x.
 
----
-
-## Build & Install
-
-### 0 . Prerequisites
-
-If you run Raspberry Pi OS Lite, begin by installing the following packages:
-
-```bash
-sudo apt install -y python-pip git python3-jinja2
-````
-
-```bash
-sudo apt install -y libboost-dev
-sudo apt install -y libgnutls28-dev openssl libtiff-dev pybind11-dev
-sudo apt install -y qtbase5-dev libqt5core5a libqt5widgets
-sudo apt install -y meson cmake
-sudo apt install -y python3-yaml python3-ply
-sudo apt install -y libglib2.0-dev libgstreamer-plugins-base1.0-dev
-```
-
-### 1 . Build & install libcamera
-
-    git clone https://github.com/raspberrypi/libcamera
-    sudo meson setup build --buildtype=release -Dpipelines=rpi/vc4,rpi/pisp -Dipas=rpi/vc4,rpi/pisp -Dv4l2=true -Dgstreamer=enabled -Dtest=false -Dlc-compliance=disabled -Dcam=disabled -Dqcam=disabled -Ddocumentation=disabled -Dpycamera=enabled
-    ninja -C build install
-    sudo ldconfig
-
-### 2 . Install redis-plus-plus (C++ Redis client)
-    git clone https://github.com/sewenew/redis-plus-plus.git
-    cd redis-plus-plus && mkdir build && cd build
-    cmake .. && make -j$(nproc)
-    sudo make install
-    cd ../..
-    sudo ldconfig
-
-### 3 . Clone, build & install cinepi‑raw
-    git clone https://github.com/Tiramisioux/cinepi-raw.git --rpicam-apps_1.7_custom_encoder
-    cd cinepi-raw
-    sudo meson setup build --buildtype=release     
-    ninja -C build                            
-    sudo meson install -C build
-    sudo ldconfig
-
----
-
-## Quick usage
-
-Here is an example using IMX477 camera connected to cam0 while forcing the preview onto the second HDMI socket.
-
-In `/boot/firmware/config.txt`, set
-
-`dtoverlay=imx477,cam0`
-
-reboot
-
-then
-
-```bash
-cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0 
-```
-
 ## Controlling recording via Redis
 
 CinePi-raw listens for recording commands through a **single string key**  `is_recording` and the **`cp_controls` pub-sub channel**.  
@@ -190,13 +181,13 @@ redis-cli SET is_recording 0
 redis-cli PUBLISH cp_controls is_recording    # triggers 1 → 0 edge
 ```
 
-## Live digital zoom via Redis
+## Live digital punch-in (center-crop preview)
 
-```bash
-SET zoom 1.8
+Via Redis you can punch-in the HDMI preview while leaving the RAW recording untouched – good for C-mount lenses that don’t cover the whole
+sensor.
+
+```json
+SET zoom 1.5
 PUBLISH cp_controls zoom
 ```
-
-The value is a simple float matching the --zoom CLI flag. CinePi-raw applies the new crop in the very next frame — no restart needed.
-
-
+CinemaDNGs always contain the entire sensor.
