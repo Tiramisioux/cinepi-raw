@@ -186,7 +186,7 @@ redis-cli PUBLISH cp_controls is_recording    # triggers 1 → 0 edge
 Via Redis you can punch-in the HDMI preview while leaving the RAW recording untouched – good for C-mount lenses that don’t cover the whole
 sensor.
 
-```json
+```bash
 SET zoom 1.5
 PUBLISH cp_controls zoom
 ```
