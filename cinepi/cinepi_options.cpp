@@ -169,6 +169,9 @@ bool CinePiOptions::Parse(int argc, char *argv[])
         if (camPort.empty())
                 camPort = "cam" + std::to_string(camera);
 
+        /* Update base class member so utils see the correct value */
+        RawOptions::camPort = camPort;
+
         /* Log summary ------------------------------------------------- */
         spdlog::info("cinepi-cli: camPort='{}'  hdmi_port={}  same_hdmi={}  zoom={}  crops={}"
                      "crops={} rectangles",
