@@ -2,26 +2,14 @@
 
 *fork of rpicam-apps that builds upon the rpicam-raw app, offering cinema dng recording capabillities and integration with REDIS offering an abstract "API" like layer for custom integrations / controls.*
 
-Requirements
------
-Please install the below requirements before continuing with the rest of the build process:
-
-[Redis](https://github.com/redis/redis)
-
-[Hiredis](https://github.com/redis/hiredis)
-
-[Redis++](https://github.com/sewenew/redis-plus-plus)
-
 License
 -------
 
 The source code is made available under the simplified [BSD 2-Clause license](https://spdx.org/licenses/BSD-2-Clause.html).
 
+# How to install
 
-
-## Build & Install
-
-### 0 . Prerequisites
+## 0 . Prerequisites
 
 If you run Raspberry Pi OS Lite, begin by installing the following packages:
 
@@ -29,37 +17,76 @@ If you run Raspberry Pi OS Lite, begin by installing the following packages:
 sudo apt install -y python-pip git python3-jinja2
 ````
 
-```bash
-sudo apt install -y libboost-dev
-sudo apt install -y libgnutls28-dev openssl libtiff-dev pybind11-dev
-sudo apt install -y qtbase5-dev libqt5core5a libqt5widgets
-sudo apt install -y meson cmake
-sudo apt install -y python3-yaml python3-ply
-sudo apt install -y libglib2.0-dev libgstreamer-plugins-base1.0-dev
+## Install libcamera
+
+```shell
+git clone https://github.com/raspberrypi/libcamera && \
+sudo find ~/libcamera -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod +x {} \; && \
+cd libcamera && \
+sudo meson setup build --buildtype=release \
+  -Dpipelines=rpi/vc4,rpi/pisp \
+  -Dipas=rpi/vc4,rpi/pisp \
+  -Dv4l2=true \
+  -Dgstreamer=enabled \
+  -Dtest=false \
+  -Dlc-compliance=disabled \
+  -Dcam=disabled \
+  -Dqcam=disabled \
+  -Ddocumentation=disabled \
+  -Dpycamera=enabled && \
+sudo ninja -C build install && \
+cd
 ```
 
-### 1 . Build & install libcamera
+```shell
+cd ~/libcamera/utils && sudo chmod +x *.py *.sh && sudo chmod +x ~/libcamera/src/ipa/ipa-sign.sh && cd ~/libcamera && sudo ninja -C build install
+```
 
-    git clone https://github.com/raspberrypi/libcamera
-    sudo meson setup build --buildtype=release -Dpipelines=rpi/vc4,rpi/pisp -Dipas=rpi/vc4,rpi/pisp -Dv4l2=true -Dgstreamer=enabled -Dtest=false -Dlc-compliance=disabled -Dcam=disabled -Dqcam=disabled -Ddocumentation=disabled -Dpycamera=enabled
-    ninja -C build install
-    sudo ldconfig
+```shell
+sudo apt-get install --reinstall libtiff5-dev && sudo ln -sf $(find /usr/lib -name "libtiff.so" | head -n 1) /usr/lib/aarch64-linux-gnu/libtiff.so.5 && export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH && sudo ldconfig
+```
 
-### 2 . Install redis-plus-plus (C++ Redis client)
-    git clone https://github.com/sewenew/redis-plus-plus.git
-    cd redis-plus-plus && mkdir build && cd build
-    cmake .. && make -j$(nproc)
-    sudo make install
-    cd ../..
-    sudo ldconfig
+```shell
+sudo apt install -y python3-pip git python3-jinja2 libboost-dev libgnutls28-dev openssl pybind11-dev qtbase5-dev libqt5core5a meson cmake python3-yaml python3-ply libglib2.0-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libavdevice59
+```
 
-### 3 . Clone, build & install cinepi‑raw
-    git clone https://github.com/Tiramisioux/cinepi-raw.git --rpicam-apps_1.7_custom_encoder
-    cd cinepi-raw
-    sudo meson setup build --buildtype=release     
-    ninja -C build                            
-    sudo meson install -C build
-    sudo ldconfig
+## Install cpp-mjpeg streamer
+
+```shell
+sudo apt install -y libspdlog-dev libjsoncpp-dev && cd /home/pi && https://github.com/nadjieb/cpp-mjpeg-streamer.git && cd cpp-mjpeg-streamer && mkdir build && cd build && cmake .. && make && sudo make install && cd
+```
+
+## Install cinepi-raw dependencies
+
+```shell
+sudo apt install -y cmake libepoxy-dev libavdevice-dev build-essential cmake libboost-program-options-dev libdrm-dev libexif-dev libcamera-dev libjpeg-dev libtiff5-dev libpng-dev redis-server libhiredis-dev libasound2-dev libjsoncpp-dev libpng-dev meson ninja-build libavcodec-dev libavdevice-dev libavformat-dev libswresample-dev && sudo apt-get install libjsoncpp-dev && cd ~ && git clone https://github.com/sewenew/redis-plus-plus.git && cd redis-plus-plus && mkdir build && cd build && cmake .. && make && sudo make install && cd ~
+```
+
+```shell
+sudo ldconfig
+```
+
+## Install cinepi-raw 
+
+```shell
+git clone https://github.com/Tiramisioux/cinepi-raw.git --branch rpicam-apps_1.7_custom_encoder && cd cinepi-raw && mkdir build && cd build && sudo meson setup && sudo ninja && cd ../.. && sudo meson install -C cinepi-raw/build && sudo ldconfig
+```
+### for pi 4:
+
+```shell
+sudo echo "/home/pi/cinepi-raw/build
+/usr/lib/aarch64-linux-gnu
+/usr/local/lib/aarch64-linux-gnu" | sudo tee /etc/ld.so.conf.d/cinepi-raw.conf && sudo ldconfig && echo 'export LD_LIBRARY_PATH=/home/pi/cinepi-raw/build:/usr/lib/aarch64-linux-gnu:/usr/local/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH' >> ~/.bashrc && source ~/.bashrc
+```
+
+## Set redis key
+
+```shell
+redis-cli <<EOF
+SET cg_rb 2.5,2.2
+PUBLISH cp_controls cg_rb
+EOF
+```
 
 ## Quick usage
 
@@ -76,7 +103,6 @@ then
 ```bash
 cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0 
 ```
-
 # CineMate fork
 
 _Adapted to libcamera 0.5 / rpicam-apps 1.0.7._
