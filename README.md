@@ -53,7 +53,7 @@ sudo apt install -y python3-pip git python3-jinja2 libboost-dev libgnutls28-dev 
 ## Install cpp-mjpeg streamer
 
 ```shell
-sudo apt install -y libspdlog-dev libjsoncpp-dev && cd /home/pi && https://github.com/nadjieb/cpp-mjpeg-streamer.git && cd cpp-mjpeg-streamer && mkdir build && cd build && cmake .. && make && sudo make install && cd
+sudo apt install -y libspdlog-dev libjsoncpp-dev && cd /home/pi && https://github.com/tiramisioux/cpp-mjpeg-streamer.git --branch cinemate && cd cpp-mjpeg-streamer && mkdir build && cd build && cmake .. && make && sudo make install && cd
 ```
 
 ## Install cinepi-raw dependencies
@@ -69,7 +69,7 @@ sudo ldconfig
 ## Install cinepi-raw 
 
 ```shell
-git clone https://github.com/Tiramisioux/cinepi-raw.git --branch rpicam-apps_1.7_custom_encoder && cd cinepi-raw && mkdir build && cd build && sudo meson setup && sudo ninja && cd ../.. && sudo meson install -C cinepi-raw/build && sudo ldconfig
+git clone https://github.com/Tiramisioux/cinepi-raw.git --branch rpicam-apps_1.7 && cd cinepi-raw && mkdir build && cd build && sudo meson setup && sudo ninja && cd ../.. && sudo meson install -C cinepi-raw/build && sudo ldconfig
 ```
 ### for pi 4:
 
