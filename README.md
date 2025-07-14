@@ -69,7 +69,7 @@ sudo ldconfig
 ## Install cinepi-raw 
 
 ```shell
-git clone https://github.com/Tiramisioux/cinepi-raw.git --branch rpicam-apps_1.7 && cd cinepi-raw && mkdir build && cd build && sudo meson setup && sudo ninja && cd ../.. && sudo meson install -C cinepi-raw/build && sudo ldconfig
+git clone https://github.com/Tiramisioux/cinepi-raw.git --branch rpicam-apps_1.7_custom_encoder && cd cinepi-raw && mkdir build && cd build && sudo meson setup && sudo ninja && cd ../.. && sudo meson install -C cinepi-raw/build && sudo ldconfig
 ```
 ### for pi 4:
 
