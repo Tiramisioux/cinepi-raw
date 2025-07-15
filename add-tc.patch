@@ -1,0 +1,357 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/cinepi/cinepi_controller.cpp b/cinepi/cinepi_controller.cpp
+index ca7f917358b391df5f2235ba1f9002c384bc597a..9a54672ed778e80c03beb316cf8694ab4c200e65 100755
+--- a/cinepi/cinepi_controller.cpp
++++ b/cinepi/cinepi_controller.cpp
+@@ -1,28 +1,30 @@
+ #include "cinepi_controller.hpp"
+ 
+-#include <algorithm>          
++#include <algorithm>
++#include <iomanip>
++#include <sstream>
+ 
+ using namespace std;
+ using namespace std::chrono;
+ 
+ #define CP_DEF_WIDTH 1920
+ #define CP_DEF_HEIGHT 1080
+ #define CP_DEF_FRAMERATE 30
+ #define CP_DEF_ISO 400
+ #define CP_DEF_SHUTTER 50
+ #define CP_DEF_AWB 1
+ #define CP_DEF_COMPRESS 0
+ #define CP_DEF_THUMBNAIL 1
+ #define CP_DEF_THUMBNAIL_SIZE 3
+ 
+ void CinePIController::sync(){
+     // getAllKeysAndValuesFromRedis();
+ 
+     auto pipe = redis_->pipeline();
+     auto pipe_replies = pipe.get(CONTROL_KEY_WIDTH)
+                             .get(CONTROL_KEY_HEIGHT)
+                             .get(CONTROL_KEY_FRAMERATE)
+                             .get(CONTROL_KEY_ISO)
+                             .get(CONTROL_KEY_SHUTTER_SPEED)
+                             .get(CONTROL_KEY_WB)
+                             .get(CONTROL_KEY_COLORGAINS)
+@@ -200,50 +202,70 @@ void CinePIController::sync(){
+     // options_->lores_height = options_->height >> 3;
+     options_->mode_string = "0:0:0:0";
+ 
+ }
+ 
+ void CinePIController::process(CompletedRequestPtr &completed_request){
+     CinePIFrameInfo info(completed_request->metadata);
+ 
+     /* -------------------------------------------------------- *
+     *  Publish max_ram_buffers_ exactly once per configuration *
+     * -------------------------------------------------------- */
+    if (!buffer_size_sent_ && app_->GetEncoder()->initialized()) {
+        size_t max_buf = app_->GetEncoder()->maxRamBuffers();
+        redis_->set("buffer_size", std::to_string(max_buf));
+        buffer_size_sent_ = true;
+     }
+ 
+     Json::Value data;
+     Json::Value histo;
+     data["framerate"] = completed_request->framerate;
+     data["colorTemp"] = info.colorTemp;
+     data["focus"] = info.focus;
+     data["frameCount"] = app_->GetEncoder()->getFrameCount();
+     data["bufferSize"] = app_->GetEncoder()->bufferSize();
+     redis_->publish(CHANNEL_STATS, data.toStyledString());
++
++    /* --------------------------------------------------------
++     *  Keep current timecode in Redis (TC_CAM0/TC_CAM1)
++     * ------------------------------------------------------ */
++    /* use the last time-code produced by the encoder */
++    auto &tc_bcd = app_->GetEncoder()->originationTimeCode;
++
++    int hour  = ((tc_bcd[3] >> 4) & 0xF) * 10 + (tc_bcd[3] & 0xF);
++    int minute= ((tc_bcd[2] >> 4) & 0xF) * 10 + (tc_bcd[2] & 0xF);
++    int second= ((tc_bcd[1] >> 4) & 0xF) * 10 + (tc_bcd[1] & 0xF);
++    int frame = ((tc_bcd[0] >> 4) & 0xF) * 10 + (tc_bcd[0] & 0xF);
++
++    std::ostringstream tc;
++    tc << std::setw(2) << std::setfill('0') << hour  << ':'
++       << std::setw(2) << minute << ':'
++       << std::setw(2) << second << ':'
++       << std::setw(2) << frame;
++
++    std::string key = (options_->CamPort() == "cam1") ? "TC_CAM1" : "TC_CAM0";
++    redis_->set(key, tc.str());
+     
+ }
+ 
+ void CinePIController::mainThread(){
+     // spdlog::set_level(spdlog::level::debug); 
+     console->info("CinePIController Started!");
+     auto sub = redis_->subscriber();
+ 
+     using MessageHandler = std::function<void(const std::optional<std::string>&)>;
+ 
+     std::unordered_map<std::string, MessageHandler> handlers = {
+         { CONTROL_KEY_RAW_CROP, [this](const std::optional<std::string>& r) {
+             std::unordered_map<std::string, std::string> m;
+             redis_->hgetall("rawCrop", std::inserter(m, m.begin()));
+ 
+             options_->rawCrop[0] = std::stoi(m["offset_y_start"]);
+             options_->rawCrop[1] = std::stoi(m["offset_y_end"]);
+             options_->rawCrop[2] = std::stoi(m["offset_x_start"]);
+             options_->rawCrop[3] = std::stoi(m["offset_x_end"]);
+         }},
+         
+         { CONTROL_KEY_RECORD, [this](const std::optional<std::string> &r) {
+             if (!r) return;
+ 
+             bool level = std::stoi(*r);
+diff --git a/cinepi/dng_encoder.cpp b/cinepi/dng_encoder.cpp
+index cfeb0b3c49386c0a636320669dc92785164c7990..6bc5e3ffbff8121966acd4b28840554421457f6b 100755
+--- a/cinepi/dng_encoder.cpp
++++ b/cinepi/dng_encoder.cpp
+@@ -657,50 +657,57 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
+         1000                                                      // denominator
+     };
+ 
+     // preferred: per-frame value from libcamera metadata
+     if (auto fd = metadata.get(controls::FrameDuration); fd && *fd > 0)
+     {
+         double fps = 1e9 / static_cast<double>(*fd);              // ns → fps
+         fpsRat[0] = static_cast<int32_t>(fps + 0.5);       // numerator
+     }
+ 
+     ifd.addEntry(0xC764, TIFF_SRATIONAL, 1, fpsRat);
+ 
+ 
+     /* time-code (BCD) */
+     struct timeval tv;  gettimeofday(&tv, nullptr);
+     struct tm *lt = localtime(&tv.tv_sec);
+     int fps = fpsRat[0] / fpsRat[1];
+     int frame = static_cast<int>((tv.tv_usec * fps) / 1'000'000);
+     uint8_t tc[8] = {
+         static_cast<uint8_t>(((frame     /10)<<4)|(frame     %10)),
+         static_cast<uint8_t>(((lt->tm_sec/10)<<4)|(lt->tm_sec%10)),
+         static_cast<uint8_t>(((lt->tm_min/10)<<4)|(lt->tm_min%10)),
+         static_cast<uint8_t>(((lt->tm_hour/10)<<4)|(lt->tm_hour%10)),
+         0,0,0,0
+     };
++
++    /* store time-code & date for other modules */
++    std::copy(std::begin(tc), std::end(tc), originationTimeCode.begin());
++    originationDate[0] = static_cast<uint16_t>(lt->tm_year + 1900);
++    originationDate[1] = static_cast<uint16_t>(lt->tm_mon + 1);
++    originationDate[2] = static_cast<uint16_t>(lt->tm_mday);
++
+     ifd.addEntry(0xC763, TIFF_BYTE, 8, tc);
+ 
+     /* DateTimeOriginal */
+     char dateStr[20];
+     strftime(dateStr, sizeof(dateStr), "%Y:%m:%d %H:%M:%S", lt);
+     ifd.addEntry(0x9003, TIFF_ASCII, 20, dateStr);
+ 
+     ifd.sortEntries(); ifd.build(buf);
+ 
+     /* patch TIFF header with IFD-0 offset */
+     *reinterpret_cast<uint32_t*>(buf.buffer + 4) = ifd.baseOffset;
+     return buf.usedSize;
+ }
+ 
+ // ──────────────────────────────────────────────────────────────
+ //  Encoding image buffer
+ // ──────────────────────────────────────────────────────────────
+ void DngEncoder::encodeThread(int num)
+ {
+     std::chrono::duration<double> encode_time(0);
+     EncodeItem encode_item;
+ 
+     while (true)
+     {
+         /* ──  Get the next job from the queue  ───────────────── */
+@@ -743,59 +750,73 @@ void DngEncoder::encodeThread(int num)
+             continue;
+         }
+ 
+         /* Allocation succeeded – now *really* consume the permit */
+         {
+             std::lock_guard<std::mutex> lk(ram_mtx_);
+             ++ram_buffers_;
+         }
+ 
+         /* ────────────────────────────────────────────────────── */
+         /*  Build the TIFF/DNG into the new buffer               */
+         /* ────────────────────────────────────────────────────── */
+         auto start_time = std::chrono::high_resolution_clock::now();
+ 
+         size_t tiff_size = dng_save(
+             num,
+             static_cast<const uint8_t *>(mem_buf),
+             static_cast<const uint8_t *>(encode_item.mem),
+             encode_item.info,
+             static_cast<const uint8_t *>(encode_item.lomem),
+             encode_item.loinfo,
+             encode_item.losize,
+             encode_item.met,
+             encode_item.index);
+ 
++        /* convert BCD timecode to string right after dng_save */
++        auto &tc_bcd = originationTimeCode;
++        int hour  = ((tc_bcd[3] >> 4) & 0xF) * 10 + (tc_bcd[3] & 0xF);
++        int minute= ((tc_bcd[2] >> 4) & 0xF) * 10 + (tc_bcd[2] & 0xF);
++        int second= ((tc_bcd[1] >> 4) & 0xF) * 10 + (tc_bcd[1] & 0xF);
++        int frame = ((tc_bcd[0] >> 4) & 0xF) * 10 + (tc_bcd[0] & 0xF);
++
++        std::ostringstream tc;
++        tc << std::setw(2) << std::setfill('0') << hour  << ':'
++           << std::setw(2) << minute << ':'
++           << std::setw(2) << second << ':'
++           << std::setw(2) << frame;
++
+         /* queue for disk writer */
+         {
+             DiskItem item = {
+                 mem_buf,
+                 tiff_size,
+                 encode_item.info,
+                 encode_item.met,
+                 encode_item.timestamp_us,
+-                encode_item.index
++                encode_item.index,
++                tc.str()
+             };
+ 
+             std::lock_guard<std::mutex> lock(disk_mutex_);
+             disk_buffer_.push(std::move(item));
+             disk_cond_var_.notify_all();
+         }
+ 
+         auto end_time = std::chrono::high_resolution_clock::now();
+         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+         console->info("Thread[{}] {} Time taken for the encode: {} ms, disk queue:{}  Size:{}",
+                       num, encode_item.index, duration, disk_buffer_.size(), tiff_size);
+ 
+         /* mark the camera buffer as reusable */
+         input_done_callback_(nullptr);
+         output_ready_callback_(encode_item.mem,
+                                encode_item.size,
+                                encode_item.timestamp_us,
+                                true);
+     }
+ }
+ 
+ 
+ //Flushing data to disk
+ void DngEncoder::diskThread(int num)
+ {
+@@ -809,50 +830,51 @@ void DngEncoder::diskThread(int num)
+             {
+                 if (!disk_buffer_.empty())
+                 {
+                     disk_item = disk_buffer_.front();
+                     disk_buffer_.pop();
+                     break;
+                 }
+                 else {
+                     disk_cond_var_.wait_for(lock, 1ms);
+                 }
+             }
+         }
+ 
+         std::ostringstream oss;
+         oss << options_->mediaDest << '/' 
+             << options_->folder << '/' 
+             << options_->folder << '_'
+             << std::setw(9) << std::setfill('0') << disk_item.index 
+             << ".dng";
+ 
+         std::string filename = oss.str();
+     
+         console->trace("Thread[{}]  Save frame to disk: {}", num, disk_item.index);
+ 
+         console->info("DNG written: {}", filename);
++        console->info("Timecode: {}", disk_item.timecode);
+         
+         auto start_time = std::chrono::high_resolution_clock::now();
+         
+         // Use standard buffered IO instead of O_DIRECT
+         int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+ 
+         if (fd != -1) {
+             // Provide sequential access hint
+             posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+             posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE);
+             posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // drop file pages ASAP
+ 
+ 
+             // Always use actual used size returned by dng_save
+             ssize_t bytes_written = write(fd, disk_item.mem_buf, disk_item.size);
+             if (bytes_written < 0 || static_cast<size_t>(bytes_written) != disk_item.size) {
+                 perror("Error writing to file");
+             }
+             close(fd);
+         } else {
+             perror("Failed to open file for writing");
+         }
+ 
+         // Clean up
+         free(disk_item.mem_buf);
+diff --git a/cinepi/dng_encoder.hpp b/cinepi/dng_encoder.hpp
+index f7c959bfebfe66507fae9de8ab040fd19693366a..deb5f3cb35cfc037ef51a42e1f23ed6bf71758e8 100755
+--- a/cinepi/dng_encoder.hpp
++++ b/cinepi/dng_encoder.hpp
+@@ -165,42 +165,42 @@ private:
+ 	bool abortOutput_;
+ 	bool resetCount_;
+ 	uint64_t index_;
+ 	uint64_t frames_;
+ 
+     RawOptions const *options_;
+ 
+ 	struct EncodeItem
+ 	{
+ 
+ 		void *mem;
+         size_t size;
+ 		StreamInfo info;
+ 		void *lomem;
+ 		size_t losize;
+ 		StreamInfo loinfo;
+ 		CompletedRequest::ControlList met;
+ 		int64_t timestamp_us;
+ 		uint64_t index;
+ 	};
+ 	std::queue<EncodeItem> encode_queue_;
+ 	std::mutex encode_mutex_;
+ 	std::condition_variable encode_cond_var_;
+ 	std::thread encode_thread_[NUM_ENC_THREADS];
+ 
+-	struct DiskItem
+-	{
+-		void *mem_buf; 
+-
+-        size_t size;
+-		StreamInfo info;
+-		CompletedRequest::ControlList met;
+-		int64_t timestamp_us;
+-		uint64_t index;
+-	};
++        struct DiskItem
++        {
++                void *mem_buf;
++                size_t size;
++                StreamInfo info;
++                CompletedRequest::ControlList met;
++                int64_t timestamp_us;
++                uint64_t index;
++                std::string timecode;
++        };
+ 	std::queue<DiskItem> disk_buffer_;
+ 	std::mutex disk_mutex_;
+ 	std::condition_variable disk_cond_var_;
+ 	std::thread disk_thread_[NUM_DISK_THREADS];
+ };
+ 
+ #endif
+\ No newline at end of file
+ 
+EOF

@@ -679,6 +679,13 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
         static_cast<uint8_t>(((lt->tm_hour/10)<<4)|(lt->tm_hour%10)),
         0,0,0,0
     };
+
+    /* store time-code & date for other modules */
+    std::copy(std::begin(tc), std::end(tc), originationTimeCode.begin());
+    originationDate[0] = static_cast<uint16_t>(lt->tm_year + 1900);
+    originationDate[1] = static_cast<uint16_t>(lt->tm_mon + 1);
+    originationDate[2] = static_cast<uint16_t>(lt->tm_mday);
+
     ifd.addEntry(0xC763, TIFF_BYTE, 8, tc);
 
     /* DateTimeOriginal */
@@ -765,6 +772,19 @@ void DngEncoder::encodeThread(int num)
             encode_item.met,
             encode_item.index);
 
+        /* convert BCD timecode to string right after dng_save */
+        auto &tc_bcd = originationTimeCode;
+        int hour  = ((tc_bcd[3] >> 4) & 0xF) * 10 + (tc_bcd[3] & 0xF);
+        int minute= ((tc_bcd[2] >> 4) & 0xF) * 10 + (tc_bcd[2] & 0xF);
+        int second= ((tc_bcd[1] >> 4) & 0xF) * 10 + (tc_bcd[1] & 0xF);
+        int frame = ((tc_bcd[0] >> 4) & 0xF) * 10 + (tc_bcd[0] & 0xF);
+
+        std::ostringstream tc;
+        tc << std::setw(2) << std::setfill('0') << hour  << ':'
+           << std::setw(2) << minute << ':'
+           << std::setw(2) << second << ':'
+           << std::setw(2) << frame;
+
         /* queue for disk writer */
         {
             DiskItem item = {
@@ -773,7 +793,8 @@ void DngEncoder::encodeThread(int num)
                 encode_item.info,
                 encode_item.met,
                 encode_item.timestamp_us,
-                encode_item.index
+                encode_item.index,
+                tc.str()
             };
 
             std::lock_guard<std::mutex> lock(disk_mutex_);
@@ -831,6 +852,7 @@ void DngEncoder::diskThread(int num)
         console->trace("Thread[{}]  Save frame to disk: {}", num, disk_item.index);
 
         console->info("DNG written: {}", filename);
+        console->info("Timecode: {}", disk_item.timecode);
         
         auto start_time = std::chrono::high_resolution_clock::now();
         

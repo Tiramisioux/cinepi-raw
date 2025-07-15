@@ -1,6 +1,8 @@
 #include "cinepi_controller.hpp"
 
-#include <algorithm>          
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
 
 using namespace std;
 using namespace std::chrono;
@@ -222,6 +224,26 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
     data["frameCount"] = app_->GetEncoder()->getFrameCount();
     data["bufferSize"] = app_->GetEncoder()->bufferSize();
     redis_->publish(CHANNEL_STATS, data.toStyledString());
+
+    /* --------------------------------------------------------
+     *  Keep current timecode in Redis (TC_CAM0/TC_CAM1)
+     * ------------------------------------------------------ */
+    /* use the last time-code produced by the encoder */
+    auto &tc_bcd = app_->GetEncoder()->originationTimeCode;
+
+    int hour  = ((tc_bcd[3] >> 4) & 0xF) * 10 + (tc_bcd[3] & 0xF);
+    int minute= ((tc_bcd[2] >> 4) & 0xF) * 10 + (tc_bcd[2] & 0xF);
+    int second= ((tc_bcd[1] >> 4) & 0xF) * 10 + (tc_bcd[1] & 0xF);
+    int frame = ((tc_bcd[0] >> 4) & 0xF) * 10 + (tc_bcd[0] & 0xF);
+
+    std::ostringstream tc;
+    tc << std::setw(2) << std::setfill('0') << hour  << ':'
+       << std::setw(2) << minute << ':'
+       << std::setw(2) << second << ':'
+       << std::setw(2) << frame;
+
+    std::string key = (options_->CamPort() == "cam1") ? "TC_CAM1" : "TC_CAM0";
+    redis_->set(key, tc.str());
     
 }
 

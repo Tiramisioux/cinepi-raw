@@ -187,16 +187,16 @@ private:
 	std::condition_variable encode_cond_var_;
 	std::thread encode_thread_[NUM_ENC_THREADS];
 
-	struct DiskItem
-	{
-		void *mem_buf; 
-
-        size_t size;
-		StreamInfo info;
-		CompletedRequest::ControlList met;
-		int64_t timestamp_us;
-		uint64_t index;
-	};
+        struct DiskItem
+        {
+                void *mem_buf;
+                size_t size;
+                StreamInfo info;
+                CompletedRequest::ControlList met;
+                int64_t timestamp_us;
+                uint64_t index;
+                std::string timecode;
+        };
 	std::queue<DiskItem> disk_buffer_;
 	std::mutex disk_mutex_;
 	std::condition_variable disk_cond_var_;
