@@ -53,7 +53,7 @@ sudo apt install -y python3-pip git python3-jinja2 libboost-dev libgnutls28-dev 
 ## Install cpp-mjpeg streamer
 
 ```shell
-sudo apt install -y libspdlog-dev libjsoncpp-dev && cd /home/pi && https://github.com/tiramisioux/cpp-mjpeg-streamer.git --branch cinemate && cd cpp-mjpeg-streamer && mkdir build && cd build && cmake .. && make && sudo make install && cd
+sudo apt install -y libspdlog-dev libjsoncpp-dev && cd /home/pi && git clone https://github.com/tiramisioux/cpp-mjpeg-streamer.git --branch cinemate && cd cpp-mjpeg-streamer && mkdir build && cd build && cmake .. && make && sudo make install && cd
 ```
 
 ## Install cinepi-raw dependencies
