@@ -41,7 +41,7 @@ cinepi_raw_dep = [tiff_dep, hiredis_lib, redis_plus_plus_lib, boost_dep, thread_
 
 alsa_dep = dependency('alsa')
 udev_dep = dependency('libudev')
-mhd_dep = dependency('nadjieb_mjpeg_streamer', required : true)
+mhd_dep = dependency('cpp_mjpeg_streamer', required : true)
 cinepi_raw_dep += mhd_dep
 cinepi_raw_dep += alsa_dep
 cinepi_raw_dep += udev_dep
