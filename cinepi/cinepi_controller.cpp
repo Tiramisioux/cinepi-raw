@@ -223,7 +223,11 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
     data["focus"] = info.focus;
     data["frameCount"] = app_->GetEncoder()->getFrameCount();
     data["bufferSize"] = app_->GetEncoder()->bufferSize();
+    data["timestamp"] = (Json::Int64)info.ts;
     redis_->publish(CHANNEL_STATS, data.toStyledString());
+
+    std::string ts_key = (options_->CamPort() == "cam1") ? "timestamp_cam1" : "timestamp_cam0";
+    redis_->set(ts_key, std::to_string(info.ts));
 
     /* --------------------------------------------------------
      *  Keep current timecode in Redis (TC_CAM0/TC_CAM1)
