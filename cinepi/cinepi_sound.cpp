@@ -4,6 +4,7 @@
 #include <boost/rational.hpp>
 #include <boost/numeric/conversion/cast.hpp>
 #include <fstream>
+#include <cstring>
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
 
@@ -361,7 +362,9 @@ void CinePISound::soundThread() {
                 std::ostringstream bwfedit;
                 bwfedit << "bwfmetaedit " << filename << " --in-iXML=" << xml_oss.str();
                 std::ostringstream bwfedit_core;
-                auto& oTC = app_->GetEncoder()->originationTimeCode;
+                uint64_t tc64 = app_->GetEncoder()->getOriginationTimeCode();
+                uint8_t oTC[8];
+                std::memcpy(oTC, &tc64, sizeof(oTC));
                 auto& oDt = app_->GetEncoder()->originationDate;
 
                 uint64_t timeReference = (static_cast<uint64_t>(oTC[0]) * 3600 * audioSampleRate)

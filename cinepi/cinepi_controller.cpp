@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
+#include <cstring>
 
 using namespace std;
 using namespace std::chrono;
@@ -229,7 +230,9 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
      *  Keep current timecode in Redis (TC_CAM0/TC_CAM1)
      * ------------------------------------------------------ */
     /* use the last time-code produced by the encoder */
-    auto &tc_bcd = app_->GetEncoder()->originationTimeCode;
+    uint64_t tc64 = app_->GetEncoder()->getOriginationTimeCode();
+    uint8_t tc_bcd[8];
+    std::memcpy(tc_bcd, &tc64, sizeof(tc_bcd));
 
     int hour  = ((tc_bcd[3] >> 4) & 0xF) * 10 + (tc_bcd[3] & 0xF);
     int minute= ((tc_bcd[2] >> 4) & 0xF) * 10 + (tc_bcd[2] & 0xF);

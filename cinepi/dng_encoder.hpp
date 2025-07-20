@@ -76,8 +76,13 @@ public:
 	bool mono_ = false;
 
 	std::vector<int64_t> timestamps;
-	std::array<uint8_t, 8> originationTimeCode;
-	std::array<uint16_t, 3> originationDate;
+        std::array<uint8_t, 8> originationTimeCode;
+        std::atomic<uint64_t>  originationTimeCodeAtomic_{0};
+        std::array<uint16_t, 3> originationDate;
+
+        uint64_t getOriginationTimeCode() const {
+            return originationTimeCodeAtomic_.load(std::memory_order_relaxed);
+        }
 
 	/* ---- PUBLIC: number of frame buffers that fit in RAM ---- */
 	size_t maxRamBuffers() const { return max_ram_buffers_; }
