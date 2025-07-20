@@ -88,6 +88,7 @@ class CinePIController : public CinePIState
         }
 
         void process(CompletedRequestPtr &completed_request);
+        void publishTimeCode(const std::string &tc);
         void process_stream_info(libcamera::StreamConfiguration const &cfg){
 
             Json::Value data;

@@ -226,25 +226,18 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
     redis_->publish(CHANNEL_STATS, data.toStyledString());
 
     /* --------------------------------------------------------
-     *  Keep current timecode in Redis (TC_CAM0/TC_CAM1)
+     *  Timecode is now published by encoder callback
      * ------------------------------------------------------ */
-    /* use the last time-code produced by the encoder */
-    auto &tc_bcd = app_->GetEncoder()->originationTimeCode;
 
-    int hour  = ((tc_bcd[3] >> 4) & 0xF) * 10 + (tc_bcd[3] & 0xF);
-    int minute= ((tc_bcd[2] >> 4) & 0xF) * 10 + (tc_bcd[2] & 0xF);
-    int second= ((tc_bcd[1] >> 4) & 0xF) * 10 + (tc_bcd[1] & 0xF);
-    int frame = ((tc_bcd[0] >> 4) & 0xF) * 10 + (tc_bcd[0] & 0xF);
+}
 
-    std::ostringstream tc;
-    tc << std::setw(2) << std::setfill('0') << hour  << ':'
-       << std::setw(2) << minute << ':'
-       << std::setw(2) << second << ':'
-       << std::setw(2) << frame;
+void CinePIController::publishTimeCode(const std::string &tc)
+{
+    if (tc.empty())
+        return;
 
     std::string key = (options_->CamPort() == "cam1") ? "tc_cam1" : "tc_cam0";
-    redis_->set(key, tc.str());
-    
+    redis_->set(key, tc);
 }
 
 void CinePIController::mainThread(){

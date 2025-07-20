@@ -11,6 +11,7 @@
 #include <memory> // for std::shared_ptr
 #include <string>
 #include <atomic>
+#include <functional>
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -64,9 +65,9 @@ public:
 	bool initialized(){
 		return encoder_initialized_;
 	}
-	void reset_encoder(){
-		encoder_initialized_ = false;
-	}
+        void reset_encoder(){
+                encoder_initialized_ = false;
+        }
     bool buffer_full()           // inline definition
     {
         std::lock_guard<std::mutex> lk(ram_mtx_);
@@ -76,8 +77,29 @@ public:
 	bool mono_ = false;
 
 	std::vector<int64_t> timestamps;
-	std::array<uint8_t, 8> originationTimeCode;
-	std::array<uint16_t, 3> originationDate;
+        std::array<uint8_t, 8> originationTimeCode;
+        std::atomic<uint64_t>  originationTimeCodeAtomic_{0};
+        std::array<uint16_t, 3> originationDate;
+
+        mutable std::mutex last_tc_mutex_;
+        std::string last_timecode_;
+
+        uint64_t getOriginationTimeCode() const {
+            return originationTimeCodeAtomic_.load(std::memory_order_acquire);
+        }
+
+        std::string getLastTimeCode() const {
+            std::lock_guard<std::mutex> lock(last_tc_mutex_);
+            return last_timecode_;
+        }
+
+        void setLastTimeCode(const std::string &tc) {
+            std::lock_guard<std::mutex> lock(last_tc_mutex_);
+            last_timecode_ = tc;
+        }
+
+        using TimecodeCallback = std::function<void(const std::string &)>;
+        void SetTimecodeCallback(TimecodeCallback cb) { timecode_callback_ = std::move(cb); }
 
 	/* ---- PUBLIC: number of frame buffers that fit in RAM ---- */
 	size_t maxRamBuffers() const { return max_ram_buffers_; }
@@ -94,9 +116,11 @@ private:
     std::mutex            ram_mtx_;
     std::condition_variable ram_cv_;
 
-	bool raw_packed_in_ = false;   /* true if DMA already delivers packed rows */
+        bool raw_packed_in_ = false;   /* true if DMA already delivers packed rows */
 
-	bool write12bit_{false};
+        bool write12bit_{false};
+
+        TimecodeCallback timecode_callback_{};
 
 	std::shared_ptr<spdlog::logger> console;
 

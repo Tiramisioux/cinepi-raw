@@ -44,7 +44,8 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 	app.OpenCamera();
         //app.ConfigureViewfinder();
-	app.StartEncoder();
+        app.StartEncoder();
+        app.GetEncoder()->SetTimecodeCallback(std::bind(&CinePIController::publishTimeCode, &controller, _1));
 	std::vector<std::shared_ptr<libcamera::Camera>> cameras = app.GetCameras();
 	if (cameras.size() == 0)
     	throw std::runtime_error("no cameras available");
