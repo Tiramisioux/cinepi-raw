@@ -681,7 +681,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
     };
 
     /* store time-code & date for other modules */
-    std::copy(std::begin(tc), std::end(tc), originationTimeCode.begin());
+    std::copy(std::begin(tc), std::end(tc), origination .begin());
     originationDate[0] = static_cast<uint16_t>(lt->tm_year + 1900);
     originationDate[1] = static_cast<uint16_t>(lt->tm_mon + 1);
     originationDate[2] = static_cast<uint16_t>(lt->tm_mday);

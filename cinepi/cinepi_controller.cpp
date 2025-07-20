@@ -242,7 +242,7 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
        << std::setw(2) << second << ':'
        << std::setw(2) << frame;
 
-    std::string key = (options_->CamPort() == "cam1") ? "TC_CAM1" : "TC_CAM0";
+    std::string key = (options_->CamPort() == "cam1") ? "tc_cam1" : "tc_cam0";
     redis_->set(key, tc.str());
     
 }
