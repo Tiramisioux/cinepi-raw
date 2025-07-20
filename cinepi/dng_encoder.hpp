@@ -25,6 +25,10 @@ class DngEncoder : public Encoder
 public:
 	DngEncoder(RawOptions const *options);
 	~DngEncoder();
+	
+	/* NEW – let the controller push µs-since-epoch for each frame */
+    void setWallClockTimestamp(uint64_t us);   // µs since 1970-01-01
+
 	// Encode the given buffer.
 	void EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us) override;
 	void EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const &info, size_t losize, void *lomem, StreamInfo const &loinfo, int64_t timestamp_us, CompletedRequest::ControlList const &metadata);
@@ -43,6 +47,7 @@ public:
 		const StreamInfo &loinfo,
 		size_t losize,
 		const libcamera::ControlList &metadata,
+		int64_t timestamp_us,
 		uint64_t fn);
 
 	int bufferSize(){
@@ -87,6 +92,8 @@ public:
 	void clearPool();
 
 private:
+    /* NEW – cached wall-clock timestamp (0 = not set yet) */
+    uint64_t wallclock_ts_us_ { 0 };
 
     /* ──  NEW: in-RAM buffer accounting  ─────────────────────── */
     std::atomic<size_t>   ram_buffers_{0};   /* # TIFF blocks living in RAM   */

@@ -125,7 +125,10 @@ static const std::map<PixelFormat,int> mono_formats = {
 
 bool mono_ = false;   // add as a private member of DngEncoder
 
-
+void DngEncoder::setWallClockTimestamp(uint64_t us)
+{
+    wallclock_ts_us_ = us;
+}
 
 void pack_8bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
     for (size_t i = 0; i < num_pixels; i++) {
@@ -471,15 +474,16 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
 /* ────────────────────────────────────────────────────────────── */
 /*  Private: dng_save – build TIFF in-memory                      */
 /* ────────────────────────────────────────────────────────────── */
-size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
-                            const uint8_t                     *mem_buf,
-                            const uint8_t                     *raw,
-                            const StreamInfo                  &info,
-                            const uint8_t                     *lomem,
-                            const StreamInfo                  &loinfo,
-                            [[maybe_unused]] size_t            /*losize*/,
-                            const CompletedRequest::ControlList &metadata,
-                            [[maybe_unused]] uint64_t          /*fn*/)
+size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
+                            const uint8_t                      *mem_buf,
+                            const uint8_t                      *raw,
+                            const StreamInfo                   &info,
+                            const uint8_t                      *lomem,
+                            const StreamInfo                   &loinfo,
+                            size_t                              losize,
+                            const libcamera::ControlList       &metadata,
+                            int64_t                             timestamp_us,
+                            uint64_t                            fn)
 {
     /* ──  Memory writer / TIFF header  ────────────────────────── */
     MemoryBuffer buf{const_cast<uint8_t*>(mem_buf), 0, 0,
@@ -667,8 +671,17 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
     ifd.addEntry(0xC764, TIFF_SRATIONAL, 1, fpsRat);
 
 
-    /* time-code (BCD) */
-    struct timeval tv;  gettimeofday(&tv, nullptr);
+    /* ------------------------------------------------------------------
+    *  Choose wall-clock if the controller supplied one, otherwise
+    *  fall back to the timestamp_us that came with the buffer.
+    * ------------------------------------------------------------------ */
+    uint64_t ts_us = wallclock_ts_us_ ? wallclock_ts_us_   // µs since epoch
+                                    : timestamp_us;      // old path
+
+    struct timeval tv;
+    tv.tv_sec  = ts_us / 1'000'000;
+    tv.tv_usec = ts_us % 1'000'000;
+
     struct tm *lt = localtime(&tv.tv_sec);
     int fps = fpsRat[0] / fpsRat[1];
     int frame = static_cast<int>((tv.tv_usec * fps) / 1'000'000);
@@ -681,7 +694,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int               /*thread_num*/,
     };
 
     /* store time-code & date for other modules */
-    std::copy(std::begin(tc), std::end(tc), origination .begin());
+     std::copy(std::begin(tc), std::end(tc), originationTimeCode.begin());
     originationDate[0] = static_cast<uint16_t>(lt->tm_year + 1900);
     originationDate[1] = static_cast<uint16_t>(lt->tm_mon + 1);
     originationDate[2] = static_cast<uint16_t>(lt->tm_mday);
@@ -770,6 +783,7 @@ void DngEncoder::encodeThread(int num)
             encode_item.loinfo,
             encode_item.losize,
             encode_item.met,
+            encode_item.timestamp_us,
             encode_item.index);
 
         /* convert BCD timecode to string right after dng_save */

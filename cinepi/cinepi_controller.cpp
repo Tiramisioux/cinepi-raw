@@ -204,52 +204,97 @@ void CinePIController::sync(){
 
 }
 
-void CinePIController::process(CompletedRequestPtr &completed_request){
-    CinePIFrameInfo info(completed_request->metadata);
+/* ------------------------------------------------------------------ */
+/*  CinePIController::process – v2 (real TOD timestamps)              */
+/* ------------------------------------------------------------------ */
+void CinePIController::process(CompletedRequestPtr &completed_request)
+{
+    CinePIFrameInfo info(completed_request->metadata);   // info.ts = ns since boot
 
-    /* -------------------------------------------------------- *
-    *  Publish max_ram_buffers_ exactly once per configuration *
-    * -------------------------------------------------------- */
-   if (!buffer_size_sent_ && app_->GetEncoder()->initialized()) {
-       size_t max_buf = app_->GetEncoder()->maxRamBuffers();
-       redis_->set("buffer_size", std::to_string(max_buf));
-       buffer_size_sent_ = true;
+    /* ────────────────────────────────────────────────────────────── */
+    /*  0. Convert sensor ts → Unix-epoch ns                         */
+    /*     Prefer libcamera::controls::FrameWallClock if available.  */
+    /* ────────────────────────────────────────────────────────────── */
+    uint64_t epoch_ns = 0;                               // ns since 1970-01-01
+    if (auto wc = completed_request->metadata.get(controls::FrameWallClock); wc)
+    {
+        /* FrameWallClock is µs since epoch */
+        epoch_ns = static_cast<uint64_t>(*wc) * 1'000ULL;
+    }
+    else
+    {
+        /* Derive once-per-run offset between MONOTONIC and REALTIME */
+        using clk_sys  = std::chrono::system_clock;
+        using clk_mono = std::chrono::steady_clock;      // same epoch as SensorTimestamp
+
+        static bool     have_offset   = false;
+        static uint64_t boot0_ns      = 0;               // first sensor ts (ns)
+        static int64_t  epoch0_ns     = 0;               // wall clock at that moment
+
+        if (!have_offset)
+        {
+            boot0_ns  = info.ts;
+            epoch0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             clk_sys::now().time_since_epoch())
+                             .count();
+            have_offset = true;
+        }
+        epoch_ns = epoch0_ns + (info.ts - boot0_ns);
     }
 
+    /* ────────────────────────────────────────────────────────────── */
+    /*  1. One-off buffer-pool size announcement                     */
+    /* ────────────────────────────────────────────────────────────── */
+    if (!buffer_size_sent_ && app_->GetEncoder()->initialized())
+    {
+        redis_->set("buffer_size",
+                    std::to_string(app_->GetEncoder()->maxRamBuffers()));
+        buffer_size_sent_ = true;
+    }
+
+    /* ────────────────────────────────────────────────────────────── */
+    /*  2. Publish live stats                                        */
+    /* ────────────────────────────────────────────────────────────── */
     Json::Value data;
-    Json::Value histo;
-    data["framerate"] = completed_request->framerate;
-    data["colorTemp"] = info.colorTemp;
-    data["focus"] = info.focus;
+    data["framerate"]  = completed_request->framerate;
+    data["colorTemp"]  = info.colorTemp;
+    data["focus"]      = info.focus;
     data["frameCount"] = app_->GetEncoder()->getFrameCount();
     data["bufferSize"] = app_->GetEncoder()->bufferSize();
-    data["timestamp"] = (Json::Int64)info.ts;
+    data["timestamp"]  = static_cast<Json::Int64>(epoch_ns);   // ← TOD ns
     redis_->publish(CHANNEL_STATS, data.toStyledString());
 
-    std::string ts_key = (options_->CamPort() == "cam1") ? "timestamp_cam1" : "timestamp_cam0";
-    redis_->set(ts_key, std::to_string(info.ts));
+    /* cache per-camera timestamp key (TOD ns) */
+    const char *ts_key = (options_->CamPort() == "cam1")
+                           ? "timestamp_cam1"
+                           : "timestamp_cam0";
+    redis_->set(ts_key, std::to_string(epoch_ns));
 
-    /* --------------------------------------------------------
-     *  Keep current timecode in Redis (TC_CAM0/TC_CAM1)
-     * ------------------------------------------------------ */
-    /* use the last time-code produced by the encoder */
+    /* ────────────────────────────────────────────────────────────── */
+    /*  3. Feed encoder with µs-since-epoch (for DNG time-code)      */
+    /* ────────────────────────────────────────────────────────────── */
+    app_->GetEncoder()->setWallClockTimestamp(epoch_ns / 1'000ULL); // µs
+
+    /* ────────────────────────────────────────────────────────────── */
+    /*  4. Keep last encoder BCD time-code in Redis                  */
+    /* ────────────────────────────────────────────────────────────── */
     auto &tc_bcd = app_->GetEncoder()->originationTimeCode;
 
-    int hour  = ((tc_bcd[3] >> 4) & 0xF) * 10 + (tc_bcd[3] & 0xF);
-    int minute= ((tc_bcd[2] >> 4) & 0xF) * 10 + (tc_bcd[2] & 0xF);
-    int second= ((tc_bcd[1] >> 4) & 0xF) * 10 + (tc_bcd[1] & 0xF);
-    int frame = ((tc_bcd[0] >> 4) & 0xF) * 10 + (tc_bcd[0] & 0xF);
+    int hh = ((tc_bcd[3] >> 4) & 0xF) * 10 + (tc_bcd[3] & 0xF);
+    int mm = ((tc_bcd[2] >> 4) & 0xF) * 10 + (tc_bcd[2] & 0xF);
+    int ss = ((tc_bcd[1] >> 4) & 0xF) * 10 + (tc_bcd[1] & 0xF);
+    int ff = ((tc_bcd[0] >> 4) & 0xF) * 10 + (tc_bcd[0] & 0xF);
 
     std::ostringstream tc;
-    tc << std::setw(2) << std::setfill('0') << hour  << ':'
-       << std::setw(2) << minute << ':'
-       << std::setw(2) << second << ':'
-       << std::setw(2) << frame;
+    tc << std::setw(2) << std::setfill('0') << hh << ':'
+       << std::setw(2) << mm << ':'
+       << std::setw(2) << ss << ':'
+       << std::setw(2) << ff;
 
-    std::string key = (options_->CamPort() == "cam1") ? "tc_cam1" : "tc_cam0";
-    redis_->set(key, tc.str());
-    
+    const char *tc_key = (options_->CamPort() == "cam1") ? "tc_cam1" : "tc_cam0";
+    redis_->set(tc_key, tc.str());
 }
+
 
 void CinePIController::mainThread(){
     // spdlog::set_level(spdlog::level::debug); 
