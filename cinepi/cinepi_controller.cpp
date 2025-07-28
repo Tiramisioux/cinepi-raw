@@ -58,11 +58,18 @@ void CinePIController::sync(){
     console->critical(2);
 
     auto framerate = pipe_replies.get<OptionalString>(2);
-    if(framerate){
+    if (options_->sync == 2)                      // sync client → ignore Redis
+    {
+        framerate_ = options_->framerate.value_or(CP_DEF_FRAMERATE);
+    }
+    else if (framerate)
+    {
         framerate_ = stoi(*framerate);
-    }else{
+    }
+    else
+    {
         framerate_ = CP_DEF_FRAMERATE;
-        redis_->set(CONTROL_KEY_FRAMERATE, to_string(framerate_)); 
+        redis_->set(CONTROL_KEY_FRAMERATE, to_string(framerate_));
     }
 
     console->critical(3);
@@ -451,20 +458,6 @@ void CinePIController::mainThread(){
                 app_->SetControls(cl);
             }
         }},
-        { CONTROL_KEY_FRAMERATE, [this](const std::optional<std::string>& r) {
-            if(r) {
-                framerate_ = stof(*r);
-                options_->framerate = framerate_;
-
-                long int durationValues[2] = { static_cast<long int>(1000000.0 / framerate_),
-                                            static_cast<long int>(1000000.0 / framerate_) };
-
-                libcamera::Span<const long int, 2> durationRange(durationValues, 2);
-                libcamera::ControlList cl;
-                cl.set(libcamera::controls::FrameDurationLimits, durationRange);
-                app_->SetControls(cl);
-            }
-        }},
         { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
             cameraInit_ = true;
         }},
@@ -558,6 +551,29 @@ void CinePIController::mainThread(){
         }},   // end CONTROL_KEY_ZOOM
 
     };
+
+    if (options_->sync != 2)
+    {
+        handlers.emplace(CONTROL_KEY_FRAMERATE,
+            [this](const std::optional<std::string> &r)
+            {
+                if (!r)
+                    return;
+
+                framerate_ = std::stof(*r);
+                options_->framerate = framerate_;
+
+                long int durationValues[2] = {
+                    static_cast<long int>(1000000.0 / framerate_),
+                    static_cast<long int>(1000000.0 / framerate_)
+                };
+
+                libcamera::Span<const long int, 2> durationRange(durationValues, 2);
+                libcamera::ControlList cl;
+                cl.set(libcamera::controls::FrameDurationLimits, durationRange);
+                app_->SetControls(cl);
+            });
+    }
 
     sub.on_message([this, &handlers](std::string channel, std::string msg) {
         console->trace("{} from: {}", msg, channel);
