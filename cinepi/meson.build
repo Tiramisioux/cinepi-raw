@@ -52,3 +52,12 @@ cinepi_raw = executable('cinepi-raw', sources,
              link_with : rpicam_app,
              install : true)
 
+# Build the libcamera hardware sync helper tool
+lgpio_dep = dependency('lgpio', required : false)
+
+cinepi_hw_sync = executable('cinepi-hw-sync',
+            files('cinepi_hw_sync.spp'),
+            include_directories : [include_directories('..')],
+            dependencies : [lgpio_dep, dependency('threads')],
+            install : true)
+
