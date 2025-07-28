@@ -15,7 +15,6 @@
 #include <thread>
 #include <vector>
 #include <unistd.h>
-
 #include <errno.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -28,7 +27,6 @@
 using namespace std;
 using namespace std::chrono;
 
-
 static auto logger = spdlog::stdout_color_mt("cinepi_hw_sync");
 // Default to debug level for verbose output
 // Users can override via SPDLOG_LEVEL environment variable
@@ -36,7 +34,6 @@ static auto logger = spdlog::stdout_color_mt("cinepi_hw_sync");
 static struct LoggerInit {
     LoggerInit() { logger->set_level(spdlog::level::debug); }
 } logger_init;
-
 
 struct SyncPayload {
     uint32_t frameDuration;
@@ -126,7 +123,6 @@ int main(int argc, char **argv)
     logger->info("libcamera-hw-sync started with source={} fps={}", source, fps);
     if (source == "gpio")
         logger->info("GPIO chip={} line={}", chipName, line);
-
 
 #ifdef HAVE_LGPIO
     int chip = -1;
