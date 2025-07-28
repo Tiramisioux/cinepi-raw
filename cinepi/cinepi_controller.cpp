@@ -568,6 +568,29 @@ void CinePIController::mainThread(){
 
     };
 
+    if (options_->sync != 2)
+    {
+        handlers.emplace(CONTROL_KEY_FRAMERATE,
+            [this](const std::optional<std::string> &r)
+            {
+                if (!r)
+                    return;
+
+                framerate_ = std::stof(*r);
+                options_->framerate = framerate_;
+
+                long int durationValues[2] = {
+                    static_cast<long int>(1000000.0 / framerate_),
+                    static_cast<long int>(1000000.0 / framerate_)
+                };
+
+                libcamera::Span<const long int, 2> durationRange(durationValues, 2);
+                libcamera::ControlList cl;
+                cl.set(libcamera::controls::FrameDurationLimits, durationRange);
+                app_->SetControls(cl);
+            });
+    }
+
     sub.on_message([this, &handlers](std::string channel, std::string msg) {
         console->trace("{} from: {}", msg, channel);
 
