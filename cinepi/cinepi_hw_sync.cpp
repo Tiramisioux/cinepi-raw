@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
+
  * cinepi_hw_sync.cpp - Helper application to send hardware sync pulses.
  * Based on libcamera-hw-sync example.
  */
@@ -78,8 +79,8 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
-    init_logger();
 
+    init_logger();
     string source = "timer";
     double fps = 30.0;
     string group = "239.255.255.250";
@@ -113,7 +114,6 @@ int main(int argc, char **argv)
         return 1;
     }
     logger->info("UDP socket created");
-
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = inet_addr(group.c_str());
@@ -121,7 +121,6 @@ int main(int argc, char **argv)
 
     microseconds frameDuration(static_cast<int>(1e6 / fps));
     uint64_t frame = 0;
-
     logger->info("libcamera-hw-sync started with source={} fps={}", source, fps);
     if (source == "gpio")
         logger->info("GPIO chip={} line={}", chipName, line);
