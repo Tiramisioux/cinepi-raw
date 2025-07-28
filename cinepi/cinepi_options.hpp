@@ -39,6 +39,13 @@ public:
     bool  ZoomRaw()     const { return zoom_raw; }
     void  SetZoomRaw(bool v) { zoom_raw = v; }
 
+    const std::string &SyncSource() const { return sync_source; }
+    double             SyncFps()    const { return sync_fps;    }
+    const std::string &SyncGroup()  const { return sync_group;  }
+    uint16_t           SyncPort()   const { return sync_port;   }
+    const std::string &SyncChip()   const { return sync_chip;   }
+    int                SyncLine()   const { return sync_line;   }
+
     /* Vector of crop rectangles (fractions) in stream order.        */
     const std::vector<std::array<float,4>> &ScalerCrops() const
     { return scaler_crops_rects; }
@@ -57,4 +64,12 @@ private:
 
     // raw-stream zoom (disable 12-bit packing)
     bool  zoom_raw     = false;
+
+    /* Hardware sync helper parameters */
+    std::string sync_source = "timer";       // timer|stdin|gpio
+    double      sync_fps    = 30.0;          // pulses per second
+    std::string sync_group  = "239.255.255.250";
+    uint16_t    sync_port   = 10000;
+    std::string sync_chip   = "gpiochip4";
+    int         sync_line   = -1;
 };
