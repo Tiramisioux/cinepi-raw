@@ -458,7 +458,6 @@ void CinePIController::mainThread(){
                 app_->SetControls(cl);
             }
         }},
-
         { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
             cameraInit_ = true;
         }},
