@@ -277,7 +277,7 @@ bool CinePiOptions::Parse(int argc, char *argv[])
             sync_chip,
             sync_line);
 
-        if (sync != 0 && !framerate)
+        if (sync == 2 && !framerate)
             spdlog::info("--framerate not specified; using --sync-fps ({}) as camera framerate", sync_fps);
 
         return ok;

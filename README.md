@@ -117,9 +117,9 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-rawâ
 | `--hdmi-port <int>`     | `-1`              | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
 | `--same-hdmi`           | `false`           | Force both CinePi apps (capture & controller) to share the same HDMI output.                        |
 | `--keep16`              | `false`           | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit streams.                            |
-| `--sync-fps <float>`    | `30.0`            | Frame rate for generated sync pulses. If `--framerate` is omitted, this value becomes the camera framerate when sync is enabled. |
+| `--sync-fps <float>`    | `30.0`            | Frame rate for generated sync pulses. When using `--sync client` and `--framerate` is omitted, this value becomes the camera framerate. |
 
-When synchronization is active, omitting `--framerate` means the value of `--sync-fps` will be used as the camera's framerate.
+When `--sync client` is active, omitting `--framerate` means the value of `--sync-fps` will be used as the camera's framerate. Without the client flag, the framerate is controlled via Redis.
 
 ## Manual DNG encoder
 

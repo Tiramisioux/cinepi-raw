@@ -68,9 +68,7 @@ void CinePIController::sync(){
     }
     else
     {
-        framerate_ = (options_->sync != 0 && !options_->framerate)
-                          ? options_->SyncFps()
-                          : options_->framerate.value_or(CP_DEF_FRAMERATE);
+        framerate_ = CP_DEF_FRAMERATE;
         redis_->set(CONTROL_KEY_FRAMERATE, to_string(framerate_));
     }
 
