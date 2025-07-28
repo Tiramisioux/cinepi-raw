@@ -18,6 +18,9 @@
 #include <errno.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <poll.h>
 #ifdef HAVE_LGPIO
 #include <lgpio.h>
 #include <atomic>
@@ -155,9 +158,33 @@ int main(int argc, char **argv)
         console->info("GPIO alert callback installed");
     }
 #else
+    int gpio_fd = -1;
+    bool gpio_exported = false;
     if (source == "gpio") {
-        console->error("GPIO source requested but lgpio not available");
-        return 1;
+        std::string base = "/sys/class/gpio/gpio" + std::to_string(line);
+        struct stat st;
+        if (stat(base.c_str(), &st) < 0) {
+            int fd = open("/sys/class/gpio/export", O_WRONLY);
+            if (fd >= 0) {
+                std::string s = std::to_string(line);
+                write(fd, s.c_str(), s.size());
+                close(fd);
+                gpio_exported = true;
+            }
+        }
+        std::string dir = base + "/direction";
+        int fd = open(dir.c_str(), O_WRONLY);
+        if (fd >= 0) { write(fd, "in", 2); close(fd); }
+        std::string edge = base + "/edge";
+        fd = open(edge.c_str(), O_WRONLY);
+        if (fd >= 0) { write(fd, "rising", 6); close(fd); }
+        std::string val = base + "/value";
+        gpio_fd = open(val.c_str(), O_RDONLY | O_NONBLOCK);
+        if (gpio_fd < 0) {
+            console->error("Failed to open GPIO value file {}", val);
+            return 1;
+        }
+        console->info("GPIO sysfs monitoring line {}", line);
     }
 #endif
 
@@ -180,11 +207,22 @@ int main(int argc, char **argv)
             nowUs = gpioctx.ts.load() / 1000; // lgpio timestamp is in ns
             gpioctx.ready = false;
         }
+#else
+        else if (source == "gpio") {
+            struct pollfd pfd{ gpio_fd, POLLPRI, 0 };
+            poll(&pfd, 1, -1);
+            lseek(gpio_fd, 0, SEEK_SET);
+            char buf[8];
+            read(gpio_fd, buf, sizeof(buf));
+            nowUs = duration_cast<microseconds>(system_clock::now().time_since_epoch()).count();
+        }
 #endif
         else {
             console->error("Unknown source type: {}", source);
             return 1;
         }
+
+        console->info("Pulse {} received at {} us", frame, nowUs);
 
         if (!first) {
             uint64_t diff = nowUs - prevUs;
@@ -214,6 +252,17 @@ int main(int argc, char **argv)
     if (chip >= 0) {
         lgGpiochipClose(chip);
         console->info("GPIO chip closed");
+    }
+#else
+    if (gpio_fd >= 0)
+        close(gpio_fd);
+    if (gpio_exported) {
+        int fd = open("/sys/class/gpio/unexport", O_WRONLY);
+        if (fd >= 0) {
+            std::string s = std::to_string(line);
+            write(fd, s.c_str(), s.size());
+            close(fd);
+        }
     }
 #endif
 

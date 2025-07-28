@@ -60,7 +60,7 @@ void CinePIController::sync(){
     auto framerate = pipe_replies.get<OptionalString>(2);
     if (options_->sync == 2)                      // sync client → ignore Redis
     {
-        framerate_ = options_->framerate.value_or(CP_DEF_FRAMERATE);
+        framerate_ = options_->framerate.value_or(options_->SyncFps());
     }
     else if (framerate)
     {
