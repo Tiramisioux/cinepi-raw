@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /*
+
  * cinepi_hw_sync.cpp - Helper application to send hardware sync pulses.
  * Based on libcamera-hw-sync example.
  */
@@ -17,6 +18,7 @@
 #include <errno.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+
 #ifdef HAVE_LGPIO
 #include <lgpio.h>
 #include <atomic>
@@ -102,10 +104,12 @@ int main(int argc, char **argv)
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
+
         logger->error("Failed to create socket: {}", strerror(errno));
         return 1;
     }
     logger->info("UDP socket created");
+
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -114,6 +118,7 @@ int main(int argc, char **argv)
 
     microseconds frameDuration(static_cast<int>(1e6 / fps));
     uint64_t frame = 0;
+
 
     logger->info("libcamera-hw-sync started with source={} fps={}", source, fps);
     if (source == "gpio")
@@ -185,6 +190,7 @@ int main(int argc, char **argv)
 #endif
         else {
             logger->error("Unknown source type: {}", source);
+
             return 1;
         }
 
@@ -195,6 +201,7 @@ int main(int argc, char **argv)
                 logger->warn("Pulse interval {} us (expected ~{} us)", diff, exp);
             else
                 logger->debug("Pulse interval {} us", diff);
+
         }
         first = false;
         prevUs = nowUs;
@@ -217,6 +224,7 @@ int main(int argc, char **argv)
         lgGpiochipClose(chip);
         logger->info("GPIO chip closed");
     }
+
 #endif
 
     return 0;
