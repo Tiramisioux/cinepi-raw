@@ -44,6 +44,20 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 	app.OpenCamera();
         //app.ConfigureViewfinder();
+	/*-----------------------------------------------
+	* Enable the RPi sync algorithm
+	*----------------------------------------------*/
+	{
+    int mode = 0;                                       // Off
+    if (options->sync == 1)        mode = 1;            // Server
+    else if (options->sync == 2)   mode = 2;            // Client
+
+    libcamera::ControlList cl(app.GetCameras()[0]->controls());
+    cl.set(libcamera::controls::rpi::SyncMode, mode);
+    app.SetControls(std::move(cl));
+}
+
+
 	app.StartEncoder();
 	std::vector<std::shared_ptr<libcamera::Camera>> cameras = app.GetCameras();
 	if (cameras.size() == 0)
@@ -97,6 +111,18 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 				app.SetControls(std::move(ctrls));
 			}
 
+			/*-----------------------------------------------
+			* Enable the RPi sync algorithm
+			*----------------------------------------------*/
+			{
+				int mode = 0;                                       // Off
+				if (options->sync == 1)        mode = 1;            // Server
+				else if (options->sync == 2)   mode = 2;            // Client
+
+				libcamera::ControlList cl(app.GetCameras()[0]->controls());
+				cl.set(libcamera::controls::rpi::SyncMode, mode);
+				app.SetControls(std::move(cl));
+			}
 
 			app.StartCamera();
 			controller.cameraRunning = true;

@@ -29,12 +29,14 @@
 using namespace std;
 using namespace std::chrono;
 
-// Keep the logging style consistent with the other CinePI modules
 static std::shared_ptr<spdlog::logger> console = [] {
     auto lg = spdlog::stdout_color_mt("cinepi_hw_sync");
-    lg->set_level(spdlog::level::debug); // match verbosity used elsewhere
+    lg->set_level(spdlog::level::debug);      // keep full verbosity
+    lg->set_pattern("%v");                    // <<< NEW – message only
     return lg;
 }();
+
+
 
 struct SyncPayload {
     uint32_t frameDuration;
@@ -157,36 +159,79 @@ int main(int argc, char **argv)
         }
         console->info("GPIO alert callback installed");
     }
-#else
-    int gpio_fd = -1;
+#else  /* ---------- sysfs fallback when HAVE_LGPIO is not defined ---------- */
+    int  gpio_fd       = -1;
     bool gpio_exported = false;
+
     if (source == "gpio") {
-        std::string base = "/sys/class/gpio/gpio" + std::to_string(line);
-        struct stat st;
+        /* Translate (chipName,line)  → global GPIO number used by sysfs */
+        int global_line = line;
+        if (chipName.rfind("gpiochip", 0) == 0) {
+            int chip_idx = std::stoi(chipName.substr(8));
+            std::string base_file =
+                "/sys/class/gpio/gpiochip" + std::to_string(chip_idx) + "/base";
+            FILE *f = fopen(base_file.c_str(), "r");
+            if (!f) {
+                console->error("Cannot read {} ({})", base_file, strerror(errno));
+                return 1;
+            }
+            int base = 0;
+            fscanf(f, "%d", &base);
+            fclose(f);
+            global_line = base + line;
+        }
+
+        std::string base = "/sys/class/gpio/gpio" + std::to_string(global_line);
+
+        /* ------------------------------------------------------------------
+         * 1. export the line (needs root or udev rule that gives you write
+         *    access to /sys/class/gpio/export)
+         * ------------------------------------------------------------------ */
+        struct stat st{};
         if (stat(base.c_str(), &st) < 0) {
             int fd = open("/sys/class/gpio/export", O_WRONLY);
-            if (fd >= 0) {
-                std::string s = std::to_string(line);
-                write(fd, s.c_str(), s.size());
-                close(fd);
-                gpio_exported = true;
+            if (fd < 0) {
+                console->error("Cannot write /sys/class/gpio/export ({}). "
+                               "Try running with sudo or add the user to the "
+                               "'gpio' group.", strerror(errno));
+                return 1;
             }
+            std::string s = std::to_string(global_line);
+            write(fd, s.c_str(), s.size());
+            close(fd);
+            gpio_exported = true;
         }
-        std::string dir = base + "/direction";
-        int fd = open(dir.c_str(), O_WRONLY);
-        if (fd >= 0) { write(fd, "in", 2); close(fd); }
-        std::string edge = base + "/edge";
-        fd = open(edge.c_str(), O_WRONLY);
-        if (fd >= 0) { write(fd, "rising", 6); close(fd); }
+
+        /* wait until the kernel has created the directory */
+        for (int i = 0; i < 100; ++i) {        // up to ~1 s total
+            if (stat(base.c_str(), &st) == 0)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (stat(base.c_str(), &st) < 0) {
+            console->error("GPIO {} did not appear under /sys/class/gpio", global_line);
+            return 1;
+        }
+
+        auto write_str = [](const std::string &path, const char *str) {
+            int fd = open(path.c_str(), O_WRONLY);
+            if (fd >= 0) { write(fd, str, strlen(str)); close(fd); }
+            else         console->warn("Cannot open {} ({})", path, strerror(errno));
+        };
+
+        write_str(base + "/direction", "in");
+        write_str(base + "/edge",      "rising");
+
+        /* open the value file non-blocking so we can poll() on it */
         std::string val = base + "/value";
         gpio_fd = open(val.c_str(), O_RDONLY | O_NONBLOCK);
         if (gpio_fd < 0) {
-            console->error("Failed to open GPIO value file {}", val);
+            console->error("Failed to open GPIO value file {} ({})", val, strerror(errno));
             return 1;
         }
-        console->info("GPIO sysfs monitoring line {}", line);
+        console->info("GPIO sysfs monitoring global line {}", global_line);
     }
-#endif
+#endif /* --------- end of sysfs fallback block --------- */
 
     uint64_t prevUs = 0;
     bool first = true;
