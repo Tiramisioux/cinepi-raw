@@ -73,7 +73,8 @@ static void usage(const char *argv0)
     cout << "Usage: " << argv0
          << " [--source timer|stdin|gpio] [--fps N]\n"
          << "            [--group ADDRESS] [--port PORT]\n"
-         << "            [--chip NAME] [--line PIN]\n";
+         << "            [--chip NAME] [--line PIN]\n"
+         << "            [--out-pin PIN]";
 }
 
 int main(int argc, char **argv)
@@ -84,6 +85,7 @@ int main(int argc, char **argv)
     uint16_t port = 10000;
     string chipName = "gpiochip4";
     int line = -1;
+    int outLine = -1;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -99,6 +101,8 @@ int main(int argc, char **argv)
             chipName = argv[++i];
         } else if (arg == "--line" && i + 1 < argc) {
             line = stoi(argv[++i]);
+        } else if (arg == "--out-pin" && i + 1 < argc) {
+            outLine = stoi(argv[++i]);
         } else {
             usage(argv[0]);
             return 0;
@@ -121,6 +125,8 @@ int main(int argc, char **argv)
     console->info("libcamera-hw-sync started with source={} fps={}", source, fps);
     if (source == "gpio")
         console->info("GPIO chip={} line={}", chipName, line);
+    if (outLine >= 0)
+        console->info("Output pin {} enabled", outLine);
 
 #ifdef HAVE_LGPIO
     int chip = -1;
@@ -129,7 +135,7 @@ int main(int argc, char **argv)
 #endif
 
 #ifdef HAVE_LGPIO
-    if (source == "gpio") {
+    if (source == "gpio" || outLine >= 0) {
         int num = 0;
         if (chipName.rfind("gpiochip", 0) == 0)
             num = stoi(chipName.substr(8));
@@ -145,25 +151,39 @@ int main(int argc, char **argv)
         }
         console->info("GPIO chip {} opened", chipName);
 
-        rc = lgGpioClaimAlert(chip, 0, LG_RISING_EDGE, line, -1);
-        if (rc < 0) {
-            console->error("Failed to claim alert on line {}", line);
-            return 1;
-        }
-        console->info("Alert claimed on GPIO line {}", line);
+        if (source == "gpio") {
+            rc = lgGpioClaimAlert(chip, 0, LG_RISING_EDGE, line, -1);
+            if (rc < 0) {
+                console->error("Failed to claim alert on line {}", line);
+                return 1;
+            }
+            console->info("Alert claimed on GPIO line {}", line);
 
-        rc = lgGpioSetAlertsFunc(chip, line, gpio_alert_cb, &gpioctx);
-        if (rc < 0) {
-            console->error("Failed to set alert callback");
-            return 1;
+            rc = lgGpioSetAlertsFunc(chip, line, gpio_alert_cb, &gpioctx);
+            if (rc < 0) {
+                console->error("Failed to set alert callback");
+                return 1;
+            }
+            console->info("GPIO alert callback installed");
         }
-        console->info("GPIO alert callback installed");
+
+        if (outLine >= 0) {
+            rc = lgGpioClaimOutput(chip, 0, outLine, 0);
+            if (rc < 0) {
+                console->error("Failed to claim output on line {}", outLine);
+                return 1;
+            }
+            console->info("Output GPIO line {} claimed", outLine);
+        }
     }
 #else  /* ---------- sysfs fallback when HAVE_LGPIO is not defined ---------- */
     int  gpio_fd       = -1;
     bool gpio_exported = false;
+    int  out_fd        = -1;
+    bool out_exported  = false;
+    int  out_global_line = -1;
 
-    if (source == "gpio") {
+    if (source == "gpio" || outLine >= 0) {
         /* Translate (chipName,line)  → global GPIO number used by sysfs */
         int global_line = line;
         if (chipName.rfind("gpiochip", 0) == 0) {
@@ -182,6 +202,18 @@ int main(int argc, char **argv)
         }
 
         std::string base = "/sys/class/gpio/gpio" + std::to_string(global_line);
+        int out_global = outLine;
+        if (outLine >= 0 && chipName.rfind("gpiochip", 0) == 0) {
+            int chip_idx = std::stoi(chipName.substr(8));
+            std::string base_file_out =
+                "/sys/class/gpio/gpiochip" + std::to_string(chip_idx) + "/base";
+            FILE *f = fopen(base_file_out.c_str(), "r");
+            if (f) { int b = 0; fscanf(f, "%d", &b); fclose(f); out_global = b + outLine; }
+        }
+        out_global_line = out_global;
+        std::string base_out;
+        if (outLine >= 0)
+            base_out = "/sys/class/gpio/gpio" + std::to_string(out_global);
 
         /* ------------------------------------------------------------------
          * 1. export the line (needs root or udev rule that gives you write
@@ -202,6 +234,16 @@ int main(int argc, char **argv)
             gpio_exported = true;
         }
 
+        if (outLine >= 0 && stat(base_out.c_str(), &st) < 0) {
+            int fd = open("/sys/class/gpio/export", O_WRONLY);
+            if (fd >= 0) {
+                std::string s = std::to_string(out_global);
+                write(fd, s.c_str(), s.size());
+                close(fd);
+                out_exported = true;
+            }
+        }
+
         /* wait until the kernel has created the directory */
         for (int i = 0; i < 100; ++i) {        // up to ~1 s total
             if (stat(base.c_str(), &st) == 0)
@@ -210,6 +252,10 @@ int main(int argc, char **argv)
         }
         if (stat(base.c_str(), &st) < 0) {
             console->error("GPIO {} did not appear under /sys/class/gpio", global_line);
+            return 1;
+        }
+        if (outLine >= 0 && stat(base_out.c_str(), &st) < 0) {
+            console->error("GPIO {} did not appear under /sys/class/gpio", out_global);
             return 1;
         }
 
@@ -221,6 +267,10 @@ int main(int argc, char **argv)
 
         write_str(base + "/direction", "in");
         write_str(base + "/edge",      "rising");
+        if (outLine >= 0) {
+            write_str(base_out + "/direction", "out");
+            write_str(base_out + "/value", "0");
+        }
 
         /* open the value file non-blocking so we can poll() on it */
         std::string val = base + "/value";
@@ -228,6 +278,11 @@ int main(int argc, char **argv)
         if (gpio_fd < 0) {
             console->error("Failed to open GPIO value file {} ({})", val, strerror(errno));
             return 1;
+        }
+        if (outLine >= 0) {
+            out_fd = open((base_out + "/value").c_str(), O_WRONLY);
+            if (out_fd < 0)
+                console->warn("Failed to open output GPIO value file {}", base_out + "/value");
         }
         console->info("GPIO sysfs monitoring global line {}", global_line);
     }
@@ -280,6 +335,24 @@ int main(int argc, char **argv)
         first = false;
         prevUs = nowUs;
 
+        if (outLine >= 0) {
+#ifdef HAVE_LGPIO
+            lgGpioWrite(chip, outLine, 1);
+            this_thread::sleep_for(std::chrono::milliseconds(5));
+            lgGpioWrite(chip, outLine, 0);
+#else
+            if (out_fd >= 0) {
+                write(out_fd, "1", 1);
+                fsync(out_fd);
+                this_thread::sleep_for(std::chrono::milliseconds(5));
+                lseek(out_fd, 0, SEEK_SET);
+                write(out_fd, "0", 1);
+                fsync(out_fd);
+                lseek(out_fd, 0, SEEK_SET);
+            }
+#endif
+        }
+
         SyncPayload payload{};
         payload.frameDuration = frameDuration.count();
         payload.wallClockFrameTimestamp = nowUs;
@@ -301,11 +374,19 @@ int main(int argc, char **argv)
 #else
     if (gpio_fd >= 0)
         close(gpio_fd);
-    if (gpio_exported) {
+    if (out_fd >= 0)
+        close(out_fd);
+    if (gpio_exported || out_exported) {
         int fd = open("/sys/class/gpio/unexport", O_WRONLY);
         if (fd >= 0) {
-            std::string s = std::to_string(line);
-            write(fd, s.c_str(), s.size());
+            if (gpio_exported) {
+                std::string s = std::to_string(line);
+                write(fd, s.c_str(), s.size());
+            }
+            if (out_exported) {
+                std::string s2 = std::to_string(out_global_line);
+                write(fd, s2.c_str(), s2.size());
+            }
             close(fd);
         }
     }
