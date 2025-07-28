@@ -48,7 +48,20 @@ CinePiOptions::CinePiOptions()
                 ("scaler-crops",
                     value<std::string>()->implicit_value(""),
                     "Per-stream crop rectangles as fractions:\n"
-                    "x,y,w,h[:x,y,w,h ...]   (0-1, up to 3 streams)");
+                    "x,y,w,h[:x,y,w,h ...]   (0-1, up to 3 streams)")
+
+                ("sync-source", value<std::string>()->default_value("timer"),
+                    "Source for sync pulses: timer|stdin|gpio")
+                ("sync-fps", value<double>()->default_value(30.0),
+                    "Frame rate for generated sync pulses")
+                ("sync-group", value<std::string>()->default_value("239.255.255.250"),
+                    "Multicast group address for sync")
+                ("sync-port", value<int>()->default_value(10000),
+                    "UDP port for sync")
+                ("sync-chip", value<std::string>()->default_value("gpiochip4"),
+                    "GPIO chip name for sync source")
+                ("sync-line", value<int>()->default_value(-1),
+                    "GPIO line number for sync source");
         options_.add(cinepi_group);
 }
 
@@ -132,6 +145,73 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                         continue;
                 }
 
+                /* sync helper options -------------------------------------- */
+                if (arg.rfind("--sync-source=", 0) == 0) {
+                        sync_source = arg.substr(sizeof("--sync-source=") - 1);
+                        continue;
+                }
+                if (arg == "--sync-source") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--sync-source requires a value");
+                        sync_source = argv[++i];
+                        continue;
+                }
+
+                if (arg.rfind("--sync-fps=", 0) == 0) {
+                        sync_fps = std::stod(arg.substr(sizeof("--sync-fps=") - 1));
+                        continue;
+                }
+                if (arg == "--sync-fps") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--sync-fps requires a value");
+                        sync_fps = std::stod(argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--sync-group=", 0) == 0) {
+                        sync_group = arg.substr(sizeof("--sync-group=") - 1);
+                        continue;
+                }
+                if (arg == "--sync-group") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--sync-group requires a value");
+                        sync_group = argv[++i];
+                        continue;
+                }
+
+                if (arg.rfind("--sync-port=", 0) == 0) {
+                        sync_port = static_cast<uint16_t>(std::stoi(arg.substr(sizeof("--sync-port=") - 1)));
+                        continue;
+                }
+                if (arg == "--sync-port") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--sync-port requires a value");
+                        sync_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+                        continue;
+                }
+
+                if (arg.rfind("--sync-chip=", 0) == 0) {
+                        sync_chip = arg.substr(sizeof("--sync-chip=") - 1);
+                        continue;
+                }
+                if (arg == "--sync-chip") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--sync-chip requires a value");
+                        sync_chip = argv[++i];
+                        continue;
+                }
+
+                if (arg.rfind("--sync-line=", 0) == 0) {
+                        sync_line = std::stoi(arg.substr(sizeof("--sync-line=") - 1));
+                        continue;
+                }
+                if (arg == "--sync-line") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--sync-line requires a value");
+                        sync_line = std::stoi(argv[++i]);
+                        continue;
+                }
+
                 /* not a CinePi flag – forward it */
                 forward.push_back(argv[i]);
         }
@@ -173,13 +253,20 @@ bool CinePiOptions::Parse(int argc, char *argv[])
         RawOptions::camPort = camPort;
 
         /* Log summary ------------------------------------------------- */
-        spdlog::info("cinepi-cli: camPort='{}'  hdmi_port={}  same_hdmi={}  zoom={}  crops={}"
-                     "crops={} rectangles",
-                     camPort,
-                     hdmi_port,
-                     same_hdmi ? "true" : "false",
-                     Zoom(),
-                     scaler_crops_rects.size());
+        spdlog::info(
+            "cinepi-cli: camPort='{}' hdmi_port={} same_hdmi={} zoom={} crops={}"
+            " rectangles sync_src={} fps={} grp={} port={} chip={} line={}",
+            camPort,
+            hdmi_port,
+            same_hdmi ? "true" : "false",
+            Zoom(),
+            scaler_crops_rects.size(),
+            sync_source,
+            sync_fps,
+            sync_group,
+            sync_port,
+            sync_chip,
+            sync_line);
 
         return ok;
 }
