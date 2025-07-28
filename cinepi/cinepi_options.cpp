@@ -253,14 +253,23 @@ bool CinePiOptions::Parse(int argc, char *argv[])
         RawOptions::camPort = camPort;
 
         /* Log summary ------------------------------------------------- */
+        std::string sync_mode;
+        switch (sync)
+        {
+            case 1:  sync_mode = "server"; break;
+            case 2:  sync_mode = "client"; break;
+            default: sync_mode = "off";    break;
+        }
+
         spdlog::info(
             "cinepi-cli: camPort='{}' hdmi_port={} same_hdmi={} zoom={} crops={}"
-            " rectangles sync_src={} fps={} grp={} port={} chip={} line={}",
+            " rectangles sync_mode={} src={} fps={} grp={} port={} chip={} line={}",
             camPort,
             hdmi_port,
             same_hdmi ? "true" : "false",
             Zoom(),
             scaler_crops_rects.size(),
+            sync_mode,
             sync_source,
             sync_fps,
             sync_group,
