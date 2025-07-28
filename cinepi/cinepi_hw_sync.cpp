@@ -26,18 +26,12 @@
 using namespace std;
 using namespace std::chrono;
 
-static std::shared_ptr<spdlog::logger> logger;
-
-static void init_logger()
-{
-    if (!logger)
-    {
-        logger = spdlog::stdout_color_mt("cinepi_hw_sync");
-        logger->set_level(spdlog::level::debug);
-        spdlog::set_level(spdlog::level::debug);
-        logger->flush_on(spdlog::level::debug);
-    }
-}
+// Keep the logging style consistent with the other CinePI modules
+static std::shared_ptr<spdlog::logger> console = [] {
+    auto lg = spdlog::stdout_color_mt("cinepi_hw_sync");
+    lg->set_level(spdlog::level::debug); // match verbosity used elsewhere
+    return lg;
+}();
 
 struct SyncPayload {
     uint32_t frameDuration;
@@ -79,8 +73,6 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
-
-    init_logger();
     string source = "timer";
     double fps = 30.0;
     string group = "239.255.255.250";
@@ -110,10 +102,10 @@ int main(int argc, char **argv)
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        logger->error("Failed to create socket: {}", strerror(errno));
+        console->error("Failed to create socket: {}", strerror(errno));
         return 1;
     }
-    logger->info("UDP socket created");
+    console->info("UDP socket created");
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = inet_addr(group.c_str());
@@ -121,9 +113,9 @@ int main(int argc, char **argv)
 
     microseconds frameDuration(static_cast<int>(1e6 / fps));
     uint64_t frame = 0;
-    logger->info("libcamera-hw-sync started with source={} fps={}", source, fps);
+    console->info("libcamera-hw-sync started with source={} fps={}", source, fps);
     if (source == "gpio")
-        logger->info("GPIO chip={} line={}", chipName, line);
+        console->info("GPIO chip={} line={}", chipName, line);
 
 #ifdef HAVE_LGPIO
     int chip = -1;
@@ -143,28 +135,28 @@ int main(int argc, char **argv)
         if (chip < 0 && num == 4)
             chip = lgGpiochipOpen(0);
         if (chip < 0) {
-            logger->error("Failed to open {} or gpiochip0", chipName);
+            console->error("Failed to open {} or gpiochip0", chipName);
             return 1;
         }
-        logger->info("GPIO chip {} opened", chipName);
+        console->info("GPIO chip {} opened", chipName);
 
         rc = lgGpioClaimAlert(chip, 0, LG_RISING_EDGE, line, -1);
         if (rc < 0) {
-            logger->error("Failed to claim alert on line {}", line);
+            console->error("Failed to claim alert on line {}", line);
             return 1;
         }
-        logger->info("Alert claimed on GPIO line {}", line);
+        console->info("Alert claimed on GPIO line {}", line);
 
         rc = lgGpioSetAlertsFunc(chip, line, gpio_alert_cb, &gpioctx);
         if (rc < 0) {
-            logger->error("Failed to set alert callback");
+            console->error("Failed to set alert callback");
             return 1;
         }
-        logger->info("GPIO alert callback installed");
+        console->info("GPIO alert callback installed");
     }
 #else
     if (source == "gpio") {
-        logger->error("GPIO source requested but lgpio not available");
+        console->error("GPIO source requested but lgpio not available");
         return 1;
     }
 #endif
@@ -190,7 +182,7 @@ int main(int argc, char **argv)
         }
 #endif
         else {
-            logger->error("Unknown source type: {}", source);
+            console->error("Unknown source type: {}", source);
             return 1;
         }
 
@@ -198,9 +190,9 @@ int main(int argc, char **argv)
             uint64_t diff = nowUs - prevUs;
             uint64_t exp = frameDuration.count();
             if (diff < exp * 9 / 10 || diff > exp * 11 / 10)
-                logger->warn("Pulse interval {} us (expected ~{} us)", diff, exp);
+                console->warn("Pulse interval {} us (expected ~{} us)", diff, exp);
             else
-                logger->debug("Pulse interval {} us", diff);
+                console->debug("Pulse interval {} us", diff);
         }
         first = false;
         prevUs = nowUs;
@@ -213,15 +205,15 @@ int main(int argc, char **argv)
         ssize_t ret = sendto(sock, &payload, sizeof(payload), 0,
                              reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
         if (ret < 0)
-            logger->error("sendto failed: {}", strerror(errno));
+            console->error("sendto failed: {}", strerror(errno));
 
-        logger->info("Frame {} sent", frame++);
+        console->info("Frame {} sent", frame++);
     }
 
 #ifdef HAVE_LGPIO
     if (chip >= 0) {
         lgGpiochipClose(chip);
-        logger->info("GPIO chip closed");
+        console->info("GPIO chip closed");
     }
 #endif
 
