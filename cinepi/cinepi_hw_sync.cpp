@@ -74,6 +74,7 @@ static void usage(const char *argv0)
          << " [--source timer|stdin|gpio] [--fps N]\n"
          << "            [--group ADDRESS] [--port PORT]\n"
          << "            [--chip NAME] [--line PIN]\n"
+
          << "            [--out-pin PIN] [--out-fps N]";
 }
 
@@ -105,6 +106,7 @@ int main(int argc, char **argv)
             line = stoi(argv[++i]);
         } else if (arg == "--out-pin" && i + 1 < argc) {
             outLine = stoi(argv[++i]);
+
         } else if (arg == "--out-fps" && i + 1 < argc) {
             outFps = stod(argv[++i]);
         } else {
