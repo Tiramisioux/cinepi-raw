@@ -4,7 +4,10 @@
 
 #include <boost/program_options.hpp>
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include <cstdlib>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <sstream>
 
@@ -48,7 +51,25 @@ CinePiOptions::CinePiOptions()
                 ("scaler-crops",
                     value<std::string>()->implicit_value(""),
                     "Per-stream crop rectangles as fractions:\n"
-                    "x,y,w,h[:x,y,w,h ...]   (0-1, up to 3 streams)");
+                    "x,y,w,h[:x,y,w,h ...]   (0-1, up to 3 streams)")
+                ("encode-workers",
+                    value<unsigned int>()->default_value(2),
+                    "Number of DNG encode worker threads")
+                ("disk-workers",
+                    value<unsigned int>()->default_value(8),
+                    "Number of DNG disk writer threads")
+                ("encode-affinity",
+                    value<std::string>()->implicit_value(""),
+                    "CPU list (e.g. 4,5 or 2-3) to pin encode workers")
+                ("disk-affinity",
+                    value<std::string>()->implicit_value(""),
+                    "CPU list (e.g. 0-1) to pin disk workers")
+                ("encode-nice",
+                    value<int>(),
+                    "Nice level (-20..19) for encode workers")
+                ("disk-nice",
+                    value<int>(),
+                    "Nice level (-20..19) for disk workers");
         options_.add(cinepi_group);
 }
 
@@ -62,6 +83,129 @@ static std::array<float,4> parseCrop(const std::string &tok)
     if (sscanf(tok.c_str(), "%f,%f,%f,%f", &x,&y,&w,&h) != 4)
         throw std::runtime_error("Invalid --scaler-crops token: " + tok);
     return { x,y,w,h };
+}
+
+
+static std::string trimToken(const std::string &token)
+{
+        const auto start = token.find_first_not_of(" \t");
+        if (start == std::string::npos)
+                return "";
+        const auto end = token.find_last_not_of(" \t");
+        return token.substr(start, end - start + 1);
+}
+
+static unsigned int parseWorkerCount(const std::string &flag, const std::string &value)
+{
+        try
+        {
+                size_t pos = 0;
+                unsigned long parsed = std::stoul(value, &pos, 10);
+                if (pos != value.size())
+                        throw std::runtime_error(flag + " contains trailing characters: " + value.substr(pos));
+                if (parsed == 0)
+                        throw std::runtime_error(flag + " must be greater than zero");
+                if (parsed > std::numeric_limits<uint32_t>::max())
+                        throw std::runtime_error(flag + " exceeds supported range");
+                return static_cast<unsigned int>(parsed);
+        }
+        catch (const std::invalid_argument &)
+        {
+                throw std::runtime_error(flag + " requires a positive integer value");
+        }
+        catch (const std::out_of_range &)
+        {
+                throw std::runtime_error(flag + " is out of range");
+        }
+}
+
+static int parseNiceValue(const std::string &flag, const std::string &value)
+{
+        try
+        {
+                size_t pos = 0;
+                int parsed = std::stoi(value, &pos, 10);
+                if (pos != value.size())
+                        throw std::runtime_error(flag + " contains trailing characters: " + value.substr(pos));
+                if (parsed < -20 || parsed > 19)
+                        throw std::runtime_error(flag + " must be between -20 and 19");
+                return parsed;
+        }
+        catch (const std::invalid_argument &)
+        {
+                throw std::runtime_error(flag + " requires an integer value");
+        }
+        catch (const std::out_of_range &)
+        {
+                throw std::runtime_error(flag + " is out of range");
+        }
+}
+
+static std::vector<int> parseCpuList(const std::string &flag, const std::string &value)
+{
+        if (value.empty())
+                throw std::runtime_error(flag + " requires a CPU list");
+
+        std::vector<int> cpus;
+        std::stringstream ss(value);
+        std::string token;
+
+        while (std::getline(ss, token, ','))
+        {
+                token = trimToken(token);
+                if (token.empty())
+                        throw std::runtime_error(flag + " contains an empty entry");
+
+                auto dash = token.find('-');
+                if (dash == std::string::npos)
+                {
+                        size_t pos = 0;
+                        int cpu = std::stoi(token, &pos, 10);
+                        if (pos != token.size() || cpu < 0)
+                                throw std::runtime_error(flag + " has invalid CPU index: " + token);
+                        cpus.push_back(cpu);
+                        continue;
+                }
+
+                std::string start_str = trimToken(token.substr(0, dash));
+                std::string end_str   = trimToken(token.substr(dash + 1));
+                if (start_str.empty() || end_str.empty())
+                        throw std::runtime_error(flag + " has invalid range: " + token);
+
+                size_t pos1 = 0;
+                size_t pos2 = 0;
+                int start_cpu = std::stoi(start_str, &pos1, 10);
+                int end_cpu   = std::stoi(end_str, &pos2, 10);
+                if (pos1 != start_str.size() || pos2 != end_str.size() || start_cpu < 0 || end_cpu < 0)
+                        throw std::runtime_error(flag + " has invalid range: " + token);
+                if (end_cpu < start_cpu)
+                        throw std::runtime_error(flag + " has descending range: " + token);
+
+                for (int cpu = start_cpu; cpu <= end_cpu; ++cpu)
+                        cpus.push_back(cpu);
+        }
+
+        if (cpus.empty())
+                throw std::runtime_error(flag + " resolved to an empty CPU set");
+
+        std::sort(cpus.begin(), cpus.end());
+        cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
+        return cpus;
+}
+
+static std::string cpuListToString(const std::optional<std::vector<int>> &cpus)
+{
+        if (!cpus || cpus->empty())
+                return std::string("auto");
+
+        std::ostringstream oss;
+        for (size_t i = 0; i < cpus->size(); ++i)
+        {
+                if (i)
+                        oss << ',';
+                oss << (*cpus)[i];
+        }
+        return oss.str();
 }
 
 
@@ -132,6 +276,72 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                         continue;
                 }
 
+                if (arg.rfind("--encode-workers=", 0) == 0) {
+                        RawOptions::encode_workers = parseWorkerCount("--encode-workers", arg.substr(sizeof("--encode-workers=") - 1));
+                        continue;
+                }
+                if (arg == "--encode-workers") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--encode-workers requires a value");
+                        RawOptions::encode_workers = parseWorkerCount("--encode-workers", argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--disk-workers=", 0) == 0) {
+                        RawOptions::disk_workers = parseWorkerCount("--disk-workers", arg.substr(sizeof("--disk-workers=") - 1));
+                        continue;
+                }
+                if (arg == "--disk-workers") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--disk-workers requires a value");
+                        RawOptions::disk_workers = parseWorkerCount("--disk-workers", argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--encode-affinity=", 0) == 0) {
+                        RawOptions::encode_affinity = parseCpuList("--encode-affinity", arg.substr(sizeof("--encode-affinity=") - 1));
+                        continue;
+                }
+                if (arg == "--encode-affinity") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--encode-affinity requires a value");
+                        RawOptions::encode_affinity = parseCpuList("--encode-affinity", argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--disk-affinity=", 0) == 0) {
+                        RawOptions::disk_affinity = parseCpuList("--disk-affinity", arg.substr(sizeof("--disk-affinity=") - 1));
+                        continue;
+                }
+                if (arg == "--disk-affinity") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--disk-affinity requires a value");
+                        RawOptions::disk_affinity = parseCpuList("--disk-affinity", argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--encode-nice=", 0) == 0) {
+                        RawOptions::encode_nice = parseNiceValue("--encode-nice", arg.substr(sizeof("--encode-nice=") - 1));
+                        continue;
+                }
+                if (arg == "--encode-nice") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--encode-nice requires a value");
+                        RawOptions::encode_nice = parseNiceValue("--encode-nice", argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--disk-nice=", 0) == 0) {
+                        RawOptions::disk_nice = parseNiceValue("--disk-nice", arg.substr(sizeof("--disk-nice=") - 1));
+                        continue;
+                }
+                if (arg == "--disk-nice") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--disk-nice requires a value");
+                        RawOptions::disk_nice = parseNiceValue("--disk-nice", argv[++i]);
+                        continue;
+                }
+
                 /* not a CinePi flag – forward it */
                 forward.push_back(argv[i]);
         }
@@ -180,6 +390,14 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                      same_hdmi ? "true" : "false",
                      Zoom(),
                      scaler_crops_rects.size());
+
+        spdlog::info("cinepi-cli: encode_workers={} disk_workers={} encode_affinity={} disk_affinity={} encode_nice={} disk_nice={}",
+                      RawOptions::encode_workers,
+                      RawOptions::disk_workers,
+                      cpuListToString(RawOptions::encode_affinity),
+                      cpuListToString(RawOptions::disk_affinity),
+                      RawOptions::encode_nice ? std::to_string(*RawOptions::encode_nice) : std::string("auto"),
+                      RawOptions::disk_nice ? std::to_string(*RawOptions::disk_nice) : std::string("auto"));
 
         return ok;
 }

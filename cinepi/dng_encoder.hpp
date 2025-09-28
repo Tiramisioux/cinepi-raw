@@ -11,6 +11,7 @@
 #include <memory> // for std::shared_ptr
 #include <string>
 #include <atomic>
+#include <optional>
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -107,13 +108,16 @@ private:
 
 	std::shared_ptr<spdlog::logger> console;
 
-	static const int NUM_ENC_THREADS = 2;
-	static const int NUM_DISK_THREADS = 8;
+        void encodeThread(int num);
+        void diskThread(int num);
+        void stopThreads();
+        void configureThreadContext(const std::string &name,
+                                     size_t index,
+                                     size_t total,
+                                     const std::optional<std::vector<int>> &affinity,
+                                     const std::optional<int> &nice_value);
 
-	void encodeThread(int num);
-	void diskThread(int num);
-
-	bool encoder_initialized_;
+        bool encoder_initialized_;
 	struct DngInfo
 {
 	uint8_t bits;
@@ -168,18 +172,27 @@ private:
 	unsigned int max_buffer_frames;
 
 	bool encodeCheck_;
-	bool abortEncode_;
-	bool abortOutput_;
-	bool resetCount_;
-	uint64_t index_;
-	uint64_t frames_;
+        bool resetCount_;
+        uint64_t index_;
+        uint64_t frames_;
 
     RawOptions const *options_;
 
-	struct EncodeItem
-	{
+        size_t encode_worker_count_ { 0 };
+        size_t disk_worker_count_   { 0 };
+        std::vector<std::thread> encode_threads_;
+        std::vector<std::thread> disk_threads_;
+        std::atomic<bool> stop_encode_ { false };
+        std::atomic<bool> stop_disk_   { false };
+        std::optional<std::vector<int>> encode_affinity_;
+        std::optional<std::vector<int>> disk_affinity_;
+        std::optional<int> encode_nice_;
+        std::optional<int> disk_nice_;
 
-		void *mem;
+        struct EncodeItem
+        {
+
+                void *mem;
         size_t size;
 		StreamInfo info;
 		void *lomem;
@@ -191,8 +204,7 @@ private:
 	};
 	std::queue<EncodeItem> encode_queue_;
 	std::mutex encode_mutex_;
-	std::condition_variable encode_cond_var_;
-	std::thread encode_thread_[NUM_ENC_THREADS];
+        std::condition_variable encode_cond_var_;
 
         struct DiskItem
         {
@@ -204,10 +216,9 @@ private:
                 uint64_t index;
                 std::string timecode;
         };
-	std::queue<DiskItem> disk_buffer_;
-	std::mutex disk_mutex_;
-	std::condition_variable disk_cond_var_;
-	std::thread disk_thread_[NUM_DISK_THREADS];
+        std::queue<DiskItem> disk_buffer_;
+        std::mutex disk_mutex_;
+        std::condition_variable disk_cond_var_;
 };
 
 #endif
