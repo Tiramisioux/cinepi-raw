@@ -111,13 +111,18 @@ _Adapted to libcamera 0.5 / rpicam-apps 1.0.7._
 
 The following flags extend the base `rpicam-apps` functionality with CinePi-raw–specific features:
 
-| Flag                    | Default           | Description                                                                                          |
-|-------------------------|-------------------|------------------------------------------------------------------------------------------------------|
-| `--cam-port <string>`   | `""`              | Physical camera port to use (e.g. `cam0` or `cam1`).                                         |
-| `--hdmi-port <int>`     | `-1`              | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
-| `--same-hdmi`           | `false`           | Force both CinePi apps (capture & controller) to share the same HDMI output.                        |
-| `--keep16`              | `false`           | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit streams.                            |
-
+| Flag                      | Default | Description |
+|---------------------------|---------|-------------|
+| `--cam-port <string>`     | `""`    | Physical camera port to use (e.g. `cam0` or `cam1`). |
+| `--hdmi-port <int>`       | `-1`    | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
+| `--same-hdmi`             | `false` | Force both CinePi apps (capture & controller) to share the same HDMI output. |
+| `--keep16`                | `false` | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit streams. |
+| `--encode-workers <n>`    | `2`     | Number of DNG encode worker threads to spawn (min. `1`). |
+| `--disk-workers <n>`      | `8`     | Number of disk writer threads used for flushing DNGs (min. `1`). |
+| `--encode-affinity <list>`| `auto`  | Pin encode workers to a CPU list (e.g. `4,5` or `2-5`). |
+| `--disk-affinity <list>`  | `auto`  | Pin disk workers to the specified CPU list. |
+| `--encode-nice <int>`     | `auto`  | Nice level for encode workers (`-20` = highest priority, `19` = lowest). |
+| `--disk-nice <int>`       | `auto`  | Nice level applied to disk workers. |
 
 ## Manual DNG encoder
 
@@ -128,6 +133,23 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 - Packs the 16 bit files to 12 bit, unless `--keep16` is used.
 
 - Supports both IMX 585 color and mono variants.
+
+### Worker pool tuning examples
+
+- **Cooler operation:** Limit the encoder and disk workers if you want to reduce thermal load. For example:
+
+  ```bash
+  cinepi-raw --encode-workers 4 --disk-workers 4 [other options]
+  ```
+
+- **Steer workloads to specific CPUs:** Combine affinity and nice controls to keep background threads off the CPU cores you care about:
+
+  ```bash
+  cinepi-raw --encode-workers 4 --encode-affinity 4-5 --encode-nice -5 \
+             --disk-workers 2 --disk-affinity 0-3 --disk-nice 8 [other options]
+  ```
+
+  This example pins encode workers to CPUs 4–5 with a higher priority while leaving disk flush threads on the little cores with a lower scheduling priority.
   
 ## Audio recording
 

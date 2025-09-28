@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/video_options.hpp"
 
@@ -52,4 +53,12 @@ struct RawOptions : public VideoOptions
 
     /* keep full 16-bit raw instead of packing – NEW */
     bool keep16;                           // set by --keep16 in CinePiOptions
+
+    /* worker pool sizing + tuning */
+    uint32_t encode_workers { 2 };
+    uint32_t disk_workers   { 8 };
+    std::optional<std::vector<int>> encode_affinity;
+    std::optional<std::vector<int>> disk_affinity;
+    std::optional<int> encode_nice;
+    std::optional<int> disk_nice;
 };

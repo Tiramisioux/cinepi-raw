@@ -16,8 +16,12 @@
  #include <iomanip>
  
  #include <sstream>                 
- #include <fstream>                 
- #include <regex>                   
+#include <algorithm>
+#include <fstream>
+#include <regex>
+#include <utility>
+#include <sched.h>
+#include <sys/resource.h>
  
  #include "dng_encoder.hpp"        
  #include "utils.hpp"               
@@ -252,43 +256,145 @@ Matrix(float m0, float m1, float m2,
 };
 
 #include <pthread.h>
+#include <cerrno>
 
 DngEncoder::DngEncoder(RawOptions const *options)
     : Encoder(options), // Assuming you're calling the base class constructor
       write12bit_(false),
       encoder_initialized_(false),
       encodeCheck_(false),
-      abortEncode_(false), 
-      abortOutput_(false), 
-      resetCount_(false), 
-      index_(0), 
-      frames_(0), 
+      resetCount_(false),
+      index_(0),
+      frames_(0),
       options_(options)
 {
-    console = spdlog::stdout_color_mt("dng_encoder");
+    console = spdlog::get("dng_encoder");
+    if (!console)
+        console = spdlog::stdout_color_mt("dng_encoder");
 
-    for (int i = 0; i < NUM_ENC_THREADS; i++){
-        encode_thread_[i] = std::thread(std::bind(&DngEncoder::encodeThread, this, i));
+    if (options_)
+    {
+        encode_worker_count_ = std::max<uint32_t>(1, options_->encode_workers);
+        disk_worker_count_   = std::max<uint32_t>(1, options_->disk_workers);
+        encode_affinity_     = options_->encode_affinity;
+        disk_affinity_       = options_->disk_affinity;
+        encode_nice_         = options_->encode_nice;
+        disk_nice_           = options_->disk_nice;
     }
-    for (int i = 0; i < NUM_DISK_THREADS; i++){
-        disk_thread_[i] = std::thread(std::bind(&DngEncoder::diskThread, this, i));
+    else
+    {
+        encode_worker_count_ = 2;
+        disk_worker_count_   = 8;
     }
 
-    console->info("DngEncoder started!");
+    encode_threads_.reserve(encode_worker_count_);
+    for (size_t i = 0; i < encode_worker_count_; ++i)
+        encode_threads_.emplace_back(&DngEncoder::encodeThread, this, static_cast<int>(i));
+
+    disk_threads_.reserve(disk_worker_count_);
+    for (size_t i = 0; i < disk_worker_count_; ++i)
+        disk_threads_.emplace_back(&DngEncoder::diskThread, this, static_cast<int>(i));
+
+    console->info("DngEncoder started with {} encode worker(s) and {} disk worker(s)",
+                  encode_worker_count_,
+                  disk_worker_count_);
 }
 
 DngEncoder::~DngEncoder()
 {
-    abortEncode_ = true;
-    for (int i = 0; i < NUM_ENC_THREADS; i++){
-        encode_thread_[i].join();
+    stopThreads();
+    console->info("DngEncoder stopped!");
+}
+
+void DngEncoder::stopThreads()
+{
+    bool encode_was_running = !stop_encode_.exchange(true, std::memory_order_acq_rel);
+    bool disk_was_running   = !stop_disk_.exchange(true, std::memory_order_acq_rel);
+
+    if (encode_was_running)
+        encode_cond_var_.notify_all();
+    if (disk_was_running)
+        disk_cond_var_.notify_all();
+
+    for (auto &thread : encode_threads_)
+    {
+        if (thread.joinable())
+            thread.join();
     }
-    for (int i = 0; i < NUM_DISK_THREADS; i++){
-        disk_thread_[i].join();
+    for (auto &thread : disk_threads_)
+    {
+        if (thread.joinable())
+            thread.join();
     }
 
-    abortOutput_ = true;
-    console->info("DngEncoder stopped!");
+    encode_threads_.clear();
+    disk_threads_.clear();
+}
+
+void DngEncoder::configureThreadContext(const std::string &baseName,
+                                        size_t index,
+                                        size_t total,
+                                        const std::optional<std::vector<int>> &affinity,
+                                        const std::optional<int> &nice_value)
+{
+    std::string name = baseName + std::to_string(index);
+    if (name.size() >= 16)
+        name.resize(15);
+
+    if (pthread_setname_np(pthread_self(), name.c_str()) != 0)
+    {
+        if (console)
+            console->warn("{}: failed to set thread name: {}", name, strerror(errno));
+    }
+
+    std::vector<int> cpus_to_pin;
+    if (affinity && !affinity->empty())
+    {
+        if (affinity->size() >= total)
+        {
+            cpus_to_pin.push_back((*affinity)[index % affinity->size()]);
+        }
+        else
+        {
+            cpus_to_pin.assign(affinity->begin(), affinity->end());
+        }
+
+        cpu_set_t cpu_mask;
+        CPU_ZERO(&cpu_mask);
+        for (int cpu : cpus_to_pin)
+            CPU_SET(cpu, &cpu_mask);
+
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_mask), &cpu_mask) != 0)
+        {
+            if (console)
+                console->warn("{}: failed to set CPU affinity: {}", name, strerror(errno));
+        }
+        else
+        {
+            std::ostringstream oss;
+            for (size_t i = 0; i < cpus_to_pin.size(); ++i)
+            {
+                if (i)
+                    oss << ',';
+                oss << cpus_to_pin[i];
+            }
+            if (console)
+                console->debug("{} pinned to CPU(s) {}", name, oss.str());
+        }
+    }
+
+    if (nice_value)
+    {
+        if (setpriority(PRIO_PROCESS, 0, *nice_value) != 0)
+        {
+            if (console)
+                console->warn("{}: failed to set nice level {}: {}", name, *nice_value, strerror(errno));
+        }
+        else if (console)
+        {
+            console->debug("{} nice level set to {}", name, *nice_value);
+        }
+    }
 }
 
 void DngEncoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us)
@@ -305,10 +411,13 @@ void DngEncoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &
 void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const &info, size_t losize, void *lomem, StreamInfo const &loinfo, int64_t timestamp_us, CompletedRequest::ControlList const &metadata)
 {
     {
+        if (stop_encode_.load(std::memory_order_acquire))
+            return;
+
         std::lock_guard<std::mutex> lock(encode_mutex_);
         EncodeItem item = { mem, size, info, lomem, losize, loinfo, metadata, timestamp_us, index_++ };
         encode_queue_.push(item);
-        encode_cond_var_.notify_all();
+        encode_cond_var_.notify_one();
     }
 }
 
@@ -718,7 +827,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 // ──────────────────────────────────────────────────────────────
 void DngEncoder::encodeThread(int num)
 {
-    std::chrono::duration<double> encode_time(0);
+    configureThreadContext("dng-enc-", static_cast<size_t>(num), encode_worker_count_, encode_affinity_, encode_nice_);
     EncodeItem encode_item;
 
     while (true)
@@ -726,16 +835,15 @@ void DngEncoder::encodeThread(int num)
         /* ──  Get the next job from the queue  ───────────────── */
         {
             std::unique_lock<std::mutex> lock(encode_mutex_);
-            while (true)
-            {
-                if (!encode_queue_.empty())
-                {
-                    encode_item = encode_queue_.front();
-                    encode_queue_.pop();
-                    break;
-                }
-                encode_cond_var_.wait_for(lock, 500us);
-            }
+            encode_cond_var_.wait(lock, [this] {
+                return stop_encode_.load(std::memory_order_acquire) || !encode_queue_.empty();
+            });
+
+            if (stop_encode_.load(std::memory_order_acquire) && encode_queue_.empty())
+                break;
+
+            encode_item = encode_queue_.front();
+            encode_queue_.pop();
         }
 
         frames_ = encode_item.index;
@@ -813,7 +921,7 @@ void DngEncoder::encodeThread(int num)
 
             std::lock_guard<std::mutex> lock(disk_mutex_);
             disk_buffer_.push(std::move(item));
-            disk_cond_var_.notify_all();
+            disk_cond_var_.notify_one();
         }
 
         auto end_time = std::chrono::high_resolution_clock::now();
@@ -834,29 +942,27 @@ void DngEncoder::encodeThread(int num)
 //Flushing data to disk
 void DngEncoder::diskThread(int num)
 {
+    configureThreadContext("dng-dsk-", static_cast<size_t>(num), disk_worker_count_, disk_affinity_, disk_nice_);
     DiskItem disk_item;
 
     while (true)
     {
         {
             std::unique_lock<std::mutex> lock(disk_mutex_);
-            while (true)
-            {
-                if (!disk_buffer_.empty())
-                {
-                    disk_item = disk_buffer_.front();
-                    disk_buffer_.pop();
-                    break;
-                }
-                else {
-                    disk_cond_var_.wait_for(lock, 1ms);
-                }
-            }
+            disk_cond_var_.wait(lock, [this] {
+                return stop_disk_.load(std::memory_order_acquire) || !disk_buffer_.empty();
+            });
+
+            if (stop_disk_.load(std::memory_order_acquire) && disk_buffer_.empty())
+                break;
+
+            disk_item = disk_buffer_.front();
+            disk_buffer_.pop();
         }
 
         std::ostringstream oss;
-        oss << options_->mediaDest << '/' 
-            << options_->folder << '/' 
+        oss << options_->mediaDest << '/'
+            << options_->folder << '/'
             << options_->folder << '_'
             << std::setw(9) << std::setfill('0') << disk_item.index 
             << ".dng";
