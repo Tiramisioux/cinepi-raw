@@ -20,6 +20,8 @@
 #include "preview/hdmi_utils.hpp"
 #include "preview/preview.hpp"
 
+#include <utility>
+
 
 typedef std::function<void(void *, size_t, int64_t, bool)> EncodeOutputReadyCallback;
 typedef std::function<void(libcamera::ControlList &)> MetadataReadyCallback;
@@ -33,16 +35,23 @@ public:
 	// CinePIRecorder() : RPiCamApp(std::make_unique<RawOptions>()) {}
 	CinePIRecorder() : RPiCamApp(std::make_unique<CinePiOptions>()) {}
 
-	void StartEncoder()
-	{
-		createEncoder();
-		encoder_->SetInputDoneCallback(std::bind(&CinePIRecorder::encodeBufferDone, this, std::placeholders::_1));
-		encoder_->SetOutputReadyCallback(encode_output_ready_callback_);
-	}
+        void StartEncoder()
+        {
+                createEncoder();
+                encoder_->SetInputDoneCallback(std::bind(&CinePIRecorder::encodeBufferDone, this, std::placeholders::_1));
+                encoder_->SetOutputReadyCallback(encode_output_ready_callback_);
+                encoder_->SetDiskErrorCallback(disk_error_callback_);
+        }
 	uint64_t last_timestamp_ns;
 	// This is callback when the encoder gives you the encoded output data.
-	void SetEncodeOutputReadyCallback(EncodeOutputReadyCallback callback) { encode_output_ready_callback_ = callback; }
-	void SetMetadataReadyCallback(MetadataReadyCallback callback) { metadata_ready_callback_ = callback; }
+        void SetEncodeOutputReadyCallback(EncodeOutputReadyCallback callback) { encode_output_ready_callback_ = callback; }
+        void SetMetadataReadyCallback(MetadataReadyCallback callback) { metadata_ready_callback_ = callback; }
+        void SetDiskErrorCallback(DngEncoder::DiskErrorCallback callback)
+        {
+                disk_error_callback_ = std::move(callback);
+                if (encoder_)
+                        encoder_->SetDiskErrorCallback(disk_error_callback_);
+        }
 	void EncodeBuffer(CompletedRequestPtr &completed_request, Stream *stream, Stream *lostream)
 	{
 		assert(encoder_);
@@ -126,7 +135,8 @@ private:
 
 	std::queue<CompletedRequestPtr> encode_buffer_queue_;
 	std::mutex encode_buffer_queue_mutex_;
-	EncodeOutputReadyCallback encode_output_ready_callback_;
-	MetadataReadyCallback metadata_ready_callback_;
+        EncodeOutputReadyCallback encode_output_ready_callback_;
+        MetadataReadyCallback metadata_ready_callback_;
+        DngEncoder::DiskErrorCallback disk_error_callback_;
 };
 #endif // CINEPI_RECORDER_HPP

@@ -15,13 +15,14 @@
  #include <stdexcept>
  #include <iomanip>
  
- #include <sstream>                 
+ #include <sstream>
 #include <algorithm>
 #include <fstream>
 #include <regex>
 #include <utility>
 #include <sched.h>
 #include <sys/resource.h>
+ #include <cerrno>
  
  #include "dng_encoder.hpp"        
  #include "utils.hpp"               
@@ -256,7 +257,6 @@ Matrix(float m0, float m1, float m2,
 };
 
 #include <pthread.h>
-#include <cerrno>
 
 DngEncoder::DngEncoder(RawOptions const *options)
     : Encoder(options), // Assuming you're calling the base class constructor
@@ -304,6 +304,21 @@ DngEncoder::~DngEncoder()
 {
     stopThreads();
     console->info("DngEncoder stopped!");
+}
+
+void DngEncoder::SetDiskErrorCallback(DiskErrorCallback callback)
+{
+    disk_error_callback_ = std::move(callback);
+}
+
+DngEncoder::DiskErrorCallback DngEncoder::GetDiskErrorCallback() const
+{
+    return disk_error_callback_;
+}
+
+uint64_t DngEncoder::DiskFailureCount() const
+{
+    return disk_failures_.load(std::memory_order_relaxed);
 }
 
 void DngEncoder::stopThreads()
@@ -971,11 +986,11 @@ void DngEncoder::diskThread(int num)
     
         console->trace("Thread[{}]  Save frame to disk: {}", num, disk_item.index);
 
-        console->info("DNG written: {}", filename);
-        console->info("Timecode: {}", disk_item.timecode);
-        
         auto start_time = std::chrono::high_resolution_clock::now();
-        
+
+        bool disk_write_failed = false;
+        std::string failure_reason;
+
         // Use standard buffered IO instead of O_DIRECT
         int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
@@ -988,12 +1003,38 @@ void DngEncoder::diskThread(int num)
 
             // Always use actual used size returned by dng_save
             ssize_t bytes_written = write(fd, disk_item.mem_buf, disk_item.size);
-            if (bytes_written < 0 || static_cast<size_t>(bytes_written) != disk_item.size) {
-                perror("Error writing to file");
+            if (bytes_written < 0) {
+                int err = errno;
+                disk_write_failed = true;
+                failure_reason = std::string("write failed: ") + strerror(err);
+            } else if (static_cast<size_t>(bytes_written) != disk_item.size) {
+                disk_write_failed = true;
+                failure_reason = "partial write: wrote " +
+                    std::to_string(static_cast<long long>(bytes_written)) +
+                    " of " + std::to_string(static_cast<unsigned long long>(disk_item.size)) +
+                    " bytes";
+            } else {
+                console->info("DNG written: {}", filename);
+                console->info("Timecode: {}", disk_item.timecode);
             }
             close(fd);
         } else {
-            perror("Failed to open file for writing");
+            int err = errno;
+            disk_write_failed = true;
+            failure_reason = std::string("open failed: ") + strerror(err);
+        }
+
+        if (disk_write_failed) {
+            console->error("Thread[{}] frame {} disk write failure for '{}': {}",
+                           num,
+                           disk_item.index,
+                           filename,
+                           failure_reason);
+            console->error("Timecode (failed frame): {}", disk_item.timecode);
+            auto failures = disk_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
+            console->error("Total disk write failures so far: {}", failures);
+            if (disk_error_callback_)
+                disk_error_callback_(disk_item.index, filename);
         }
 
         // Clean up
