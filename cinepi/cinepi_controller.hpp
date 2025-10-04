@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <thread>
 #include <chrono>
+#include <string>
 
 //external dependancies
 #include <sw/redis++/redis++.h>
@@ -26,6 +27,7 @@
 #define CHANNEL_CONTROLS "cp_controls"
 #define CHANNEL_STATS "cp_stats"
 #define CHANNEL_HISTOGRAM "cp_histogram"
+#define CHANNEL_ALERTS "cp_alerts"
 
 #define REDIS_DEFAULT "redis://127.0.0.1:6379/0"
 
@@ -97,6 +99,8 @@ class CinePIController : public CinePIState
             redis_->set(CONTROL_KEY_WIDTH, std::to_string(cfg.size.width));
             redis_->set(CONTROL_KEY_HEIGHT, std::to_string(cfg.size.height));
         }
+
+        void notifyDiskWriteFailure(uint64_t frameIndex, const std::string &filename);
 
         bool folderOpen;
         bool cameraRunning;
