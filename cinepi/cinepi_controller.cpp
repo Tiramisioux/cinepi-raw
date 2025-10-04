@@ -17,6 +17,46 @@ using namespace std::chrono;
 #define CP_DEF_THUMBNAIL 1
 #define CP_DEF_THUMBNAIL_SIZE 3
 
+void CinePIController::notifyDiskWriteFailure(uint64_t frameIndex, const std::string &filename)
+{
+    std::string reason;
+    Json::UInt64 failure_count = 0;
+
+    if (auto *encoder = app_->GetEncoder())
+    {
+        failure_count = static_cast<Json::UInt64>(encoder->DiskFailureCount());
+        reason = encoder->LastDiskFailureReason();
+    }
+
+    if (!reason.empty())
+        console->error("Disk write failure for frame {} ({}): {}", frameIndex, filename, reason);
+    else
+        console->error("Disk write failure for frame {} ({}).", frameIndex, filename);
+
+    Json::Value alert;
+    alert["type"] = "disk_write_failure";
+    alert["frame"] = static_cast<Json::UInt64>(frameIndex);
+    alert["file"] = filename;
+    alert["message"] = "Disk write dropped frame";
+
+    if (failure_count)
+        alert["failures"] = failure_count;
+    if (!reason.empty())
+        alert["reason"] = reason;
+
+    if (redis_)
+    {
+        try
+        {
+            redis_->publish(CHANNEL_ALERTS, alert.toStyledString());
+        }
+        catch (const sw::redis::Error &err)
+        {
+            console->error("Failed to publish disk write alert: {}", err.what());
+        }
+    }
+}
+
 void CinePIController::sync(){
     // getAllKeysAndValuesFromRedis();
 

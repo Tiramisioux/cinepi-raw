@@ -12,6 +12,7 @@
 #include <string>
 #include <atomic>
 #include <optional>
+#include <functional>
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -24,8 +25,10 @@
 class DngEncoder : public Encoder
 {
 public:
-	DngEncoder(RawOptions const *options);
-	~DngEncoder();
+        using DiskErrorCallback = std::function<void(uint64_t, const std::string &)>;
+
+        DngEncoder(RawOptions const *options);
+        ~DngEncoder();
 	
 	/* NEW – let the controller push µs-since-epoch for each frame */
     void setWallClockTimestamp(uint64_t us);   // µs since 1970-01-01
@@ -54,9 +57,16 @@ public:
 	int bufferSize(){
 		return disk_buffer_.size();
 	}
-	uint64_t getFrameCount(){
-		return frames_;
-	}
+        uint64_t getFrameCount() const {
+                return frames_.load(std::memory_order_relaxed);
+        }
+
+        void SetDiskErrorCallback(DiskErrorCallback callback);
+        DiskErrorCallback GetDiskErrorCallback() const;
+        uint64_t DiskFailureCount() const;
+        std::string LastDiskFailureReason() const;
+        std::string MakeOutputFilename(uint64_t frameIndex) const;
+        uint64_t RecordDiskFailure(uint64_t frameIndex, const std::string &filename, const std::string &reason);
 
 	uint16_t photometric;
 	uint16_t samples_per_pixel;
@@ -81,9 +91,9 @@ public:
 
 	bool mono_ = false;
 
-	std::vector<int64_t> timestamps;
-	std::array<uint8_t, 8> originationTimeCode;
-	std::array<uint16_t, 3> originationDate;
+        std::vector<int64_t> timestamps;
+        std::array<uint8_t, 8> originationTimeCode;
+        std::array<uint16_t, 3> originationDate;
 
 	/* ---- PUBLIC: number of frame buffers that fit in RAM ---- */
 	size_t maxRamBuffers() const { return max_ram_buffers_; }
@@ -106,7 +116,12 @@ private:
 
 	bool write12bit_{false};
 
-	std::shared_ptr<spdlog::logger> console;
+        std::shared_ptr<spdlog::logger> console;
+
+        DiskErrorCallback disk_error_callback_;
+        std::atomic<uint64_t> disk_failures_{0};
+        mutable std::mutex disk_failure_mutex_;
+        std::string last_disk_failure_reason_;
 
         void encodeThread(int num);
         void diskThread(int num);
@@ -174,7 +189,7 @@ private:
 	bool encodeCheck_;
         bool resetCount_;
         uint64_t index_;
-        uint64_t frames_;
+        std::atomic<uint64_t> frames_;
 
     RawOptions const *options_;
 

@@ -20,6 +20,12 @@
 #include "preview/hdmi_utils.hpp"
 #include "preview/preview.hpp"
 
+#include <utility>
+#include <optional>
+#include <sstream>
+#include <iomanip>
+#include <cmath>
+
 
 typedef std::function<void(void *, size_t, int64_t, bool)> EncodeOutputReadyCallback;
 typedef std::function<void(libcamera::ControlList &)> MetadataReadyCallback;
@@ -33,16 +39,24 @@ public:
 	// CinePIRecorder() : RPiCamApp(std::make_unique<RawOptions>()) {}
 	CinePIRecorder() : RPiCamApp(std::make_unique<CinePiOptions>()) {}
 
-	void StartEncoder()
-	{
-		createEncoder();
-		encoder_->SetInputDoneCallback(std::bind(&CinePIRecorder::encodeBufferDone, this, std::placeholders::_1));
-		encoder_->SetOutputReadyCallback(encode_output_ready_callback_);
-	}
+        void StartEncoder()
+        {
+                createEncoder();
+                last_disk_drop_frame_.reset();
+                encoder_->SetInputDoneCallback(std::bind(&CinePIRecorder::encodeBufferDone, this, std::placeholders::_1));
+                encoder_->SetOutputReadyCallback(encode_output_ready_callback_);
+                encoder_->SetDiskErrorCallback(disk_error_callback_);
+        }
 	uint64_t last_timestamp_ns;
 	// This is callback when the encoder gives you the encoded output data.
-	void SetEncodeOutputReadyCallback(EncodeOutputReadyCallback callback) { encode_output_ready_callback_ = callback; }
-	void SetMetadataReadyCallback(MetadataReadyCallback callback) { metadata_ready_callback_ = callback; }
+        void SetEncodeOutputReadyCallback(EncodeOutputReadyCallback callback) { encode_output_ready_callback_ = callback; }
+        void SetMetadataReadyCallback(MetadataReadyCallback callback) { metadata_ready_callback_ = callback; }
+        void SetDiskErrorCallback(DngEncoder::DiskErrorCallback callback)
+        {
+                disk_error_callback_ = std::move(callback);
+                if (encoder_)
+                        encoder_->SetDiskErrorCallback(disk_error_callback_);
+        }
 	void EncodeBuffer(CompletedRequestPtr &completed_request, Stream *stream, Stream *lostream)
 	{
 		assert(encoder_);
@@ -75,14 +89,40 @@ public:
 		auto fd = completed_request->metadata.get(controls::FrameDuration);
 		int64_t frameduration_us = fd ? *fd : 0;
 
-		float fps_measured = 1000000000.0/(timestamp_ns-last_timestamp_ns);
-		float fps_setting  = 1000000.0/frameduration_us;
+                double fps_measured = 0.0;
+                double fps_setting  = 0.0;
+                bool have_rate_info = last_timestamp_ns != 0 && timestamp_ns > last_timestamp_ns && frameduration_us > 0;
 
-		if(abs(fps_measured - fps_setting) > 1){
-			LOG(1,"Frame Drop!!!!!     FPS measured:"  << fps_measured<< " FPS settings:" << fps_setting);
-		}
+                if (have_rate_info) {
+                        fps_measured = 1000000000.0 / static_cast<double>(timestamp_ns - last_timestamp_ns);
+                        fps_setting  = 1000000.0 / static_cast<double>(frameduration_us);
 
-		last_timestamp_ns = timestamp_ns;
+                        double fps_delta = std::fabs(fps_measured - fps_setting);
+                        if (fps_delta > 1.0) {
+                                LOG(1,"Frame Drop!!!!!     FPS measured:"  << fps_measured<< " FPS settings:" << fps_setting);
+
+                                if (encoder_) {
+                                        uint64_t frame_index = encoder_->getFrameCount();
+
+                                        if (!last_disk_drop_frame_ || *last_disk_drop_frame_ != frame_index) {
+                                                last_disk_drop_frame_ = frame_index;
+
+                                                std::string filename = encoder_->MakeOutputFilename(frame_index);
+                                                std::ostringstream reason;
+                                                reason << std::fixed << std::setprecision(2)
+                                                       << "Frame rate drop detected: measured " << fps_measured
+                                                       << " FPS vs setting " << fps_setting << " FPS";
+                                                encoder_->RecordDiskFailure(frame_index, filename, reason.str());
+                                        }
+                                }
+                        } else {
+                                last_disk_drop_frame_.reset();
+                        }
+                } else {
+                        last_disk_drop_frame_.reset();
+                }
+
+                last_timestamp_ns = timestamp_ns;
 		encoder_->log_ts(timestamp_ns);
 		{
 			std::lock_guard<std::mutex> lock(encode_buffer_queue_mutex_);
@@ -126,7 +166,9 @@ private:
 
 	std::queue<CompletedRequestPtr> encode_buffer_queue_;
 	std::mutex encode_buffer_queue_mutex_;
-	EncodeOutputReadyCallback encode_output_ready_callback_;
-	MetadataReadyCallback metadata_ready_callback_;
+        EncodeOutputReadyCallback encode_output_ready_callback_;
+        MetadataReadyCallback metadata_ready_callback_;
+        DngEncoder::DiskErrorCallback disk_error_callback_;
+        std::optional<uint64_t> last_disk_drop_frame_;
 };
 #endif // CINEPI_RECORDER_HPP
