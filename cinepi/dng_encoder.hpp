@@ -59,6 +59,8 @@ public:
 	}
         uint64_t getFrameCount() const {
                 return frames_.load(std::memory_order_relaxed);
+        uint64_t getFrameCount(){
+                return frames_;
         }
 
         void SetDiskErrorCallback(DiskErrorCallback callback);

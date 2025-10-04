@@ -1065,6 +1065,16 @@ void DngEncoder::diskThread(int num)
                 reason << " (timecode " << disk_item.timecode << ')';
 
             RecordDiskFailure(disk_item.index, filename, reason.str());
+            console->error("Thread[{}] frame {} disk write failure for '{}': {}",
+                           num,
+                           disk_item.index,
+                           filename,
+                           failure_reason);
+            console->error("Timecode (failed frame): {}", disk_item.timecode);
+            auto failures = disk_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
+            console->error("Total disk write failures so far: {}", failures);
+            if (disk_error_callback_)
+                disk_error_callback_(disk_item.index, filename);
         }
 
         // Clean up

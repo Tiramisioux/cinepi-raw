@@ -32,6 +32,7 @@ void CinePIController::notifyDiskWriteFailure(uint64_t frameIndex, const std::st
         console->error("Disk write failure for frame {} ({}): {}", frameIndex, filename, reason);
     else
         console->error("Disk write failure for frame {} ({}).", frameIndex, filename);
+    console->error("Disk write failure for frame {} ({}).", frameIndex, filename);
 
     Json::Value alert;
     alert["type"] = "disk_write_failure";
@@ -43,6 +44,8 @@ void CinePIController::notifyDiskWriteFailure(uint64_t frameIndex, const std::st
         alert["failures"] = failure_count;
     if (!reason.empty())
         alert["reason"] = reason;
+    if (auto *encoder = app_->GetEncoder())
+        alert["failures"] = static_cast<Json::UInt64>(encoder->DiskFailureCount());
 
     if (redis_)
     {
