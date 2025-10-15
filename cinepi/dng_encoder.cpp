@@ -25,7 +25,8 @@
  
  #include "dng_encoder.hpp"        
  #include "utils.hpp"               
- #include "ifd_builder.hpp"         
+#include "ifd_builder.hpp"
+#include "sync_utils.hpp"
  
  #include <sys/mman.h>              
  #include <sys/types.h>
@@ -40,6 +41,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/uio.h>
 #include <sys/time.h>
 
 
@@ -272,28 +274,66 @@ DngEncoder::DngEncoder(RawOptions const *options)
     if (!console)
         console = spdlog::stdout_color_mt("dng_encoder");
 
+    StartupGate::Config gate_cfg;
+
     if (options_)
     {
         encode_worker_count_ = std::max<uint32_t>(1, options_->encode_workers);
         disk_worker_count_   = std::max<uint32_t>(1, options_->disk_workers);
-        encode_affinity_     = options_->encode_affinity;
-        disk_affinity_       = options_->disk_affinity;
-        encode_nice_         = options_->encode_nice;
-        disk_nice_           = options_->disk_nice;
+
+        if (options_->encode_affinity)
+            encode_affinity_ = options_->encode_affinity;
+        else
+            encode_affinity_ = std::vector<int>{1, 2};
+
+        if (options_->disk_affinity)
+            disk_affinity_ = options_->disk_affinity;
+        else
+            disk_affinity_ = std::vector<int>{2};
+
+        if (options_->encode_nice)
+            encode_nice_ = options_->encode_nice;
+        else
+            encode_nice_ = -10;
+
+        if (options_->disk_nice)
+            disk_nice_ = options_->disk_nice;
+        else
+            disk_nice_ = -5;
+
+        gate_cfg.preroll_ms         = options_->preroll_ms;
+        gate_cfg.start_queue_frames = options_->start_queue_frames;
+        gate_cfg.ignore_start_frames= options_->ignore_start_frames;
+
+        sync_policy_          = options_->sync_policy;
+        sync_interval_        = options_->sync_interval;
+        drop_cache_after_close_ = options_->drop_cache_after_close;
     }
     else
     {
-        encode_worker_count_ = 2;
-        disk_worker_count_   = 8;
+        encode_worker_count_ = 4;
+        disk_worker_count_   = 2;
+        encode_affinity_     = std::vector<int>{1, 2};
+        disk_affinity_       = std::vector<int>{2};
+        encode_nice_         = -10;
+        disk_nice_           = -5;
     }
+
+    if (sync_policy_ == RawOptions::SyncPolicy::Interval && sync_interval_ == 0)
+        sync_interval_ = 1;
+
+    gate_.setLogger(console);
+    gate_.configure(gate_cfg);
 
     encode_threads_.reserve(encode_worker_count_);
     for (size_t i = 0; i < encode_worker_count_; ++i)
         encode_threads_.emplace_back(&DngEncoder::encodeThread, this, static_cast<int>(i));
+    gate_.markEncoderReady();
 
     disk_threads_.reserve(disk_worker_count_);
     for (size_t i = 0; i < disk_worker_count_; ++i)
         disk_threads_.emplace_back(&DngEncoder::diskThread, this, static_cast<int>(i));
+    gate_.markWriterReady();
 
     console->info("DngEncoder started with {} encode worker(s) and {} disk worker(s)",
                   encode_worker_count_,
@@ -329,6 +369,31 @@ void DngEncoder::stopThreads()
 
     encode_threads_.clear();
     disk_threads_.clear();
+}
+
+void DngEncoder::syncTakeDirectory() const
+{
+    if (!options_)
+        return;
+
+    std::string path = options_->mediaDest + '/' + options_->folder;
+    int dir_fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0)
+    {
+        if (console)
+            console->warn("Failed to open take directory '{}' for fdatasync: {}", path, strerror(errno));
+        return;
+    }
+
+    if (fdatasync(dir_fd) != 0 && console)
+        console->warn("fdatasync({}) failed: {}", path, strerror(errno));
+
+    close(dir_fd);
+}
+
+void DngEncoder::updateQueueDepthLocked()
+{
+    queue_depth_.store(disk_buffer_.size() + preroll_cache_.size(), std::memory_order_relaxed);
 }
 
 void DngEncoder::configureThreadContext(const std::string &baseName,
@@ -395,6 +460,60 @@ void DngEncoder::configureThreadContext(const std::string &baseName,
             console->debug("{} nice level set to {}", name, *nice_value);
         }
     }
+}
+
+void DngEncoder::armRecording()
+{
+    frames_written_take_.store(0, std::memory_order_relaxed);
+    pending_take_sync_.store(false, std::memory_order_relaxed);
+    gate_.arm();
+}
+
+void DngEncoder::disarmRecording()
+{
+    StartupGate::Phase phase = gate_.phase();
+    gate_.disarm();
+
+    if (phase != StartupGate::Phase::Recording)
+        clearPool();
+    else if (sync_policy_ == RawOptions::SyncPolicy::Take)
+        pending_take_sync_.store(true, std::memory_order_release);
+
+    frames_written_take_.store(0, std::memory_order_relaxed);
+}
+
+void DngEncoder::markTakeDirectoryReady(bool ready)
+{
+    gate_.markTakeReady(ready);
+}
+
+bool DngEncoder::cadenceActive() const
+{
+    return gate_.cadenceActive();
+}
+
+bool DngEncoder::shouldIgnoreFrame(uint64_t frame_index) const
+{
+    return gate_.shouldIgnoreFrame(frame_index);
+}
+
+StartupGate::Phase DngEncoder::pipelinePhase() const
+{
+    return gate_.phase();
+}
+
+size_t DngEncoder::diskQueueDepth() const
+{
+    return queue_depth_.load(std::memory_order_relaxed);
+}
+
+DngEncoder::StageMetrics DngEncoder::snapshotStageMetrics() const
+{
+    StageMetrics metrics{};
+    metrics.encode_ms = static_cast<double>(last_encode_us_.load(std::memory_order_relaxed)) / 1000.0;
+    metrics.disk_ms   = static_cast<double>(last_disk_us_.load(std::memory_order_relaxed)) / 1000.0;
+    metrics.queue_depth = queue_depth_.load(std::memory_order_relaxed);
+    return metrics;
 }
 
 void DngEncoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us)
@@ -920,14 +1039,21 @@ void DngEncoder::encodeThread(int num)
             };
 
             std::lock_guard<std::mutex> lock(disk_mutex_);
-            disk_buffer_.push(std::move(item));
-            disk_cond_var_.notify_one();
+            disk_buffer_.push_back(std::move(item));
+            updateQueueDepthLocked();
+            disk_cond_var_.notify_all();
         }
 
         auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        console->info("Thread[{}] {} Time taken for the encode: {} ms, disk queue:{}  Size:{}",
-                      num, encode_item.index, duration, disk_buffer_.size(), tiff_size);
+        auto encode_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        last_encode_us_.store(static_cast<uint64_t>(encode_us), std::memory_order_relaxed);
+        double encode_ms = static_cast<double>(encode_us) / 1000.0;
+        console->info("Thread[{}] {} encode_ms={:.2f} queue_depth={} size={}",
+                      num,
+                      encode_item.index,
+                      encode_ms,
+                      queue_depth_.load(std::memory_order_relaxed),
+                      tiff_size);
 
         /* mark the camera buffer as reusable */
         input_done_callback_(nullptr);
@@ -943,96 +1069,232 @@ void DngEncoder::encodeThread(int num)
 void DngEncoder::diskThread(int num)
 {
     configureThreadContext("dng-dsk-", static_cast<size_t>(num), disk_worker_count_, disk_affinity_, disk_nice_);
-    DiskItem disk_item;
-
     while (true)
     {
+        DiskItem disk_item{};
+        bool have_item = false;
+
         {
             std::unique_lock<std::mutex> lock(disk_mutex_);
             disk_cond_var_.wait(lock, [this] {
-                return stop_disk_.load(std::memory_order_acquire) || !disk_buffer_.empty();
+                return stop_disk_.load(std::memory_order_acquire) ||
+                       !disk_buffer_.empty() || !preroll_cache_.empty();
             });
 
-            if (stop_disk_.load(std::memory_order_acquire) && disk_buffer_.empty())
+            if (stop_disk_.load(std::memory_order_acquire) && disk_buffer_.empty() && preroll_cache_.empty())
                 break;
 
-            disk_item = disk_buffer_.front();
-            disk_buffer_.pop();
+            if (gate_.phase() == StartupGate::Phase::Armed)
+            {
+                while (!disk_buffer_.empty())
+                {
+                    preroll_cache_.push_back(std::move(disk_buffer_.front()));
+                    disk_buffer_.pop_front();
+                }
+                updateQueueDepthLocked();
+
+                if (!gate_.tryTransitionToRecording(preroll_cache_.size(), StartupGate::Clock::now()))
+                    continue;
+
+                while (!preroll_cache_.empty())
+                {
+                    disk_buffer_.push_front(std::move(preroll_cache_.back()));
+                    preroll_cache_.pop_back();
+                }
+                updateQueueDepthLocked();
+            }
+            else if (gate_.phase() == StartupGate::Phase::Recording && !preroll_cache_.empty())
+            {
+                while (!preroll_cache_.empty())
+                {
+                    disk_buffer_.push_front(std::move(preroll_cache_.back()));
+                    preroll_cache_.pop_back();
+                }
+                updateQueueDepthLocked();
+            }
+
+            if (!disk_buffer_.empty())
+            {
+                disk_item = std::move(disk_buffer_.front());
+                disk_buffer_.pop_front();
+                updateQueueDepthLocked();
+                have_item = true;
+            }
+            else
+            {
+                updateQueueDepthLocked();
+            }
+        }
+
+        if (!have_item)
+            continue;
+
+        if (!options_)
+        {
+            free(disk_item.mem_buf);
+            continue;
         }
 
         std::ostringstream oss;
         oss << options_->mediaDest << '/'
             << options_->folder << '/'
             << options_->folder << '_'
-            << std::setw(9) << std::setfill('0') << disk_item.index 
+            << std::setw(9) << std::setfill('0') << disk_item.index
             << ".dng";
 
         std::string filename = oss.str();
-    
-        console->trace("Thread[{}]  Save frame to disk: {}", num, disk_item.index);
 
-        console->info("DNG written: {}", filename);
-        console->info("Timecode: {}", disk_item.timecode);
-        
+        console->trace("Thread[{}] save frame {}", num, disk_item.index);
+
         auto start_time = std::chrono::high_resolution_clock::now();
-        
-        // Use standard buffered IO instead of O_DIRECT
-        int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
-        if (fd != -1) {
-            // Provide sequential access hint
-            posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-            posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE);
-            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // drop file pages ASAP
-
-
-            // Always use actual used size returned by dng_save
-            ssize_t bytes_written = write(fd, disk_item.mem_buf, disk_item.size);
-            if (bytes_written < 0 || static_cast<size_t>(bytes_written) != disk_item.size) {
-                perror("Error writing to file");
-            }
-            close(fd);
-        } else {
-            perror("Failed to open file for writing");
+        int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd == -1)
+        {
+            console->error("Failed to open {}: {}", filename, strerror(errno));
+            free(disk_item.mem_buf);
+            continue;
         }
 
-        // Clean up
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+        if (posix_fallocate(fd, 0, static_cast<off_t>(disk_item.size)) != 0)
+        {
+            // Ignore allocation failures – fall back to normal writes
+        }
+
+        const uint8_t *data_ptr = static_cast<const uint8_t *>(disk_item.mem_buf);
+        size_t remaining = disk_item.size;
+        off_t offset = 0;
+        constexpr size_t chunk = 1 << 20;          // 1 MiB
+        constexpr int max_iov = 8;
+
+        while (remaining > 0)
+        {
+            struct iovec iov[max_iov];
+            int iovcnt = 0;
+            size_t scheduled = 0;
+            size_t bytes_left = remaining;
+            const uint8_t *batch_ptr = data_ptr;
+
+            while (bytes_left > 0 && iovcnt < max_iov)
+            {
+                size_t len = std::min(bytes_left, chunk);
+                iov[iovcnt].iov_base = const_cast<uint8_t *>(batch_ptr);
+                iov[iovcnt].iov_len  = len;
+                batch_ptr  += len;
+                bytes_left -= len;
+                scheduled  += len;
+                ++iovcnt;
+            }
+
+            ssize_t written = pwritev(fd, iov, iovcnt, offset);
+            if (written < 0)
+            {
+                console->error("pwritev failed for {}: {}", filename, strerror(errno));
+                break;
+            }
+
+            offset += written;
+            data_ptr += written;
+            remaining -= static_cast<size_t>(written);
+        }
+
+        bool wrote_all = (remaining == 0);
+        if (!wrote_all)
+            console->error("Short write for {} ({} bytes remaining)", filename, remaining);
+
+        bool sync_now = false;
+        uint64_t frame_number = 0;
+        if (wrote_all)
+        {
+            frame_number = frames_written_take_.fetch_add(1, std::memory_order_relaxed) + 1;
+            sync_now = should_sync_frame(sync_policy_, sync_interval_, frame_number);
+        }
+
+        if (sync_now)
+            fdatasync(fd);
+
+        if (drop_cache_after_close_)
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+
+        close(fd);
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto disk_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        last_disk_us_.store(static_cast<uint64_t>(disk_us), std::memory_order_relaxed);
+
         free(disk_item.mem_buf);
 
         {
             std::lock_guard<std::mutex> lk(ram_mtx_);
             if (ram_buffers_ > 0)
-                --ram_buffers_;          // <-- give permit back
+                --ram_buffers_;
             ram_cv_.notify_all();
         }
 
-        /* push any cached arenas back to the kernel */
-        #ifdef __GLIBC__
-            // hand empty arenas back to the kernel
-            malloc_trim(0);
-        #endif
+#ifdef __GLIBC__
+        malloc_trim(0);
+#endif
 
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        console->info("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
+        if (wrote_all)
+        {
+            if (frame_number == 1)
+                gate_.noteFirstDngWritten();
+            gate_.noteFrameWritten();
+        }
+
+        double disk_ms = static_cast<double>(disk_us) / 1000.0;
+        const char *sync_label = wrote_all ? (sync_now ? "fdatasync" : "kernel") : "failed";
+        console->info("Thread[{}] {} disk_ms={:.2f} queue_depth={} size={} sync={} timecode={}",
+                      num,
+                      disk_item.index,
+                      disk_ms,
+                      queue_depth_.load(std::memory_order_relaxed),
+                      disk_item.size,
+                      sync_label,
+                      disk_item.timecode);
+
+        if (wrote_all && pending_take_sync_.load(std::memory_order_acquire) &&
+            queue_depth_.load(std::memory_order_relaxed) == 0 &&
+            gate_.phase() != StartupGate::Phase::Recording)
+        {
+            bool expected = true;
+            if (pending_take_sync_.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
+                syncTakeDirectory();
+        }
     }
 }
 
 void DngEncoder::clearPool()
 {
-    // 1) Drain any pending disk items (free their mem_bufs)
+    std::vector<DiskItem> leftovers;
     {
         std::lock_guard<std::mutex> lock(disk_mutex_);
-        while (!disk_buffer_.empty()) {
-            auto &item = disk_buffer_.front();
-            free(item.mem_buf);
-            // return permit
-            {
-                std::lock_guard<std::mutex> lk(ram_mtx_);
-                if (ram_buffers_ > 0) --ram_buffers_;
-            }
-            disk_buffer_.pop();
+        while (!disk_buffer_.empty())
+        {
+            leftovers.push_back(std::move(disk_buffer_.front()));
+            disk_buffer_.pop_front();
         }
-        ram_cv_.notify_all();
+        while (!preroll_cache_.empty())
+        {
+            leftovers.push_back(std::move(preroll_cache_.front()));
+            preroll_cache_.pop_front();
+        }
+        updateQueueDepthLocked();
     }
+
+    size_t freed = leftovers.size();
+    for (auto &item : leftovers)
+        free(item.mem_buf);
+
+    if (freed)
+    {
+        std::lock_guard<std::mutex> lk(ram_mtx_);
+        if (ram_buffers_ >= freed)
+            ram_buffers_ -= freed;
+        else
+            ram_buffers_ = 0;
+    }
+    ram_cv_.notify_all();
 }

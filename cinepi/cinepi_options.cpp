@@ -5,6 +5,7 @@
 #include <boost/program_options.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <limits>
 #include <optional>
@@ -53,10 +54,10 @@ CinePiOptions::CinePiOptions()
                     "Per-stream crop rectangles as fractions:\n"
                     "x,y,w,h[:x,y,w,h ...]   (0-1, up to 3 streams)")
                 ("encode-workers",
-                    value<unsigned int>()->default_value(2),
+                    value<unsigned int>()->default_value(4),
                     "Number of DNG encode worker threads")
                 ("disk-workers",
-                    value<unsigned int>()->default_value(8),
+                    value<unsigned int>()->default_value(2),
                     "Number of DNG disk writer threads")
                 ("encode-affinity",
                     value<std::string>()->implicit_value(""),
@@ -69,7 +70,31 @@ CinePiOptions::CinePiOptions()
                     "Nice level (-20..19) for encode workers")
                 ("disk-nice",
                     value<int>(),
-                    "Nice level (-20..19) for disk workers");
+                    "Nice level (-20..19) for disk workers")
+                ("preroll-ms",
+                        value<unsigned int>()->default_value(300),
+                        "Warm-up duration before writing DNG files (0 disables)")
+                ("start-queue-frames",
+                        value<unsigned int>()->default_value(6),
+                        "Minimum queued frames before starting disk writes")
+                ("ignore-start-frames",
+                        value<unsigned int>()->default_value(12),
+                        "Frames to ignore for drop detection after recording begins")
+                ("sync-policy",
+                        value<std::string>()->default_value("never"),
+                        "Disk sync policy: never, take, or interval[=N]")
+                ("sync-interval",
+                        value<unsigned int>()->default_value(0),
+                        "When --sync-policy=interval, fdatasync every N frames")
+                ("drop-cache-after-close",
+                        value<bool>()->default_value(false)->implicit_value(true),
+                        "Call posix_fadvise(..., DONTNEED) after each frame (off by default)")
+                ("selftest",
+                        value<bool>()->default_value(false)->implicit_value(true),
+                        "Run synthetic disk self-test and exit")
+                ("selftest-seconds",
+                        value<unsigned int>()->default_value(1),
+                        "Duration in seconds for --selftest runs");
         options_.add(cinepi_group);
 }
 
@@ -95,6 +120,14 @@ static std::string trimToken(const std::string &token)
         return token.substr(start, end - start + 1);
 }
 
+static std::string toLower(std::string value)
+{
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+        });
+        return value;
+}
+
 static unsigned int parseWorkerCount(const std::string &flag, const std::string &value)
 {
         try
@@ -117,6 +150,90 @@ static unsigned int parseWorkerCount(const std::string &flag, const std::string 
         {
                 throw std::runtime_error(flag + " is out of range");
         }
+}
+
+static unsigned int parseUnsignedOption(const std::string &flag,
+                                        const std::string &value,
+                                        unsigned int min_value,
+                                        unsigned int max_value = std::numeric_limits<unsigned int>::max())
+{
+        try
+        {
+                size_t pos = 0;
+                unsigned long parsed = std::stoul(value, &pos, 10);
+                if (pos != value.size())
+                        throw std::runtime_error(flag + " contains trailing characters: " + value.substr(pos));
+                if (parsed < min_value)
+                        throw std::runtime_error(flag + " must be >= " + std::to_string(min_value));
+                if (parsed > max_value)
+                        throw std::runtime_error(flag + " exceeds supported range");
+                return static_cast<unsigned int>(parsed);
+        }
+        catch (const std::invalid_argument &)
+        {
+                throw std::runtime_error(flag + " requires an unsigned integer value");
+        }
+        catch (const std::out_of_range &)
+        {
+                throw std::runtime_error(flag + " is out of range");
+        }
+}
+
+static RawOptions::SyncPolicy parseSyncPolicy(const std::string &flag,
+                                              const std::string &value,
+                                              RawOptions &options)
+{
+        std::string lower = toLower(value);
+
+        auto setInterval = [&](const std::string &interval_str) {
+                if (interval_str.empty())
+                        return;
+                options.sync_interval = parseUnsignedOption(flag, interval_str, 1);
+        };
+
+        if (lower == "never")
+        {
+                options.sync_interval = 0;
+                return RawOptions::SyncPolicy::Never;
+        }
+        if (lower == "take")
+        {
+                options.sync_interval = 0;
+                return RawOptions::SyncPolicy::Take;
+        }
+        if (lower.rfind("interval", 0) == 0)
+        {
+                size_t pos = lower.find_first_of("=:");
+                if (pos != std::string::npos)
+                        setInterval(lower.substr(pos + 1));
+                return RawOptions::SyncPolicy::Interval;
+        }
+
+        throw std::runtime_error(flag + " must be one of never, take, interval[=N]");
+}
+
+static const char *syncPolicyName(RawOptions::SyncPolicy policy)
+{
+        switch (policy)
+        {
+        case RawOptions::SyncPolicy::Never:
+                return "never";
+        case RawOptions::SyncPolicy::Take:
+                return "take";
+        case RawOptions::SyncPolicy::Interval:
+                return "interval";
+        }
+        return "unknown";
+}
+
+static bool parseBoolOption(const std::string &flag, const std::string &value)
+{
+        std::string lower = toLower(value);
+        if (lower == "1" || lower == "true" || lower == "yes" || lower == "on")
+                return true;
+        if (lower == "0" || lower == "false" || lower == "no" || lower == "off")
+                return false;
+        throw std::runtime_error(flag + " must be true/false (or 1/0)");
 }
 
 static int parseNiceValue(const std::string &flag, const std::string &value)
@@ -342,6 +459,92 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                         continue;
                 }
 
+                if (arg.rfind("--preroll-ms=", 0) == 0) {
+                        RawOptions::preroll_ms = parseUnsignedOption("--preroll-ms", arg.substr(sizeof("--preroll-ms=") - 1), 0);
+                        continue;
+                }
+                if (arg == "--preroll-ms") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--preroll-ms requires a value");
+                        RawOptions::preroll_ms = parseUnsignedOption("--preroll-ms", argv[++i], 0);
+                        continue;
+                }
+
+                if (arg.rfind("--start-queue-frames=", 0) == 0) {
+                        RawOptions::start_queue_frames = parseUnsignedOption("--start-queue-frames", arg.substr(sizeof("--start-queue-frames=") - 1), 0);
+                        continue;
+                }
+                if (arg == "--start-queue-frames") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--start-queue-frames requires a value");
+                        RawOptions::start_queue_frames = parseUnsignedOption("--start-queue-frames", argv[++i], 0);
+                        continue;
+                }
+
+                if (arg.rfind("--ignore-start-frames=", 0) == 0) {
+                        RawOptions::ignore_start_frames = parseUnsignedOption("--ignore-start-frames", arg.substr(sizeof("--ignore-start-frames=") - 1), 0);
+                        continue;
+                }
+                if (arg == "--ignore-start-frames") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--ignore-start-frames requires a value");
+                        RawOptions::ignore_start_frames = parseUnsignedOption("--ignore-start-frames", argv[++i], 0);
+                        continue;
+                }
+
+                if (arg.rfind("--sync-policy=", 0) == 0) {
+                        RawOptions::sync_policy = parseSyncPolicy("--sync-policy", arg.substr(sizeof("--sync-policy=") - 1), *this);
+                        continue;
+                }
+                if (arg == "--sync-policy") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--sync-policy requires a value");
+                        RawOptions::sync_policy = parseSyncPolicy("--sync-policy", argv[++i], *this);
+                        continue;
+                }
+
+                if (arg.rfind("--sync-interval=", 0) == 0) {
+                        RawOptions::sync_interval = parseUnsignedOption("--sync-interval", arg.substr(sizeof("--sync-interval=") - 1), 1);
+                        RawOptions::sync_policy = RawOptions::SyncPolicy::Interval;
+                        continue;
+                }
+                if (arg == "--sync-interval") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--sync-interval requires a value");
+                        RawOptions::sync_interval = parseUnsignedOption("--sync-interval", argv[++i], 1);
+                        RawOptions::sync_policy = RawOptions::SyncPolicy::Interval;
+                        continue;
+                }
+
+                if (arg.rfind("--drop-cache-after-close=", 0) == 0) {
+                        RawOptions::drop_cache_after_close = parseBoolOption("--drop-cache-after-close", arg.substr(sizeof("--drop-cache-after-close=") - 1));
+                        continue;
+                }
+                if (arg == "--drop-cache-after-close") {
+                        RawOptions::drop_cache_after_close = true;
+                        continue;
+                }
+
+                if (arg.rfind("--selftest=", 0) == 0) {
+                        RawOptions::selftest = parseBoolOption("--selftest", arg.substr(sizeof("--selftest=") - 1));
+                        continue;
+                }
+                if (arg == "--selftest") {
+                        RawOptions::selftest = true;
+                        continue;
+                }
+
+                if (arg.rfind("--selftest-seconds=", 0) == 0) {
+                        RawOptions::selftest_seconds = parseUnsignedOption("--selftest-seconds", arg.substr(sizeof("--selftest-seconds=") - 1), 1);
+                        continue;
+                }
+                if (arg == "--selftest-seconds") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--selftest-seconds requires a value");
+                        RawOptions::selftest_seconds = parseUnsignedOption("--selftest-seconds", argv[++i], 1);
+                        continue;
+                }
+
                 /* not a CinePi flag – forward it */
                 forward.push_back(argv[i]);
         }
@@ -398,6 +601,16 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                       cpuListToString(RawOptions::disk_affinity),
                       RawOptions::encode_nice ? std::to_string(*RawOptions::encode_nice) : std::string("auto"),
                       RawOptions::disk_nice ? std::to_string(*RawOptions::disk_nice) : std::string("auto"));
+
+        spdlog::info("cinepi-cli: preroll={}ms start_queue={} ignore_start={} sync_policy={} sync_interval={} drop_cache={} selftest={} duration={}s",
+                     RawOptions::preroll_ms,
+                     RawOptions::start_queue_frames,
+                     RawOptions::ignore_start_frames,
+                     syncPolicyName(RawOptions::sync_policy),
+                     RawOptions::sync_interval,
+                     RawOptions::drop_cache_after_close ? "on" : "off",
+                     RawOptions::selftest ? "on" : "off",
+                     RawOptions::selftest_seconds);
 
         return ok;
 }
