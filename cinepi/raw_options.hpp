@@ -77,6 +77,8 @@ struct RawOptions : public VideoOptions
     uint32_t ignore_start_frames { 12 };
 
     /* disk synchronisation ---------------------------------------------- */
+    using SyncPolicy = RawSyncPolicy;
+
     RawSyncPolicy sync_policy { RawSyncPolicy::Never };
     SyncPolicy sync_policy { SyncPolicy::Never };
     uint32_t   sync_interval { 0 };      // used when policy == Interval

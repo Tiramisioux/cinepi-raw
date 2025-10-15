@@ -100,6 +100,11 @@ public:
 
         bool mono_ = false;
 
+
+        StageMetrics snapshotStageMetrics() const;
+
+        bool mono_ = false;
+
         std::vector<int64_t> timestamps;
         std::array<uint8_t, 8> originationTimeCode;
         std::array<uint16_t, 3> originationDate;
