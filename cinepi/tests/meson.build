@@ -7,6 +7,6 @@ test('startup_gate', startup_gate_test)
 
 sync_policy_test = executable('sync_policy_test',
     'test_sync_policy.cpp',
-    include_directories : [include_directories('..', '../../core')])
+    include_directories : [include_directories('..', '../..')])
 
 test('sync_policy', sync_policy_test)
