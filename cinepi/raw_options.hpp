@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/video_options.hpp"
+#include "sync_policy.hpp"
 
 struct RawOptions : public VideoOptions
 {
@@ -55,6 +56,7 @@ struct RawOptions : public VideoOptions
     bool keep16;                           // set by --keep16 in CinePiOptions
 
     /* worker pool sizing + tuning */
+    using SyncPolicy = RawSyncPolicy;
     enum class SyncPolicy
     {
         Never,
