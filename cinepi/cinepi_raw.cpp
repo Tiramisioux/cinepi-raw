@@ -42,6 +42,7 @@ static bool write_frame_file(const fs::path &path,
                              RawOptions const *options,
                              uint32_t frame_number,
                              RawSyncPolicy policy,
+                             RawOptions::SyncPolicy policy,
                              uint32_t sync_interval)
 {
         constexpr size_t chunk = 1 << 20; // 1 MiB
@@ -127,6 +128,7 @@ static int run_selftest(CinePiOptions *options)
                 buffer[i] = static_cast<uint8_t>(i & 0xFF);
 
         RawSyncPolicy policy = options->sync_policy;
+        RawOptions::SyncPolicy policy = options->sync_policy;
         uint32_t sync_interval = options->sync_interval ? options->sync_interval : 0;
 
         for (uint32_t i = 0; i < frames; ++i)
@@ -142,6 +144,7 @@ static int run_selftest(CinePiOptions *options)
         }
 
         if (policy == RawSyncPolicy::Take)
+        if (policy == RawOptions::SyncPolicy::Take)
         {
                 int dir_fd = open(take_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
                 if (dir_fd >= 0)
