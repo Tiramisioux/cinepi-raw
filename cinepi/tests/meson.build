@@ -1,5 +1,5 @@
 startup_gate_test = executable('startup_gate_test',
-    'test_startup_gate.cpp',
+    ['test_startup_gate.cpp', '../startup_gate.cpp'],
     include_directories : [include_directories('..')],
     dependencies : [spdlog_dep])
 
