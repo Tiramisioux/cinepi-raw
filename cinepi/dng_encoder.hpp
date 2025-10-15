@@ -100,11 +100,6 @@ public:
 
         bool mono_ = false;
 
-
-        StageMetrics snapshotStageMetrics() const;
-
-        bool mono_ = false;
-
         std::vector<int64_t> timestamps;
         std::array<uint8_t, 8> originationTimeCode;
         std::array<uint16_t, 3> originationDate;
@@ -252,7 +247,6 @@ private:
         std::atomic<uint64_t> last_disk_us_{0};
         std::atomic<size_t>   queue_depth_{0};
 
-        RawSyncPolicy sync_policy_ { RawSyncPolicy::Never };
         RawOptions::SyncPolicy sync_policy_ { RawOptions::SyncPolicy::Never };
         uint32_t sync_interval_ { 0 };
         bool drop_cache_after_close_ { false };

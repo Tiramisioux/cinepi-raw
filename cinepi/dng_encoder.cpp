@@ -128,9 +128,6 @@ static const std::map<PixelFormat,int> mono_formats = {
     /* leave genuine true-mono formats here, e.g. GREY8 if you ever use it */
 };
 
-
-bool mono_ = false;   // add as a private member of DngEncoder
-
 void DngEncoder::setWallClockTimestamp(uint64_t us)
 {
     wallclock_ts_us_ = us;
@@ -319,7 +316,6 @@ DngEncoder::DngEncoder(RawOptions const *options)
         disk_nice_           = -5;
     }
 
-    if (sync_policy_ == RawSyncPolicy::Interval && sync_interval_ == 0)
     if (sync_policy_ == RawOptions::SyncPolicy::Interval && sync_interval_ == 0)
         sync_interval_ = 1;
 
@@ -477,7 +473,6 @@ void DngEncoder::disarmRecording()
 
     if (phase != StartupGate::Phase::Recording)
         clearPool();
-    else if (sync_policy_ == RawSyncPolicy::Take)
     else if (sync_policy_ == RawOptions::SyncPolicy::Take)
         pending_take_sync_.store(true, std::memory_order_release);
 
