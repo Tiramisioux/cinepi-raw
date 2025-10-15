@@ -41,6 +41,7 @@ static bool write_frame_file(const fs::path &path,
                              const std::vector<uint8_t> &buffer,
                              RawOptions const *options,
                              uint32_t frame_number,
+                             RawSyncPolicy policy,
                              RawOptions::SyncPolicy policy,
                              uint32_t sync_interval)
 {
@@ -126,6 +127,7 @@ static int run_selftest(CinePiOptions *options)
         for (size_t i = 0; i < frame_size; ++i)
                 buffer[i] = static_cast<uint8_t>(i & 0xFF);
 
+        RawSyncPolicy policy = options->sync_policy;
         RawOptions::SyncPolicy policy = options->sync_policy;
         uint32_t sync_interval = options->sync_interval ? options->sync_interval : 0;
 
@@ -141,6 +143,7 @@ static int run_selftest(CinePiOptions *options)
                 spdlog::info("selftest: frame {} took {} ms", i + 1, ms);
         }
 
+        if (policy == RawSyncPolicy::Take)
         if (policy == RawOptions::SyncPolicy::Take)
         {
                 int dir_fd = open(take_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);

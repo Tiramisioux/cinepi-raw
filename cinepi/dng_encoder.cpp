@@ -319,6 +319,7 @@ DngEncoder::DngEncoder(RawOptions const *options)
         disk_nice_           = -5;
     }
 
+    if (sync_policy_ == RawSyncPolicy::Interval && sync_interval_ == 0)
     if (sync_policy_ == RawOptions::SyncPolicy::Interval && sync_interval_ == 0)
         sync_interval_ = 1;
 
@@ -476,6 +477,7 @@ void DngEncoder::disarmRecording()
 
     if (phase != StartupGate::Phase::Recording)
         clearPool();
+    else if (sync_policy_ == RawSyncPolicy::Take)
     else if (sync_policy_ == RawOptions::SyncPolicy::Take)
         pending_take_sync_.store(true, std::memory_order_release);
 

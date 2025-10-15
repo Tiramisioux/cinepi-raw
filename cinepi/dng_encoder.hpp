@@ -247,6 +247,7 @@ private:
         std::atomic<uint64_t> last_disk_us_{0};
         std::atomic<size_t>   queue_depth_{0};
 
+        RawSyncPolicy sync_policy_ { RawSyncPolicy::Never };
         RawOptions::SyncPolicy sync_policy_ { RawOptions::SyncPolicy::Never };
         uint32_t sync_interval_ { 0 };
         bool drop_cache_after_close_ { false };
