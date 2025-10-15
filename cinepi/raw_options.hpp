@@ -57,12 +57,6 @@ struct RawOptions : public VideoOptions
 
     /* worker pool sizing + tuning */
     using SyncPolicy = RawSyncPolicy;
-    enum class SyncPolicy
-    {
-        Never,
-        Take,
-        Interval
-    };
 
     uint32_t encode_workers { 4 };
     uint32_t disk_workers   { 2 };
@@ -77,9 +71,6 @@ struct RawOptions : public VideoOptions
     uint32_t ignore_start_frames { 12 };
 
     /* disk synchronisation ---------------------------------------------- */
-    using SyncPolicy = RawSyncPolicy;
-
-    RawSyncPolicy sync_policy { RawSyncPolicy::Never };
     SyncPolicy sync_policy { SyncPolicy::Never };
     uint32_t   sync_interval { 0 };      // used when policy == Interval
     bool       drop_cache_after_close { false };

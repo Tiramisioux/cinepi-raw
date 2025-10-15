@@ -1,5 +1,6 @@
 #include "sync_utils.hpp"
 #include "sync_policy.hpp"
+#include "raw_options.hpp"
 
 #include <cassert>
 
