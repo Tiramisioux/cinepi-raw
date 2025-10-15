@@ -24,6 +24,7 @@ endif
 sources = [
   'cinepi_raw.cpp',
   'dng_encoder.cpp',
+  'startup_gate.cpp',
   'sharedContextStage.cpp',
   'mjpegPreviewStage.cpp',
   'cinepi_controller.cpp',
