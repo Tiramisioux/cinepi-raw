@@ -117,12 +117,20 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw‚
 | `--hdmi-port <int>`       | `-1`    | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
 | `--same-hdmi`             | `false` | Force both CinePi apps (capture & controller) to share the same HDMI output. |
 | `--keep16`                | `false` | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit streams. |
-| `--encode-workers <n>`    | `2`     | Number of DNG encode worker threads to spawn (min. `1`). |
-| `--disk-workers <n>`      | `8`     | Number of disk writer threads used for flushing DNGs (min. `1`). |
+| `--encode-workers <n>`    | `4`     | Number of DNG encode worker threads to spawn (min. `1`). |
+| `--disk-workers <n>`      | `2`     | Number of disk writer threads used for flushing DNGs (min. `1`). |
 | `--encode-affinity <list>`| `auto`  | Pin encode workers to a CPU list (e.g. `4,5` or `2-5`). |
 | `--disk-affinity <list>`  | `auto`  | Pin disk workers to the specified CPU list. |
 | `--encode-nice <int>`     | `auto`  | Nice level for encode workers (`-20` = highest priority, `19` = lowest). |
 | `--disk-nice <int>`       | `auto`  | Nice level applied to disk workers. |
+| `--preroll-ms <ms>`       | `300`   | Warm-up window that absorbs frames before disk writes begin (`0` disables). |
+| `--start-queue-frames <n>`| `6`     | Minimum buffered frames before the writer transitions to ‚ÄúRecording‚Äù. |
+| `--ignore-start-frames <n>`| `12`   | Number of initial recorded frames excluded from drop detection. |
+| `--sync-policy <mode>`    | `never` | Disk sync policy: `never`, `take` (sync directory once per take) or `interval[=N]`. |
+| `--sync-interval <n>`     | `0`     | With `--sync-policy=interval`, call `fdatasync` every _n_ frames. |
+| `--drop-cache-after-close`| `false` | Call `posix_fadvise(..., DONTNEED)` after each frame to shed page cache. |
+| `--selftest`              | `false` | Run a 1 s synthetic write test (13.5 MiB frames) and exit. |
+| `--selftest-seconds <n>`  | `1`     | Duration for `--selftest` (seconds of 24 fps output). |
 
 ## Manual DNG encoder
 
@@ -148,6 +156,22 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw‚
   cinepi-raw --encode-workers 4 --encode-affinity 4-5 --encode-nice -5 \
              --disk-workers 2 --disk-affinity 0-3 --disk-nice 8 [other options]
   ```
+
+### Startup diagnostics
+
+The recorder announces the pipeline stages with concise markers:
+
+```
+ENCODER_READY
+WRITER_READY
+CADENCE_ARMED
+FIRST_DNG_WRITTEN
+CADENCE_ACTIVE
+```
+
+Frame drops are reported with contextual categories such as `DROP[STARTUP]`,
+`DROP[ENCODE_OVERRUN]`, `DROP[DISK_STALL]`, or `DROP[THERMAL]`, together with
+the measured FPS, encode/write durations, and queue depth to aid debugging.
 
   This example pins encode workers to CPUs 4‚Äì5 with a higher priority while leaving disk flush threads on the little cores with a lower scheduling priority.
   

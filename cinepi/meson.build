@@ -52,3 +52,5 @@ cinepi_raw = executable('cinepi-raw', sources,
              link_with : rpicam_app,
              install : true)
 
+subdir('tests')
+

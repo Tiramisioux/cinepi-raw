@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <queue>
+#include <deque>
 #include <thread>
 #include <vector>
 #include <array>
@@ -18,7 +19,8 @@
 
 #include "encoder/encoder.hpp"
 #include "raw_options.hpp"
-#include "cinepi_frameinfo.hpp"	
+#include "cinepi_frameinfo.hpp"
+#include "startup_gate.hpp"
 
 
 class DngEncoder : public Encoder
@@ -70,20 +72,37 @@ public:
 	bool initialized(){
 		return encoder_initialized_;
 	}
-	void reset_encoder(){
-		encoder_initialized_ = false;
-	}
+        void reset_encoder(){
+                encoder_initialized_ = false;
+        }
     bool buffer_full()           // inline definition
     {
         std::lock_guard<std::mutex> lk(ram_mtx_);
         return ram_buffers_ + 2 >= max_ram_buffers_;
     }
 
-	bool mono_ = false;
+        void armRecording();
+        void disarmRecording();
+        void markTakeDirectoryReady(bool ready);
+        bool cadenceActive() const;
+        bool shouldIgnoreFrame(uint64_t frame_index) const;
+        StartupGate::Phase pipelinePhase() const;
+        size_t diskQueueDepth() const;
 
-	std::vector<int64_t> timestamps;
-	std::array<uint8_t, 8> originationTimeCode;
-	std::array<uint16_t, 3> originationDate;
+        struct StageMetrics
+        {
+                double encode_ms;
+                double disk_ms;
+                size_t queue_depth;
+        };
+
+        StageMetrics snapshotStageMetrics() const;
+
+        bool mono_ = false;
+
+        std::vector<int64_t> timestamps;
+        std::array<uint8_t, 8> originationTimeCode;
+        std::array<uint16_t, 3> originationDate;
 
 	/* ---- PUBLIC: number of frame buffers that fit in RAM ---- */
 	size_t maxRamBuffers() const { return max_ram_buffers_; }
@@ -116,6 +135,8 @@ private:
                                      size_t total,
                                      const std::optional<std::vector<int>> &affinity,
                                      const std::optional<int> &nice_value);
+        void syncTakeDirectory() const;
+        void updateQueueDepthLocked();
 
         bool encoder_initialized_;
 	struct DngInfo
@@ -216,9 +237,21 @@ private:
                 uint64_t index;
                 std::string timecode;
         };
-        std::queue<DiskItem> disk_buffer_;
+        std::deque<DiskItem> disk_buffer_;
+        std::deque<DiskItem> preroll_cache_;
         std::mutex disk_mutex_;
         std::condition_variable disk_cond_var_;
+
+        StartupGate gate_;
+        std::atomic<uint64_t> last_encode_us_{0};
+        std::atomic<uint64_t> last_disk_us_{0};
+        std::atomic<size_t>   queue_depth_{0};
+
+        RawSyncPolicy sync_policy_ { RawSyncPolicy::Never };
+        uint32_t sync_interval_ { 0 };
+        bool drop_cache_after_close_ { false };
+        std::atomic<uint64_t> frames_written_take_{0};
+        std::atomic<bool> pending_take_sync_{false};
 };
 
 #endif
