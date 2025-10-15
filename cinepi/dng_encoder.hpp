@@ -248,6 +248,7 @@ private:
         std::atomic<size_t>   queue_depth_{0};
 
         RawSyncPolicy sync_policy_ { RawSyncPolicy::Never };
+        RawOptions::SyncPolicy sync_policy_ { RawOptions::SyncPolicy::Never };
         uint32_t sync_interval_ { 0 };
         bool drop_cache_after_close_ { false };
         std::atomic<uint64_t> frames_written_take_{0};

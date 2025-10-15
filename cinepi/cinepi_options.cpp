@@ -180,6 +180,7 @@ static unsigned int parseUnsignedOption(const std::string &flag,
 }
 
 static RawSyncPolicy parseSyncPolicy(const std::string &flag,
+static RawOptions::SyncPolicy parseSyncPolicy(const std::string &flag,
                                               const std::string &value,
                                               RawOptions &options)
 {
@@ -195,11 +196,13 @@ static RawSyncPolicy parseSyncPolicy(const std::string &flag,
         {
                 options.sync_interval = 0;
                 return RawSyncPolicy::Never;
+                return RawOptions::SyncPolicy::Never;
         }
         if (lower == "take")
         {
                 options.sync_interval = 0;
                 return RawSyncPolicy::Take;
+                return RawOptions::SyncPolicy::Take;
         }
         if (lower.rfind("interval", 0) == 0)
         {
@@ -207,6 +210,7 @@ static RawSyncPolicy parseSyncPolicy(const std::string &flag,
                 if (pos != std::string::npos)
                         setInterval(lower.substr(pos + 1));
                 return RawSyncPolicy::Interval;
+                return RawOptions::SyncPolicy::Interval;
         }
 
         throw std::runtime_error(flag + " must be one of never, take, interval[=N]");
@@ -221,6 +225,15 @@ static const char *syncPolicyName(RawSyncPolicy policy)
         case RawSyncPolicy::Take:
                 return "take";
         case RawSyncPolicy::Interval:
+static const char *syncPolicyName(RawOptions::SyncPolicy policy)
+{
+        switch (policy)
+        {
+        case RawOptions::SyncPolicy::Never:
+                return "never";
+        case RawOptions::SyncPolicy::Take:
+                return "take";
+        case RawOptions::SyncPolicy::Interval:
                 return "interval";
         }
         return "unknown";
@@ -506,6 +519,7 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                 if (arg.rfind("--sync-interval=", 0) == 0) {
                         RawOptions::sync_interval = parseUnsignedOption("--sync-interval", arg.substr(sizeof("--sync-interval=") - 1), 1);
                         RawOptions::sync_policy = RawSyncPolicy::Interval;
+                        RawOptions::sync_policy = RawOptions::SyncPolicy::Interval;
                         continue;
                 }
                 if (arg == "--sync-interval") {
@@ -513,6 +527,7 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                                 throw std::runtime_error("--sync-interval requires a value");
                         RawOptions::sync_interval = parseUnsignedOption("--sync-interval", argv[++i], 1);
                         RawOptions::sync_policy = RawSyncPolicy::Interval;
+                        RawOptions::sync_policy = RawOptions::SyncPolicy::Interval;
                         continue;
                 }
 
