@@ -57,6 +57,12 @@ struct RawOptions : public VideoOptions
 
     /* worker pool sizing + tuning */
     using SyncPolicy = RawSyncPolicy;
+    enum class SyncPolicy
+    {
+        Never,
+        Take,
+        Interval
+    };
 
     uint32_t encode_workers { 4 };
     uint32_t disk_workers   { 2 };
