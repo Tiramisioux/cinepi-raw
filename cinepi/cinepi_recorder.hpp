@@ -20,6 +20,8 @@
 #include "preview/hdmi_utils.hpp"
 #include "preview/preview.hpp"
 
+#include <cmath>
+
 
 typedef std::function<void(void *, size_t, int64_t, bool)> EncodeOutputReadyCallback;
 typedef std::function<void(libcamera::ControlList &)> MetadataReadyCallback;
@@ -39,7 +41,7 @@ public:
 		encoder_->SetInputDoneCallback(std::bind(&CinePIRecorder::encodeBufferDone, this, std::placeholders::_1));
 		encoder_->SetOutputReadyCallback(encode_output_ready_callback_);
 	}
-	uint64_t last_timestamp_ns;
+        uint64_t last_timestamp_ns = 0;
 	// This is callback when the encoder gives you the encoded output data.
 	void SetEncodeOutputReadyCallback(EncodeOutputReadyCallback callback) { encode_output_ready_callback_ = callback; }
 	void SetMetadataReadyCallback(MetadataReadyCallback callback) { metadata_ready_callback_ = callback; }
@@ -75,14 +77,70 @@ public:
 		auto fd = completed_request->metadata.get(controls::FrameDuration);
 		int64_t frameduration_us = fd ? *fd : 0;
 
-		float fps_measured = 1000000000.0/(timestamp_ns-last_timestamp_ns);
-		float fps_setting  = 1000000.0/frameduration_us;
+                StartupGate::Phase phase = encoder_->pipelinePhase();
+                if (phase == StartupGate::Phase::Recording)
+                {
+                        if (!cadence_counting_)
+                        {
+                                recorded_frames_ = 0;
+                                cadence_counting_ = true;
+                        }
+                }
+                else
+                {
+                        cadence_counting_ = false;
+                        recorded_frames_ = 0;
+                }
 
-		if(abs(fps_measured - fps_setting) > 1){
-			LOG(1,"Frame Drop!!!!!     FPS measured:"  << fps_measured<< " FPS settings:" << fps_setting);
-		}
+                bool counts_towards_drop = phase == StartupGate::Phase::Recording && cadence_counting_;
+                if (counts_towards_drop)
+                        ++recorded_frames_;
 
-		last_timestamp_ns = timestamp_ns;
+                bool ignore_window = false;
+                if (counts_towards_drop)
+                {
+                        auto *opts = GetOptions();
+                        ignore_window = recorded_frames_ <= opts->ignore_start_frames;
+                }
+
+                if (last_timestamp_ns != 0 && frameduration_us > 0)
+                {
+                        double measured_interval = static_cast<double>(timestamp_ns - last_timestamp_ns);
+                        if (measured_interval > 0.0)
+                        {
+                                double fps_measured = 1e9 / measured_interval;
+                                double fps_setting  = 1e6 / static_cast<double>(frameduration_us);
+                                double delta        = std::abs(fps_measured - fps_setting);
+
+                                if (delta > 1.0)
+                                {
+                                        auto metrics = encoder_->snapshotStageMetrics();
+                                        bool cadence_ready = encoder_->cadenceActive();
+                                        std::string reason;
+
+                                        if (!cadence_ready)
+                                                reason = "STARTUP";
+                                        else if (metrics.encode_ms > 26.0)
+                                                reason = "ENCODE_OVERRUN";
+                                        else if (metrics.disk_ms > 30.0 || metrics.queue_depth > 1)
+                                                reason = "DISK_STALL";
+                                        else
+                                                reason = "THERMAL";
+
+                                        if (reason == "STARTUP" || !ignore_window)
+                                        {
+                                                LOG(1, "DROP[" << reason << "] frame=" << encoder_->getFrameCount()
+                                                       << " fps_measured=" << fps_measured
+                                                       << " fps_expected=" << fps_setting
+                                                       << " queue=" << metrics.queue_depth
+                                                       << " encode_ms=" << metrics.encode_ms
+                                                       << " disk_ms=" << metrics.disk_ms);
+                                        }
+                                }
+                        }
+                }
+
+                last_timestamp_ns = timestamp_ns;
 		encoder_->log_ts(timestamp_ns);
 		{
 			std::lock_guard<std::mutex> lock(encode_buffer_queue_mutex_);
@@ -95,7 +153,14 @@ public:
 	CinePiOptions *GetOptions() const { return static_cast<CinePiOptions *>(options_.get()); }
 	
 	DngEncoder *GetEncoder() { return encoder_.get(); }
-	void StopEncoder() { encoder_.reset(); }
+        void StopEncoder() { encoder_.reset(); }
+
+        void ResetCadence()
+        {
+                last_timestamp_ns = 0;
+                recorded_frames_ = 0;
+                cadence_counting_ = false;
+        }
 
 protected:
 	virtual void createEncoder()
@@ -126,7 +191,10 @@ private:
 
 	std::queue<CompletedRequestPtr> encode_buffer_queue_;
 	std::mutex encode_buffer_queue_mutex_;
-	EncodeOutputReadyCallback encode_output_ready_callback_;
-	MetadataReadyCallback metadata_ready_callback_;
+        EncodeOutputReadyCallback encode_output_ready_callback_;
+        MetadataReadyCallback metadata_ready_callback_;
+
+        uint64_t recorded_frames_ { 0 };
+        bool cadence_counting_ { false };
 };
 #endif // CINEPI_RECORDER_HPP
