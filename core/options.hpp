@@ -14,15 +14,7 @@
 
 #include <boost/program_options.hpp>
 
-#if defined(__has_include)
-#if __has_include(<libcamera/libcamera.h>)
-#include <libcamera/libcamera.h>
-#else
 #include <libcamera/camera.h>
-#endif
-#else
-#include <libcamera/camera.h>
-#endif
 #include <libcamera/camera_manager.h>
 #include <libcamera/control_ids.h>
 #include <libcamera/property_ids.h>
@@ -102,12 +94,14 @@ struct TimeVal
 
 struct Options
 {
-	Options()
-	: hdmi_port(-1),                    /* ‑1 = let DRM decide   */
-		set_default_lens_position(false), af_on_capture(false),
-		keep16(false),                           // ← NEW default
-		options_("Valid options are", 120, 80), app_(nullptr)
-	{
+    Options()
+        : set_default_lens_position(false)          // declared first
+        , af_on_capture(false)                      // then this
+        , hdmi_port(-1)                             // then hdmi_port
+        , keep16(false)                             // then keep16
+        , options_("Valid options are", 120, 80)    // then options_
+        , app_(nullptr)                             // and finally app_
+    {
 		using namespace boost::program_options;
 		// clang-format off
 		options_.add_options()

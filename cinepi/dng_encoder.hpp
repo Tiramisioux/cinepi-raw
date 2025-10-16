@@ -78,6 +78,8 @@ public:
     bool buffer_full()           // inline definition
     {
         std::lock_guard<std::mutex> lk(ram_mtx_);
+		if (!encoder_initialized_ || max_ram_buffers_ == 0)
+            return false;
         return ram_buffers_ + 2 >= max_ram_buffers_;
     }
 
@@ -117,7 +119,7 @@ private:
 
     /* ──  NEW: in-RAM buffer accounting  ─────────────────────── */
     std::atomic<size_t>   ram_buffers_{0};   /* # TIFF blocks living in RAM   */
-    size_t                max_ram_buffers_;  /* hard cap calculated at setup  */
+    size_t                max_ram_buffers_{0};  /* hard cap calculated at setup  */
     std::mutex            ram_mtx_;
     std::condition_variable ram_cv_;
 
