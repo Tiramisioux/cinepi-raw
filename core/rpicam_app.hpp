@@ -22,7 +22,15 @@
 #include <vector>
 
 #include <libcamera/base/span.h>
+#if defined(__has_include)
+#if __has_include(<libcamera/libcamera.h>)
+#include <libcamera/libcamera.h>
+#else
 #include <libcamera/camera.h>
+#endif
+#else
+#include <libcamera/camera.h>
+#endif
 #include <libcamera/camera_manager.h>
 #include <libcamera/control_ids.h>
 #include <libcamera/controls.h>

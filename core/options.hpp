@@ -14,7 +14,15 @@
 
 #include <boost/program_options.hpp>
 
+#if defined(__has_include)
+#if __has_include(<libcamera/libcamera.h>)
+#include <libcamera/libcamera.h>
+#else
 #include <libcamera/camera.h>
+#endif
+#else
+#include <libcamera/camera.h>
+#endif
 #include <libcamera/camera_manager.h>
 #include <libcamera/control_ids.h>
 #include <libcamera/property_ids.h>
