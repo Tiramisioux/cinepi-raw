@@ -207,10 +207,10 @@ H264Encoder::H264Encoder(VideoOptions const *options, StreamInfo const &info)
 
 H264Encoder::~H264Encoder()
 {
-	abortPoll_ = true;
-	poll_thread_.join();
-	abortOutput_ = true;
-	output_thread_.join();
+        abortPoll_ = true;
+        poll_thread_.join();
+        abortOutput_ = true;
+        output_thread_.join();
 
 	// Turn off streaming on both the output and capture queues, and "free" the
 	// buffers that we requested. The capture ones need to be "munmapped" first.
@@ -239,15 +239,23 @@ H264Encoder::~H264Encoder()
 	if (xioctl(fd_, VIDIOC_REQBUFS, &reqbufs) < 0)
 		LOG(1, "Request to free capture buffers failed");
 
-	close(fd_);
-	LOG(2, "H264Encoder closed");
+        close(fd_);
+        LOG(2, "H264Encoder closed");
+}
+
+void H264Encoder::RequestKeyFrame()
+{
+        v4l2_control ctrl = {};
+        ctrl.id = V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME;
+        if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
+                LOG(1, "Failed to force key frame");
 }
 
 void H264Encoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us)
 {
-	int index;
-	{
-		// We need to find an available output buffer (input to the codec) to
+        int index;
+        {
+                // We need to find an available output buffer (input to the codec) to
 		// "wrap" the DMABUF.
 		std::lock_guard<std::mutex> lock(input_buffers_available_mutex_);
 		if (input_buffers_available_.empty())

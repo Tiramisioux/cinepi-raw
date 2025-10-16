@@ -10,19 +10,21 @@
 #include <cstdio>
 
 #include <atomic>
+#include <functional>
 
 #include "core/video_options.hpp"
 
 class Output
 {
 public:
-	static Output *Create(VideoOptions const *options);
+        static Output *Create(VideoOptions const *options);
 
-	Output(VideoOptions const *options);
-	virtual ~Output();
-	virtual void Signal(); // a derived class might redefine what this means
-	void OutputReady(void *mem, size_t size, int64_t timestamp_us, bool keyframe);
-	void MetadataReady(libcamera::ControlList &metadata);
+        Output(VideoOptions const *options);
+        virtual ~Output();
+        virtual void Signal(); // a derived class might redefine what this means
+        void SetRequestKeyFrameCallback(std::function<void()> callback);
+        void OutputReady(void *mem, size_t size, int64_t timestamp_us, bool keyframe);
+        void MetadataReady(libcamera::ControlList &metadata);
 
 protected:
 	enum Flag
@@ -48,9 +50,10 @@ private:
 	int64_t time_offset_;
 	int64_t last_timestamp_;
 	std::streambuf *buf_metadata_;
-	std::ofstream of_metadata_;
-	bool metadata_started_ = false;
-	std::queue<libcamera::ControlList> metadata_queue_;
+        std::ofstream of_metadata_;
+        bool metadata_started_ = false;
+        std::queue<libcamera::ControlList> metadata_queue_;
+        std::function<void()> request_keyframe_callback_;
 };
 
 void start_metadata_output(std::streambuf *buf, std::string fmt);

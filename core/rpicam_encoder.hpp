@@ -42,14 +42,19 @@ public:
 			cl.set(libcamera::controls::rpi::SyncMode, libcamera::controls::rpi::SyncModeClient);
 		SetControls(cl);
 	}
-	// This is callback when the encoder gives you the encoded output data.
-	void SetEncodeOutputReadyCallback(EncodeOutputReadyCallback callback) { encode_output_ready_callback_ = callback; }
-	void SetMetadataReadyCallback(MetadataReadyCallback callback) { metadata_ready_callback_ = callback; }
-	bool EncodeBuffer(CompletedRequestPtr &completed_request, Stream *stream)
-	{
-		assert(encoder_);
+        // This is callback when the encoder gives you the encoded output data.
+        void SetEncodeOutputReadyCallback(EncodeOutputReadyCallback callback) { encode_output_ready_callback_ = callback; }
+        void SetMetadataReadyCallback(MetadataReadyCallback callback) { metadata_ready_callback_ = callback; }
+        void RequestKeyFrame()
+        {
+                if (encoder_)
+                        encoder_->RequestKeyFrame();
+        }
+        bool EncodeBuffer(CompletedRequestPtr &completed_request, Stream *stream)
+        {
+                assert(encoder_);
 
-		// If sync was enabled, and SyncReady is still "false" then we must skip this frame. Tell our
+                // If sync was enabled, and SyncReady is still "false" then we must skip this frame. Tell our
 		// caller through the return value that we're not yet encoding anything.
 		if (GetOptions()->sync && !completed_request->metadata.get(controls::rpi::SyncReady).value_or(false))
 			return false;

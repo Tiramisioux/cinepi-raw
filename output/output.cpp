@@ -41,20 +41,30 @@ Output::Output(VideoOptions const *options)
 
 Output::~Output()
 {
-	if (fp_timestamps_)
-		fclose(fp_timestamps_);
-	if (!options_->metadata.empty())
-		stop_metadata_output(buf_metadata_, options_->metadata_format);
+        if (fp_timestamps_)
+                fclose(fp_timestamps_);
+        if (!options_->metadata.empty())
+                stop_metadata_output(buf_metadata_, options_->metadata_format);
+}
+
+void Output::SetRequestKeyFrameCallback(std::function<void()> callback)
+{
+        request_keyframe_callback_ = callback;
+        if (request_keyframe_callback_ && enable_.load())
+                request_keyframe_callback_();
 }
 
 void Output::Signal()
 {
-	enable_ = !enable_;
+        bool new_state = !enable_.load();
+        enable_ = new_state;
+        if (new_state && request_keyframe_callback_)
+                request_keyframe_callback_();
 }
 
 void Output::OutputReady(void *mem, size_t size, int64_t timestamp_us, bool keyframe)
 {
-	// When output is enabled, we may have to wait for the next keyframe.
+        // When output is enabled, we may have to wait for the next keyframe.
 	uint32_t flags = keyframe ? FLAG_KEYFRAME : FLAG_NONE;
 	if (!enable_)
 		state_ = DISABLED;
