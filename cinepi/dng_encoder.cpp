@@ -303,6 +303,7 @@ DngEncoder::DngEncoder(RawOptions const *options)
 DngEncoder::~DngEncoder()
 {
     stopThreads();
+    drainPooledBuffers();
     console->info("DngEncoder stopped!");
 }
 
@@ -858,23 +859,27 @@ void DngEncoder::encodeThread(int num)
             /* wait until a permit is available */
             std::unique_lock<std::mutex> lk(ram_mtx_);
             ram_cv_.wait(lk, [this] { return ram_buffers_ < max_ram_buffers_; });
-            lk.unlock();                              // don’t block others while malloc runs
-        }
-
-        if (posix_memalign(reinterpret_cast<void **>(&mem_buf),
-                           BLOCK_SIZE,
-                           dng_info.buffer_size) != 0)
-        {
-            /* Allocation failed – permit was not consumed, wake another waiter */
-            perror("posix_memalign");
-            ram_cv_.notify_one();
-            continue;
-        }
-
-        /* Allocation succeeded – now *really* consume the permit */
-        {
-            std::lock_guard<std::mutex> lk(ram_mtx_);
             ++ram_buffers_;
+        }
+
+        mem_buf = acquirePooledBuffer();
+
+        if (!mem_buf)
+        {
+            if (posix_memalign(reinterpret_cast<void **>(&mem_buf),
+                               BLOCK_SIZE,
+                               dng_info.buffer_size) != 0)
+            {
+                /* Allocation failed – release the reserved permit */
+                perror("posix_memalign");
+                {
+                    std::lock_guard<std::mutex> lk(ram_mtx_);
+                    if (ram_buffers_ > 0)
+                        --ram_buffers_;
+                }
+                ram_cv_.notify_one();
+                continue;
+            }
         }
 
         /* ────────────────────────────────────────────────────── */
@@ -997,7 +1002,7 @@ void DngEncoder::diskThread(int num)
         }
 
         // Clean up
-        free(disk_item.mem_buf);
+        releasePooledBuffer(static_cast<uint8_t *>(disk_item.mem_buf));
 
         {
             std::lock_guard<std::mutex> lk(ram_mtx_);
@@ -1025,7 +1030,7 @@ void DngEncoder::clearPool()
         std::lock_guard<std::mutex> lock(disk_mutex_);
         while (!disk_buffer_.empty()) {
             auto &item = disk_buffer_.front();
-            free(item.mem_buf);
+            releasePooledBuffer(static_cast<uint8_t *>(item.mem_buf));
             // return permit
             {
                 std::lock_guard<std::mutex> lk(ram_mtx_);
@@ -1035,4 +1040,87 @@ void DngEncoder::clearPool()
         }
         ram_cv_.notify_all();
     }
+}
+
+uint8_t *DngEncoder::acquirePooledBuffer()
+{
+    const size_t required_size = dng_info.buffer_size;
+    if (required_size == 0)
+        return nullptr;
+
+    std::lock_guard<std::mutex> lock(buffer_pool_mutex_);
+
+    if (pooled_buffer_size_ != 0 && pooled_buffer_size_ != required_size)
+    {
+        for (auto *ptr : buffer_pool_)
+            free(ptr);
+        buffer_pool_.clear();
+        pooled_buffer_size_ = 0;
+    }
+
+    if (pooled_buffer_size_ == 0)
+        pooled_buffer_size_ = required_size;
+
+    if (buffer_pool_.empty())
+        return nullptr;
+
+    uint8_t *buffer = buffer_pool_.back();
+    buffer_pool_.pop_back();
+    return buffer;
+}
+
+void DngEncoder::releasePooledBuffer(uint8_t *buffer)
+{
+    if (!buffer)
+        return;
+
+    const size_t required_size = dng_info.buffer_size;
+    if (required_size == 0)
+    {
+        free(buffer);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(buffer_pool_mutex_);
+
+    bool size_changed = false;
+
+    if (pooled_buffer_size_ != 0 && pooled_buffer_size_ != required_size)
+    {
+        for (auto *ptr : buffer_pool_)
+            free(ptr);
+        buffer_pool_.clear();
+        pooled_buffer_size_ = 0;
+        size_changed = true;
+    }
+
+    if (size_changed)
+    {
+        free(buffer);
+        return;
+    }
+
+    if (pooled_buffer_size_ == 0)
+        pooled_buffer_size_ = required_size;
+
+    if (pooled_buffer_size_ != required_size)
+    {
+        free(buffer);
+        return;
+    }
+
+    buffer_pool_.push_back(buffer);
+}
+
+void DngEncoder::drainPooledBuffers()
+{
+    std::vector<uint8_t *> buffers;
+    {
+        std::lock_guard<std::mutex> lock(buffer_pool_mutex_);
+        buffers.swap(buffer_pool_);
+        pooled_buffer_size_ = 0;
+    }
+
+    for (auto *ptr : buffers)
+        free(ptr);
 }

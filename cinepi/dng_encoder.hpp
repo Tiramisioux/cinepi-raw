@@ -102,11 +102,20 @@ private:
     std::mutex            ram_mtx_;
     std::condition_variable ram_cv_;
 
-	bool raw_packed_in_ = false;   /* true if DMA already delivers packed rows */
+    bool raw_packed_in_ = false;   /* true if DMA already delivers packed rows */
 
-	bool write12bit_{false};
+    bool write12bit_{false};
 
-	std::shared_ptr<spdlog::logger> console;
+    /* ──  Reusable encoded-buffer pool  ───────────────────── */
+    std::vector<uint8_t *> buffer_pool_;
+    std::mutex              buffer_pool_mutex_;
+    size_t                  pooled_buffer_size_{0};
+
+    uint8_t *acquirePooledBuffer();
+    void     releasePooledBuffer(uint8_t *buffer);
+    void     drainPooledBuffers();
+
+    std::shared_ptr<spdlog::logger> console;
 
         void encodeThread(int num);
         void diskThread(int num);
