@@ -94,11 +94,11 @@ struct TimeVal
 
 struct Options
 {
-	Options()
-	: hdmi_port(-1),                    /* ‑1 = let DRM decide   */
-		set_default_lens_position(false), af_on_capture(false),
-		keep16(false),                           // ← NEW default
-		options_("Valid options are", 120, 80), app_(nullptr)
+        Options()
+        : set_default_lens_position(false), af_on_capture(false),
+                hdmi_port(-1),                    /* ‑1 = let DRM decide   */
+                keep16(false),                           // ← NEW default
+                options_("Valid options are", 120, 80), app_(nullptr)
 	{
 		using namespace boost::program_options;
 		// clang-format off

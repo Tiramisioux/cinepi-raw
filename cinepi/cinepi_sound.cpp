@@ -121,26 +121,32 @@ uint64_t extractTime(const std::string& line) {
     return (seconds * 1e+9) + nanoseconds;
 }
 
-CinePISound::CinePISound(CinePIRecorder *app) : 
-    app_(app),
-    pid(-1),
-    abortThread_(false),
+CinePISound::CinePISound(CinePIRecorder *app) :
+    vu_meter({0, 0, 0, 0}),
+    samples_captured(0),
+    ts_start(0),
+    ts_first_buffer_b(0),
+    ts_first_buffer_a(0),
+    ts_close_file(0),
+    ts_end(0),
+    audioFormat("S16_LE"),
+    audioChannels(1),
+    audioSampleRate(FIXED_AUDIO_SAMPLE_RATE),
     arec_pipe(nullptr),
+    canRecordAudio(false),
+    defaultDevice(""),
+    console(nullptr),
+    pid(-1),
+    recording_(false),
+    record_(false),
+    app_(app),
+    options_(app->GetOptions()),
+    abortThread_(false),
+    monitor_pipe(nullptr),
     udev(nullptr),
     udev_dev(nullptr),
     udev_mon(nullptr),
-    udev_fd(-1),
-    vu_meter({0,0,0,0}),
-    samples_captured(0),
-    ts_first_buffer_b(0),
-    record_(false),
-    recording_(false),
-    canRecordAudio(false),
-    defaultDevice(""),
-    options_(app->GetOptions()),
-    audioSampleRate(FIXED_AUDIO_SAMPLE_RATE),
-    audioFormat("S16_LE"),
-    audioChannels(1)
+    udev_fd(-1)
 {
     console = spdlog::stdout_color_mt("cinepi_sound");
     console->set_level(spdlog::level::debug);  // or trace if you want even more
@@ -249,7 +255,7 @@ bool CinePISound::recording_ended() {
 }
 
 bool CinePISound::isRecording() {
-    return (recording_ && (ts_first_buffer_b > 0) || !canRecordAudio);
+    return (recording_ && ts_first_buffer_b > 0) || !canRecordAudio;
 }
 
 void CinePISound::detectRecordingDevices() {
@@ -274,7 +280,6 @@ void CinePISound::detectRecordingDevices() {
         canRecordAudio = false;
     } else {
         size_t start = result.find("card ");
-        size_t end = result.find(":", start);
         defaultDevice = "hw:" + result.substr(start + 5, 1) + ",0";
         canRecordAudio = true;
     }
@@ -323,8 +328,6 @@ void CinePISound::soundThread() {
 
             if (!std::filesystem::exists(filename)) break;
 
-            double audio_duration = samples_captured / static_cast<double>(audioSampleRate);
-
             int64_t vts_start = 0, vts_end = 0;
             int64_t frames = app_->GetEncoder()->timestamps.size();
             if (frames > 0) {
@@ -333,7 +336,7 @@ void CinePISound::soundThread() {
             }
 
             double vts_delta = (vts_end - vts_start) / 1e9;
-            if (vts_start < ts_first_buffer_b) {
+            if (vts_start < static_cast<int64_t>(ts_first_buffer_b)) {
                 console->critical("Frame start before audio!!!!");
                 return;
             }
