@@ -383,8 +383,7 @@ bool CinePiOptions::Parse(int argc, char *argv[])
         RawOptions::camPort = camPort;
 
         /* Log summary ------------------------------------------------- */
-        spdlog::info("cinepi-cli: camPort='{}'  hdmi_port={}  same_hdmi={}  zoom={}  crops={}"
-                     "crops={} rectangles",
+        spdlog::info("cinepi-cli: camPort='{}'  hdmi_port={}  same_hdmi={}  zoom={}  crops={} rectangles",
                      camPort,
                      hdmi_port,
                      same_hdmi ? "true" : "false",
