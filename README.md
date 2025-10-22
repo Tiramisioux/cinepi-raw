@@ -124,9 +124,29 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-rawâ
 | `--encode-nice <int>`     | `auto`  | Nice level for encode workers (`-20` = highest priority, `19` = lowest). |
 | `--disk-nice <int>`       | `auto`  | Nice level applied to disk workers. |
 
+### Sensor HDR controls
+
+Use the new sensor HDR helpers to configure the IMX585 dual-gain pipeline directly from `cinepi-raw` (and other `rpicam-apps` binaries):
+
+| Flag | Description |
+|------|-------------|
+| `--hdr=sensor` | Enable the sensor's HDR readout path. Combine with a 16-bit mode such as `--mode 3856:2180:16:U` to record the merged output. |
+| `--hdr-low-threshold <int>` | Override the low-gain selection threshold (`hdr_data_selection_threshold[0]`). |
+| `--hdr-high-threshold <int>` | Override the high-gain selection threshold (`hdr_data_selection_threshold[1]`). |
+| `--hdr-blending <int>` | Choose the sensor-side blending ratio (`hdr_data_blending_mode`). |
+| `--hdr-gain-adder <int>` | Apply the per-frame gain adder in dB (`hdr_gain_adder_db`). |
+
+Example: capture a 16-bit HDR frame tuned for high-gain priority
+
+```bash
+cinepi-raw --mode 3856:2180:16:U --hdr sensor \
+          --hdr-low-threshold 3000 --hdr-high-threshold 2000 \
+          --hdr-blending 3 --hdr-gain-adder 2
+```
+
 ## Manual DNG encoder
 
-- Manual writing of DNG tags. 
+- Manual writing of DNG tags.
 
 - Frames are written uncompressed, for simple I/O.
 

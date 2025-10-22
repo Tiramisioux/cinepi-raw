@@ -11,7 +11,9 @@
 #include <linux/v4l2-controls.h>
 #include <linux/videodev2.h>
 #include <map>
+#include <optional>
 #include <string>
+#include <vector>
 #include <sys/ioctl.h>
 
 #include <libcamera/formats.h>
@@ -104,29 +106,219 @@ static int xioctl(int fd, unsigned long ctl, void *arg)
 	return ret;
 }
 
-static bool set_subdev_hdr_ctrl(int en)
+struct SensorHdrConfig
 {
-	bool changed = false;
-	// Currently this does not exist in libcamera, so go directly to V4L2
-	// XXX it's not obvious which v4l2-subdev to use for which camera!
-	for (int i = 0; i < 8; i++)
-	{
-		std::string dev("/dev/v4l-subdev");
-		dev += (char)('0' + i);
-		int fd = open(dev.c_str(), O_RDWR, 0);
-		if (fd < 0)
-			continue;
+        bool enable;
+        std::optional<int> low_threshold;
+        std::optional<int> high_threshold;
+        std::optional<int> blending_mode;
+        std::optional<int> gain_adder_db;
+};
 
-		v4l2_control ctrl { V4L2_CID_WIDE_DYNAMIC_RANGE, en };
-		if (!xioctl(fd, VIDIOC_G_CTRL, &ctrl) && ctrl.value != en)
-		{
-			ctrl.value = en;
-			if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
-				changed = true;
-		}
-		close(fd);
-	}
-	return changed;
+static bool find_ext_control(int fd, const std::string &name, v4l2_query_ext_ctrl &query)
+{
+        memset(&query, 0, sizeof(query));
+        query.id = V4L2_CTRL_FLAG_NEXT_CTRL;
+        while (xioctl(fd, VIDIOC_QUERY_EXT_CTRL, &query) == 0)
+        {
+                if (!(query.flags & V4L2_CTRL_FLAG_DISABLED) &&
+                        name == reinterpret_cast<const char *>(query.name))
+                        return true;
+                query.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
+        }
+        return false;
+}
+
+static int clamp_to_range(const v4l2_query_ext_ctrl &query, int value)
+{
+        return static_cast<int>(std::clamp<int64_t>(value, query.minimum, query.maximum));
+}
+
+static bool set_simple_control(int fd, const v4l2_query_ext_ctrl &query, int value)
+{
+        if (query.flags & V4L2_CTRL_FLAG_READ_ONLY)
+                return false;
+
+        v4l2_control ctrl { static_cast<__u32>(query.id), 0 };
+        if (xioctl(fd, VIDIOC_G_CTRL, &ctrl))
+                return false;
+
+        int clamped = clamp_to_range(query, value);
+        if (ctrl.value == clamped)
+                return false;
+
+        ctrl.value = clamped;
+        if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
+                return true;
+
+        return false;
+}
+
+static bool set_hdr_thresholds(int fd, const v4l2_query_ext_ctrl &query,
+        const std::optional<int> &low, const std::optional<int> &high)
+{
+        if ((!low && !high) || (query.flags & V4L2_CTRL_FLAG_READ_ONLY) || !query.elems || !query.elem_size)
+                return false;
+
+        std::vector<uint8_t> buffer(query.elems * query.elem_size, 0);
+        v4l2_ext_control control {};
+        control.id = query.id;
+        control.size = buffer.size();
+        control.ptr = buffer.data();
+
+        v4l2_ext_controls controls {};
+        controls.which = V4L2_CTRL_WHICH_CUR_VAL;
+        controls.count = 1;
+        controls.controls = &control;
+
+        if (xioctl(fd, VIDIOC_G_EXT_CTRLS, &controls))
+                return false;
+
+        auto clamp_value = [&](int value) { return clamp_to_range(query, value); };
+
+        bool modified = false;
+        if (query.elem_size == sizeof(uint16_t))
+        {
+                auto data = reinterpret_cast<uint16_t *>(buffer.data());
+                if (low && query.elems >= 1)
+                {
+                        uint16_t new_val = static_cast<uint16_t>(clamp_value(*low));
+                        if (data[0] != new_val)
+                        {
+                                data[0] = new_val;
+                                modified = true;
+                        }
+                }
+                if (high && query.elems >= 2)
+                {
+                        uint16_t new_val = static_cast<uint16_t>(clamp_value(*high));
+                        if (data[1] != new_val)
+                        {
+                                data[1] = new_val;
+                                modified = true;
+                        }
+                }
+        }
+        else if (query.elem_size == sizeof(int32_t))
+        {
+                auto data = reinterpret_cast<int32_t *>(buffer.data());
+                if (low && query.elems >= 1)
+                {
+                        int32_t new_val = static_cast<int32_t>(clamp_value(*low));
+                        if (data[0] != new_val)
+                        {
+                                data[0] = new_val;
+                                modified = true;
+                        }
+                }
+                if (high && query.elems >= 2)
+                {
+                        int32_t new_val = static_cast<int32_t>(clamp_value(*high));
+                        if (data[1] != new_val)
+                        {
+                                data[1] = new_val;
+                                modified = true;
+                        }
+                }
+        }
+        else if (query.elem_size == sizeof(int64_t))
+        {
+                auto data = reinterpret_cast<int64_t *>(buffer.data());
+                if (low && query.elems >= 1)
+                {
+                        int64_t new_val = static_cast<int64_t>(clamp_value(*low));
+                        if (data[0] != new_val)
+                        {
+                                data[0] = new_val;
+                                modified = true;
+                        }
+                }
+                if (high && query.elems >= 2)
+                {
+                        int64_t new_val = static_cast<int64_t>(clamp_value(*high));
+                        if (data[1] != new_val)
+                        {
+                                data[1] = new_val;
+                                modified = true;
+                        }
+                }
+        }
+        else
+        {
+                return false;
+        }
+
+        if (!modified)
+                return false;
+
+        if (!xioctl(fd, VIDIOC_S_EXT_CTRLS, &controls))
+                return true;
+
+        return false;
+}
+
+static bool configure_sensor_hdr(const SensorHdrConfig &config, bool *enable_changed = nullptr)
+{
+        bool changed = false;
+        bool enable_toggled = false;
+        // Currently this does not exist in libcamera, so go directly to V4L2
+        // XXX it's not obvious which v4l2-subdev to use for which camera!
+        for (int i = 0; i < 8; i++)
+        {
+                std::string dev("/dev/v4l-subdev");
+                dev += (char)('0' + i);
+                int fd = open(dev.c_str(), O_RDWR, 0);
+                if (fd < 0)
+                        continue;
+
+                const int desired = config.enable ? 1 : 0;
+                v4l2_control ctrl { V4L2_CID_WIDE_DYNAMIC_RANGE, 0 };
+                if (!xioctl(fd, VIDIOC_G_CTRL, &ctrl) && ctrl.value != desired)
+                {
+                        ctrl.value = desired;
+                        if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
+                        {
+                                changed = true;
+                                enable_toggled = true;
+                        }
+                }
+
+                if (config.low_threshold || config.high_threshold)
+                {
+                        v4l2_query_ext_ctrl query {};
+                        if (find_ext_control(fd, "hdr_data_selection_threshold", query))
+                        {
+                                if (set_hdr_thresholds(fd, query, config.low_threshold, config.high_threshold))
+                                        changed = true;
+                        }
+                }
+
+                if (config.blending_mode)
+                {
+                        v4l2_query_ext_ctrl query {};
+                        if (find_ext_control(fd, "hdr_data_blending_mode", query))
+                        {
+                                if (set_simple_control(fd, query, *config.blending_mode))
+                                        changed = true;
+                        }
+                }
+
+                if (config.gain_adder_db)
+                {
+                        v4l2_query_ext_ctrl query {};
+                        if (find_ext_control(fd, "hdr_gain_adder_db", query))
+                        {
+                                if (set_simple_control(fd, query, *config.gain_adder_db))
+                                        changed = true;
+                        }
+                }
+
+                close(fd);
+        }
+
+        if (enable_changed)
+                *enable_changed = enable_toggled;
+        return changed;
 }
 
 bool Options::Parse(int argc, char *argv[])
@@ -198,8 +390,8 @@ bool Options::Parse(int argc, char *argv[])
 	// HDR control. Set the sensor control before opening or listing any cameras.
 	// Start by disabling HDR unconditionally. Reset the camera manager if we have
 	// actually switched the value of the control.
-	set_subdev_hdr_ctrl(0);
-	app_->initCameraManager();
+        configure_sensor_hdr({ false, std::nullopt, std::nullopt, std::nullopt, std::nullopt });
+        app_->initCameraManager();
 
 	// Unconditionally set the logging level to error for a bit.
 	libcamera::logSetLevel("*", "ERROR");
@@ -208,16 +400,24 @@ bool Options::Parse(int argc, char *argv[])
 	if (camera < cameras.size())
 	{
 		const std::string cam_id = *cameras[camera]->properties().get(libcamera::properties::Model);
-		if ((hdr == "sensor" || hdr == "auto") && cam_id == "imx708")
-		{
-			// Turn on sensor HDR.  Reset the camera manager if we have switched the value of the control.
-			if (set_subdev_hdr_ctrl(1))
-			{
-				cameras.clear();
-				app_->initCameraManager();
-				cameras = app_->GetCameras();
-			}
-			hdr = "sensor";
+                if ((hdr == "sensor" || hdr == "auto") && (cam_id == "imx708" || cam_id == "imx585"))
+                {
+                        SensorHdrConfig sensor_hdr { true,
+                                hdr_threshold_low >= 0 ? std::optional<int>(hdr_threshold_low) : std::nullopt,
+                                hdr_threshold_high >= 0 ? std::optional<int>(hdr_threshold_high) : std::nullopt,
+                                hdr_blending_mode >= 0 ? std::optional<int>(hdr_blending_mode) : std::nullopt,
+                                hdr_gain_adder_db >= 0 ? std::optional<int>(hdr_gain_adder_db) : std::nullopt };
+
+                        bool enable_changed = false;
+                        // Turn on sensor HDR.  Reset the camera manager if we have switched the value of the control.
+                        configure_sensor_hdr(sensor_hdr, &enable_changed);
+                        if (enable_changed)
+                        {
+                                cameras.clear();
+                                app_->initCameraManager();
+                                cameras = app_->GetCameras();
+                        }
+                        hdr = "sensor";
 		}
 	}
 
@@ -490,12 +690,20 @@ void Options::Print() const
 		std::cerr << "    flicker period: " << flicker_period.get() << "us" << std::endl;
 	std::cerr << "    ev: " << ev << std::endl;
 	std::cerr << "    awb: " << awb << std::endl;
-	if (awb_gain_r && awb_gain_b)
-		std::cerr << "    awb gains: red " << awb_gain_r << " blue " << awb_gain_b << std::endl;
-	std::cerr << "    flush: " << (flush ? "true" : "false") << std::endl;
-	std::cerr << "    wrap: " << wrap << std::endl;
-	std::cerr << "    brightness: " << brightness << std::endl;
-	std::cerr << "    contrast: " << contrast << std::endl;
+        if (awb_gain_r && awb_gain_b)
+                std::cerr << "    awb gains: red " << awb_gain_r << " blue " << awb_gain_b << std::endl;
+        std::cerr << "    flush: " << (flush ? "true" : "false") << std::endl;
+        std::cerr << "    wrap: " << wrap << std::endl;
+        if (hdr_threshold_low >= 0)
+                std::cerr << "    hdr-low-threshold: " << hdr_threshold_low << std::endl;
+        if (hdr_threshold_high >= 0)
+                std::cerr << "    hdr-high-threshold: " << hdr_threshold_high << std::endl;
+        if (hdr_blending_mode >= 0)
+                std::cerr << "    hdr-blending: " << hdr_blending_mode << std::endl;
+        if (hdr_gain_adder_db >= 0)
+                std::cerr << "    hdr-gain-adder: " << hdr_gain_adder_db << std::endl;
+        std::cerr << "    brightness: " << brightness << std::endl;
+        std::cerr << "    contrast: " << contrast << std::endl;
 	std::cerr << "    saturation: " << saturation << std::endl;
 	std::cerr << "    sharpness: " << sharpness << std::endl;
 	std::cerr << "    framerate: " << framerate.value_or(DEFAULT_FRAMERATE) << std::endl;

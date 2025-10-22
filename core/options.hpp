@@ -98,6 +98,8 @@ struct Options
         : set_default_lens_position(false), af_on_capture(false),
                 hdmi_port(-1),                    /* ‑1 = let DRM decide   */
                 keep16(false),                           // ← NEW default
+                hdr_threshold_low(-1), hdr_threshold_high(-1),
+                hdr_blending_mode(-1), hdr_gain_adder_db(-1),
                 options_("Valid options are", 120, 80), app_(nullptr)
 	{
 		using namespace boost::program_options;
@@ -205,10 +207,18 @@ struct Options
 			"Sets AfMetering to  AfMeteringWindows an set region used, e.g. 0.25,0.25,0.5,0.5")
 			("lens-position", value<std::string>(&lens_position_)->default_value(""),
 			 "Set the lens to a particular focus position, expressed as a reciprocal distance (0 moves the lens to infinity), or \"default\" for the hyperfocal distance")
-			("hdr", value<std::string>(&hdr)->default_value("off")->implicit_value("auto"),
-			 "Enable High Dynamic Range, where supported. Available values are \"off\", \"auto\", "
-			 "\"sensor\" for sensor HDR (e.g. for Camera Module 3), "
-			 "\"single-exp\" for PiSP based single exposure multiframe HDR")
+                        ("hdr", value<std::string>(&hdr)->default_value("off")->implicit_value("auto"),
+                         "Enable High Dynamic Range, where supported. Available values are \"off\", \"auto\", "
+                         "\"sensor\" for sensor HDR (e.g. for Camera Module 3), "
+                         "\"single-exp\" for PiSP based single exposure multiframe HDR")
+                        ("hdr-low-threshold", value<int>(&hdr_threshold_low)->default_value(-1),
+                         "Sensor HDR: set low-gain selection threshold (requires --hdr=sensor)")
+                        ("hdr-high-threshold", value<int>(&hdr_threshold_high)->default_value(-1),
+                         "Sensor HDR: set high-gain selection threshold (requires --hdr=sensor)")
+                        ("hdr-blending", value<int>(&hdr_blending_mode)->default_value(-1),
+                         "Sensor HDR: set blending mode (requires --hdr=sensor)")
+                        ("hdr-gain-adder", value<int>(&hdr_gain_adder_db)->default_value(-1),
+                         "Sensor HDR: set gain adder in dB (requires --hdr=sensor)")
 			("metadata", value<std::string>(&metadata),
 			 "Save captured image metadata to a file or \"-\" for stdout")
 			("metadata-format", value<std::string>(&metadata_format)->default_value("json"),
@@ -285,11 +295,15 @@ struct Options
 	std::optional<float> lens_position;
 	bool set_default_lens_position;
 	bool af_on_capture;
-	std::string metadata;
-	std::string metadata_format;
-	std::string hdr;
-	TimeVal<std::chrono::microseconds> flicker_period;
-	bool no_raw;
+        std::string metadata;
+        std::string metadata_format;
+        std::string hdr;
+        int hdr_threshold_low;
+        int hdr_threshold_high;
+        int hdr_blending_mode;
+        int hdr_gain_adder_db;
+        TimeVal<std::chrono::microseconds> flicker_period;
+        bool no_raw;
 
 	/** HDMI connector to use for the DRM preview.
 	 *  -1 = let libdrm pick      (default)
