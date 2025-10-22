@@ -207,7 +207,7 @@ struct Options
 			 "Set the lens to a particular focus position, expressed as a reciprocal distance (0 moves the lens to infinity), or \"default\" for the hyperfocal distance")
                         ("hdr", value<std::string>(&hdr)->default_value("off")->implicit_value("auto"),
                          "Enable High Dynamic Range, where supported. Available values are \"off\", \"auto\", "
-                         "\"sensor\" for sensor HDR (e.g. Camera Module 3 or IMX585), "
+                         "\"sensor\" for sensor HDR (e.g. Camera Module 3 or IMX585 colour/mono), "
                          "\"single-exp\" for PiSP based single exposure multiframe HDR")
 			("metadata", value<std::string>(&metadata),
 			 "Save captured image metadata to a file or \"-\" for stdout")
