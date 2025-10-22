@@ -104,8 +104,16 @@ static int xioctl(int fd, unsigned long ctl, void *arg)
 	return ret;
 }
 
-static bool set_subdev_hdr_ctrl(int en)
+enum class HdrCtrlResult
 {
+	Unsupported,
+	Unchanged,
+	Changed,
+};
+
+static HdrCtrlResult set_subdev_hdr_ctrl(int en)
+{
+	bool supported = false;
 	bool changed = false;
 	// Currently this does not exist in libcamera, so go directly to V4L2
 	// XXX it's not obvious which v4l2-subdev to use for which camera!
@@ -118,15 +126,21 @@ static bool set_subdev_hdr_ctrl(int en)
 			continue;
 
 		v4l2_control ctrl { V4L2_CID_WIDE_DYNAMIC_RANGE, en };
-		if (!xioctl(fd, VIDIOC_G_CTRL, &ctrl) && ctrl.value != en)
+		if (!xioctl(fd, VIDIOC_G_CTRL, &ctrl))
 		{
-			ctrl.value = en;
-			if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
-				changed = true;
+			supported = true;
+			if (ctrl.value != en)
+			{
+				ctrl.value = en;
+				if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
+					changed = true;
+			}
 		}
 		close(fd);
 	}
-	return changed;
+	if (!supported)
+		return HdrCtrlResult::Unsupported;
+	return changed ? HdrCtrlResult::Changed : HdrCtrlResult::Unchanged;
 }
 
 bool Options::Parse(int argc, char *argv[])
@@ -208,16 +222,23 @@ bool Options::Parse(int argc, char *argv[])
 	if (camera < cameras.size())
 	{
 		const std::string cam_id = *cameras[camera]->properties().get(libcamera::properties::Model);
-		if ((hdr == "sensor" || hdr == "auto") && cam_id == "imx708")
+		const bool is_imx585 = cam_id == "imx585" || cam_id == "imx585_mono";
+		if ((hdr == "sensor" || hdr == "auto") && (cam_id == "imx708" || is_imx585))
 		{
 			// Turn on sensor HDR.  Reset the camera manager if we have switched the value of the control.
-			if (set_subdev_hdr_ctrl(1))
+			HdrCtrlResult hdr_result = set_subdev_hdr_ctrl(1);
+			if (hdr_result == HdrCtrlResult::Unsupported)
+			{
+				LOG_ERROR("Sensor HDR requested but wide_dynamic_range control not found on any subdevice");
+			}
+			if (hdr_result == HdrCtrlResult::Changed)
 			{
 				cameras.clear();
 				app_->initCameraManager();
 				cameras = app_->GetCameras();
 			}
-			hdr = "sensor";
+			if (hdr_result != HdrCtrlResult::Unsupported)
+				hdr = "sensor";
 		}
 	}
 
