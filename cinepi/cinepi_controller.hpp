@@ -34,15 +34,15 @@ using namespace sw::redis;
 class CinePIController : public CinePIState
 {
     public:
-        CinePIController(CinePIRecorder *app) 
-            : CinePIState(), 
-            app_(app),
+        CinePIController(CinePIRecorder *app)
+            : CinePIState(),
             folderOpen(false),
             cameraRunning(false),
             trigger_(0),
-            options_(app->GetOptions()), 
-            cameraInit_(true), 
-            abortThread_(false) 
+            cameraInit_(true),
+            app_(app),
+            options_(app->GetOptions()),
+            abortThread_(false)
         {
             console = spdlog::stdout_color_mt("cinepi_controller");
         };

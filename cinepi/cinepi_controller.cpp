@@ -225,7 +225,6 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     {
         /* Derive once-per-run offset between MONOTONIC and REALTIME */
         using clk_sys  = std::chrono::system_clock;
-        using clk_mono = std::chrono::steady_clock;      // same epoch as SensorTimestamp
 
         static bool     have_offset   = false;
         static uint64_t boot0_ns      = 0;               // first sensor ts (ns)
