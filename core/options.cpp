@@ -6,6 +6,8 @@
  */
 #include <algorithm>
 #include <fcntl.h>
+#include <filesystem>
+#include <system_error>
 #include <iomanip>
 #include <iostream>
 #include <linux/v4l2-controls.h>
@@ -113,34 +115,43 @@ enum class HdrCtrlResult
 
 static HdrCtrlResult set_subdev_hdr_ctrl(int en)
 {
-	bool supported = false;
-	bool changed = false;
-	// Currently this does not exist in libcamera, so go directly to V4L2
-	// XXX it's not obvious which v4l2-subdev to use for which camera!
-	for (int i = 0; i < 8; i++)
-	{
-		std::string dev("/dev/v4l-subdev");
-		dev += (char)('0' + i);
-		int fd = open(dev.c_str(), O_RDWR, 0);
-		if (fd < 0)
-			continue;
+        bool supported = false;
+        bool changed = false;
+        std::error_code ec;
 
-		v4l2_control ctrl { V4L2_CID_WIDE_DYNAMIC_RANGE, en };
-		if (!xioctl(fd, VIDIOC_G_CTRL, &ctrl))
-		{
-			supported = true;
-			if (ctrl.value != en)
-			{
-				ctrl.value = en;
-				if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
-					changed = true;
-			}
-		}
-		close(fd);
-	}
-	if (!supported)
-		return HdrCtrlResult::Unsupported;
-	return changed ? HdrCtrlResult::Changed : HdrCtrlResult::Unchanged;
+        // Currently this does not exist in libcamera, so go directly to V4L2
+        // XXX it's not obvious which v4l2-subdev to use for which camera!
+        for (const auto &entry : std::filesystem::directory_iterator("/dev", ec))
+        {
+                if (ec)
+                        break;
+
+                const std::string name = entry.path().filename().string();
+                if (name.rfind("v4l-subdev", 0) != 0)
+                        continue;
+
+                const std::string dev = entry.path().string();
+                int fd = open(dev.c_str(), O_RDWR, 0);
+                if (fd < 0)
+                        continue;
+
+                v4l2_control ctrl { V4L2_CID_WIDE_DYNAMIC_RANGE, en };
+                if (!xioctl(fd, VIDIOC_G_CTRL, &ctrl))
+                {
+                        supported = true;
+                        if (ctrl.value != en)
+                        {
+                                ctrl.value = en;
+                                if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
+                                        changed = true;
+                        }
+                }
+                close(fd);
+        }
+
+        if (!supported)
+                return HdrCtrlResult::Unsupported;
+        return changed ? HdrCtrlResult::Changed : HdrCtrlResult::Unchanged;
 }
 
 bool Options::Parse(int argc, char *argv[])
