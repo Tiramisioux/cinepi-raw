@@ -23,6 +23,8 @@
 #include "core/logging.hpp"
 #include "core/version.hpp"
 
+class RPiCamApp;
+
 static constexpr double DEFAULT_FRAMERATE = 30.0;
 
 struct Mode
@@ -305,7 +307,8 @@ struct Options
 	void SetApp(RPiCamApp *app) { app_ = app; }
 
 protected:
-	boost::program_options::options_description options_;
+        boost::program_options::options_description options_;
+        RPiCamApp *GetApp() const { return app_; }
 
 private:
 	bool hflip_;
