@@ -5,13 +5,152 @@
 #include <boost/program_options.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <sstream>
+#include <string_view>
+#include <vector>
+
+#include "core/rpicam_app.hpp"
 
 using namespace boost::program_options;
+
+namespace
+{
+
+struct CamPortDetectionResult
+{
+        std::string port;
+        std::string source;
+};
+
+static std::optional<std::string> portFromIdString(const std::string &id)
+{
+        std::string lowered = id;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char ch) { return std::tolower(ch); });
+
+        const std::array<std::string_view, 4> tokens { "csiphy", "csi", "unicam", "cam" };
+
+        for (const auto &token : tokens)
+        {
+                std::size_t pos = lowered.find(token);
+                while (pos != std::string::npos)
+                {
+                        std::size_t digit = pos + token.size();
+                        while (digit < lowered.size() &&
+                               (lowered[digit] == '@' || lowered[digit] == '-' ||
+                                lowered[digit] == '_' || lowered[digit] == '/'))
+                                ++digit;
+
+                        if (digit < lowered.size() && std::isdigit(static_cast<unsigned char>(lowered[digit])))
+                                return std::string("cam") + lowered[digit];
+
+                        pos = lowered.find(token, pos + 1);
+                }
+        }
+
+        return std::nullopt;
+}
+
+static std::optional<CamPortDetectionResult>
+portFromCameraId(const std::shared_ptr<libcamera::Camera> &camera)
+{
+        if (!camera)
+                return std::nullopt;
+
+        if (auto port = portFromIdString(camera->id()))
+        {
+                return CamPortDetectionResult { *port, "camera id '" + camera->id() + "'" };
+        }
+
+        return std::nullopt;
+}
+
+static std::optional<CamPortDetectionResult> portFromDeviceTree()
+{
+        namespace fs = std::filesystem;
+        const std::array<std::string, 3> ports { "cam0", "cam1", "cam2" };
+        std::vector<std::string> active;
+
+        for (const auto &port : ports)
+        {
+                fs::path node = fs::path("/proc/device-tree") / port;
+                if (!fs::exists(node))
+                        continue;
+
+                bool connected = false;
+                const std::array<fs::path, 3> remote_candidates {
+                        node / "ports/port@0/endpoint@0/remote-endpoint",
+                        node / "ports/port@0/endpoint@1/remote-endpoint",
+                        node / "endpoint@0/remote-endpoint"
+                };
+
+                for (const auto &candidate : remote_candidates)
+                {
+                        if (fs::exists(candidate))
+                        {
+                                connected = true;
+                                break;
+                        }
+                }
+
+                if (!connected)
+                {
+                        fs::path status_path = node / "status";
+                        if (fs::exists(status_path))
+                        {
+                                std::ifstream status(status_path, std::ios::binary);
+                                std::string value((std::istreambuf_iterator<char>(status)),
+                                                 std::istreambuf_iterator<char>());
+                                value.erase(std::remove(value.begin(), value.end(), '\0'), value.end());
+                                std::transform(value.begin(), value.end(), value.begin(),
+                                               [](unsigned char ch) { return std::tolower(ch); });
+                                if (value.empty() || value == "okay")
+                                        connected = true;
+                        }
+                }
+
+                if (connected)
+                        active.push_back(port);
+        }
+
+        if (active.size() == 1)
+                return CamPortDetectionResult { active.front(), "device-tree probe" };
+
+        return std::nullopt;
+}
+
+static std::optional<CamPortDetectionResult>
+detectCamPort(RPiCamApp *app, unsigned int selected_index)
+{
+        if (!app)
+                return std::nullopt;
+
+        auto cameras = app->GetCameras();
+        if (selected_index < cameras.size())
+        {
+                if (auto matched = portFromCameraId(cameras[selected_index]))
+                        return matched;
+        }
+
+        if (cameras.size() == 1)
+        {
+                if (auto matched = portFromCameraId(cameras.front()))
+                        return matched;
+        }
+
+        return portFromDeviceTree();
+}
+
+} // namespace
 
 CinePiOptions::CinePiOptions()
         : RawOptions()
@@ -377,7 +516,19 @@ bool CinePiOptions::Parse(int argc, char *argv[])
 
         /* Derive default camPort if user left it blank */
         if (camPort.empty())
-                camPort = "cam" + std::to_string(camera);
+        {
+                if (auto detected = detectCamPort(GetApp(), camera))
+                {
+                        camPort = detected->port;
+                        spdlog::info("cinepi-cli: auto-detected camPort='{}' via {}",
+                                     camPort,
+                                     detected->source);
+                }
+                else
+                {
+                        camPort = "cam" + std::to_string(camera);
+                }
+        }
 
         /* Update base class member so utils see the correct value */
         RawOptions::camPort = camPort;
