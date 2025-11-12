@@ -50,6 +50,7 @@ private:
     bool tryAudioConfig(const std::string& device, const std::string& format, int channels, int rate);
     bool recording_ended();
     void generateXML(std::string fn);
+    void publishMicSelection();
 
 
 
