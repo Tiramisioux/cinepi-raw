@@ -4,6 +4,7 @@
 #include <boost/rational.hpp>
 #include <boost/numeric/conversion/cast.hpp>
 #include <fstream>
+#include <sys/wait.h>
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
 
@@ -110,6 +111,25 @@ int pclose2(FILE * fp, pid_t pid)
     return stat;
 }
 
+static int run_with_stderr_capture(const std::string& cmd, std::string& first_line) {
+    FILE* fp = popen((cmd + " 2>&1").c_str(), "r");
+    if (!fp) {
+        return -1;
+    }
+
+    char buf[256] = {0};
+    bool have_line = false;
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (!have_line) {
+            first_line = buf;
+            have_line = true;
+        }
+    }
+
+    int rc = pclose(fp);
+    return rc;
+}
+
 uint64_t extractTime(const std::string& line) {
     size_t colon_pos = line.find(':');
     size_t dot_pos = line.find('.');
@@ -172,17 +192,27 @@ void CinePISound::start() {
 }
 
 
-bool CinePISound::tryAudioConfig(const std::string& device, const std::string& format, int channels, int rate) {
+bool CinePISound::tryAudioConfig(const std::string& device, const std::string& format,
+                                 int channels, int rate)
+{
     std::ostringstream cmd;
     cmd << "arecord -D " << device
         << " -f " << format
         << " -c " << channels
         << " -r " << rate
-        << " -d 1 -t raw > /dev/null 2>&1";
+        << " -d 1 -t raw";
 
-    console->info("Trying device {} with format {}, channels {}: {}", device, format, channels, cmd.str());
-    int ret = std::system(cmd.str().c_str());
-    return WIFEXITED(ret) && WEXITSTATUS(ret) == 0;
+    std::string stderr_one;
+    int rc = run_with_stderr_capture(cmd.str(), stderr_one);
+    int exit_code = (rc >= 0 && WIFEXITED(rc)) ? WEXITSTATUS(rc) : -1;
+
+    if (exit_code == 0) {
+        console->info("Probe OK: {} (fmt {}, ch {}, {} Hz)", device, format, channels, rate);
+        return true;
+    } else {
+        console->debug("Probe FAILED rc={} : {} | {}", exit_code, cmd.str(), stderr_one);
+        return false;
+    }
 }
 
 void CinePISound::record_start() {
@@ -207,11 +237,16 @@ void CinePISound::record_start() {
 
     cmdStream.str("");
     cmdStream.clear();
-    cmdStream << "arecord -D " << defaultDevice
+    cmdStream << "arecord"
+              << " -D " << defaultDevice
               << " -f " << audioFormat
               << " -c " << audioChannels
               << " -r " << audioSampleRate
-              << " -t wav -V " << vu_mode << " " << filename << " 2>&1";
+              << " -t wav"
+              << " --disable-resample"
+              << " --disable-softvol"
+              << " -V " << vu_mode
+              << " " << filename << " 2>&1";
 
     console->info("Executing arecord: {}", cmdStream.str());
 
@@ -259,32 +294,24 @@ bool CinePISound::isRecording() {
 }
 
 void CinePISound::detectRecordingDevices() {
-    FILE* pipe = popen("arecord -l", "r");
-    if(!pipe) {
-        console->error("Failed to run arecord -l");
-        canRecordAudio = false;
-        return;
+    std::string list;
+    {
+        FILE* fp = popen("arecord -l 2>/dev/null", "r");
+        if (fp) {
+            char buf[512];
+            while (fgets(buf, sizeof(buf), fp)) {
+                list += buf;
+            }
+            pclose(fp);
+        }
     }
-
-    char buffer[128];
-    std::string result = "";
-    while(fgets(buffer, sizeof(buffer), pipe) != NULL) {
-        result += buffer;
-    }
-    pclose(pipe);
-
-    console->debug("{}", result);
-
-    if(result.find("card ") == std::string::npos) {
+    if (list.find("card ") == std::string::npos) {
         console->error("No recording devices detected!");
         canRecordAudio = false;
     } else {
-        size_t start = result.find("card ");
-        defaultDevice = "hw:" + result.substr(start + 5, 1) + ",0";
         canRecordAudio = true;
     }
-
-    console->debug("{}", defaultDevice);
+    console->debug("Audio device present: {}", canRecordAudio ? "yes" : "no");
 }
 
 void CinePISound::soundThread() {
@@ -465,44 +492,66 @@ std::string CinePISound::getPreferredMonitorOutput() {
 
 void CinePISound::parseHardwareParams() {
     audioSampleRate = FIXED_AUDIO_SAMPLE_RATE;
-    
-        if (tryAudioConfig("dsnoop_24bit", "S24_3LE", 2, audioSampleRate)) {
-            audioFormat = "S24_3LE";
-            audioChannels = 2;
-            defaultDevice = "mic_24bit";
-            canRecordAudio = true;
-            console->info("parseHardwareParams(): using dsnoop_24bit");
-        } else if (tryAudioConfig("dsnoop_16bit", "S16_LE", 1, audioSampleRate)) {
-            audioFormat = "S16_LE";
-            audioChannels = 1;
-            defaultDevice = "mic_16bit";
-            canRecordAudio = true;
-            console->info("parseHardwareParams(): using dsnoop_16bit");
-        } else {
-            audioFormat.clear();
-            defaultDevice.clear();
-            audioChannels = 0;
-            canRecordAudio = false;
-            console->error("parseHardwareParams(): no usable dsnoop device found");
-        }
-    
-        // Restart monitoring
-        if (monitor_pid > 0) {
-            kill(-monitor_pid, SIGTERM);
-            monitor_pid = -1;
-        }
-    
-        if (canRecordAudio) {
-            std::string outputDevice = getPreferredMonitorOutput();
-            std::ostringstream mon_cmd;
-            mon_cmd << "alsaloop -C " << defaultDevice
-                    << " -P " << outputDevice
-                    << " -t 10000 -A 1 -d";
-    
-            console->info("Starting audio monitoring: {}", mon_cmd.str());
-            monitor_pipe = popen2(mon_cmd.str(), "r", monitor_pid);
-        }
+
+    if (tryAudioConfig("mic_24bit", "S24_3LE", 2, audioSampleRate)) {
+        audioFormat    = "S24_3LE";
+        audioChannels  = 2;
+        defaultDevice  = "mic_24bit";
+        canRecordAudio = true;
+        console->info("parseHardwareParams(): using mic_24bit");
+    } else if (tryAudioConfig("mic_16bit", "S16_LE", 1, audioSampleRate)) {
+        audioFormat    = "S16_LE";
+        audioChannels  = 1;
+        defaultDevice  = "mic_16bit";
+        canRecordAudio = true;
+        console->info("parseHardwareParams(): using mic_16bit");
+    } else {
+        audioFormat.clear();
+        defaultDevice.clear();
+        audioChannels   = 0;
+        canRecordAudio  = false;
+        console->error("parseHardwareParams(): no usable mic_* alias found");
     }
+
+    if (canRecordAudio) {
+        publishMicSelection();
+    }
+
+    if (monitor_pid > 0) {
+        kill(-monitor_pid, SIGTERM);
+        if (monitor_pipe) {
+            pclose2(monitor_pipe, monitor_pid);
+            monitor_pipe = nullptr;
+        }
+        monitor_pid = -1;
+    }
+
+    if (canRecordAudio) {
+        std::string outputDevice = getPreferredMonitorOutput();
+        std::ostringstream mon_cmd;
+        mon_cmd << "alsaloop -C " << defaultDevice
+                << " -P " << outputDevice
+                << " -t 10000 -A 1 -d";
+        console->info("Starting audio monitoring: {}", mon_cmd.str());
+        monitor_pipe = popen2(mon_cmd.str(), "r", monitor_pid);
+    }
+}
+
+void CinePISound::publishMicSelection() {
+    if (!canRecordAudio) {
+        return;
+    }
+
+    std::ostringstream rc;
+    rc << "redis-cli MSET "
+       << "MIC_PCM_ALIAS " << defaultDevice << ' '
+       << "MIC_FORMAT " << audioFormat << ' '
+       << "MIC_CHANNELS " << audioChannels << ' '
+       << "MIC_RATE " << audioSampleRate;
+    int r = std::system(rc.str().c_str());
+    int code = (r >= 0 && WIFEXITED(r)) ? WEXITSTATUS(r) : -1;
+    console->debug("Published MIC_* to Redis (rc={})", code);
+}
 
 
 void CinePISound::init_udev() {
