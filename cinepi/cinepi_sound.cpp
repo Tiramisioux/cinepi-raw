@@ -113,6 +113,42 @@ int pclose2(FILE * fp, pid_t pid)
 
 static int run_with_stderr_capture(const std::string& cmd, std::string& first_line) {
     FILE* fp = popen((cmd + " 2>&1").c_str(), "r");
+    if (!fp) {
+        return -1;
+    }
+
+    std::string line_buf;
+    char buf[1024];
+    bool have_line = false;
+
+    while (true) {
+        size_t n = fread(buf, 1, sizeof(buf), fp);
+        if (n == 0) {
+            if (feof(fp) || ferror(fp)) {
+                break;
+            }
+        } else if (!have_line) {
+            line_buf.append(buf, n);
+            auto pos = line_buf.find('\n');
+            if (pos != std::string::npos) {
+                first_line = line_buf.substr(0, pos);
+                have_line = true;
+            } else if (line_buf.size() > 1024) {
+                first_line = line_buf;
+                have_line = true;
+            }
+        }
+    }
+
+    if (have_line) {
+        while (!first_line.empty() && (first_line.back() == '\r' || first_line.back() == '\n')) {
+            first_line.pop_back();
+        }
+    } else {
+        first_line.clear();
+    }
+
+    return pclose(fp);
     if (!fp) return -1;
     char buf[256] = {0};
     if (fgets(buf, sizeof(buf), fp)) first_line = buf;
@@ -191,6 +227,18 @@ bool CinePISound::tryAudioConfig(const std::string& device, const std::string& f
         << " -c " << channels
         << " -r " << rate
         << " -d 1 -t raw";
+
+    std::string stderr_one;
+    int rc = run_with_stderr_capture(cmd.str(), stderr_one);
+    int exit_code = -1;
+    if (rc >= 0) {
+        if (WIFEXITED(rc)) {
+            exit_code = WEXITSTATUS(rc);
+        } else if (WIFSIGNALED(rc)) {
+            exit_code = 128 + WTERMSIG(rc);
+        }
+    }
+
 
     std::string stderr_one;
     int rc = run_with_stderr_capture(cmd.str(), stderr_one);
