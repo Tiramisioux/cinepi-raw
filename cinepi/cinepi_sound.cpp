@@ -113,19 +113,9 @@ int pclose2(FILE * fp, pid_t pid)
 
 static int run_with_stderr_capture(const std::string& cmd, std::string& first_line) {
     FILE* fp = popen((cmd + " 2>&1").c_str(), "r");
-    if (!fp) {
-        return -1;
-    }
-
+    if (!fp) return -1;
     char buf[256] = {0};
-    bool have_line = false;
-    while (fgets(buf, sizeof(buf), fp)) {
-        if (!have_line) {
-            first_line = buf;
-            have_line = true;
-        }
-    }
-
+    if (fgets(buf, sizeof(buf), fp)) first_line = buf;
     int rc = pclose(fp);
     return rc;
 }
