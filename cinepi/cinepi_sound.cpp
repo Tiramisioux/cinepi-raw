@@ -149,11 +149,6 @@ static int run_with_stderr_capture(const std::string& cmd, std::string& first_li
     }
 
     return pclose(fp);
-    if (!fp) return -1;
-    char buf[256] = {0};
-    if (fgets(buf, sizeof(buf), fp)) first_line = buf;
-    int rc = pclose(fp);
-    return rc;
 }
 
 uint64_t extractTime(const std::string& line) {
@@ -238,11 +233,6 @@ bool CinePISound::tryAudioConfig(const std::string& device, const std::string& f
             exit_code = 128 + WTERMSIG(rc);
         }
     }
-
-
-    std::string stderr_one;
-    int rc = run_with_stderr_capture(cmd.str(), stderr_one);
-    int exit_code = (rc >= 0 && WIFEXITED(rc)) ? WEXITSTATUS(rc) : -1;
 
     if (exit_code == 0) {
         console->info("Probe OK: {} (fmt {}, ch {}, {} Hz)", device, format, channels, rate);
