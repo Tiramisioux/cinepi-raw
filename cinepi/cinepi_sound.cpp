@@ -427,7 +427,10 @@ void CinePISound::soundThread() {
     init_udev();
 
     while (!abortThread_) {
-        if (record_ && (pid > 0)) {
+        // Always drain the arecord pipe until the child exits, even after record_stop()
+        // clears the record_ flag. Otherwise the pipe would never be closed and the WAV
+        // file would remain incomplete/unwritten, resulting in 0 WAV clips.
+        if (pid > 0) {
             char buffer[256];
             std::string result = "";
             while (fgets(buffer, sizeof(buffer), arec_pipe) != NULL) {
