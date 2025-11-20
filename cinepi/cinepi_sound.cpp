@@ -4,6 +4,8 @@
 #include <boost/rational.hpp>
 #include <boost/numeric/conversion/cast.hpp>
 #include <fstream>
+#include <regex>
+#include <unordered_set>
 #include <sys/wait.h>
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
@@ -184,6 +186,7 @@ CinePISound::CinePISound(CinePIRecorder *app) :
     options_(app->GetOptions()),
     abortThread_(false),
     monitor_pipe(nullptr),
+    monitoring_(false),
     udev(nullptr),
     udev_dev(nullptr),
     udev_mon(nullptr),
@@ -251,6 +254,8 @@ void CinePISound::record_start() {
         return;
     }
 
+    stopMonitoring();
+
     std::ostringstream oss;
     oss << options_->mediaDest << '/' << options_->folder << '/' << options_->folder << ".wav";
     std::string filename = oss.str();
@@ -306,6 +311,10 @@ void CinePISound::record_stop() {
         kill(-pid, SIGTERM); // Send to full process group
     }
     console->info("Sound recording stopped.");
+
+    if (canRecordAudio) {
+        startMonitoring();
+    }
 }
 
 bool CinePISound::recording_ended() {
@@ -340,6 +349,70 @@ void CinePISound::detectRecordingDevices() {
         canRecordAudio = true;
     }
     console->debug("Audio device present: {}", canRecordAudio ? "yes" : "no");
+}
+
+void CinePISound::stopMonitoring() {
+    if (monitor_pid > 0) {
+        kill(-monitor_pid, SIGTERM);
+        if (monitor_pipe) {
+            pclose2(monitor_pipe, monitor_pid);
+            monitor_pipe = nullptr;
+        }
+        monitor_pid = -1;
+        monitoring_ = false;
+        console->info("Stopped audio monitoring");
+    }
+}
+
+void CinePISound::startMonitoring() {
+    if (!canRecordAudio || recording_ || record_ || monitoring_) {
+        return;
+    }
+
+    std::string outputDevice = getPreferredMonitorOutput();
+    std::ostringstream mon_cmd;
+    mon_cmd << "alsaloop -C " << defaultDevice
+            << " -P " << outputDevice
+            << " -t 10000 -A 1 -d";
+    console->info("Starting audio monitoring: {}", mon_cmd.str());
+    monitor_pipe = popen2(mon_cmd.str(), "r", monitor_pid);
+    if (monitor_pid > 0 && monitor_pipe) {
+        monitoring_ = true;
+    }
+}
+
+std::vector<std::string> CinePISound::parseArecordAliases() {
+    std::vector<std::string> aliases;
+    std::unordered_set<std::string> seen;
+    FILE* fp = popen("arecord -l 2>/dev/null", "r");
+    if (!fp) {
+        console->warn("parseArecordAliases(): failed to run arecord -l");
+        return aliases;
+    }
+
+    std::regex re(R"(card\s+(\d+):.*device\s+(\d+):)");
+    char buf[512];
+    while (fgets(buf, sizeof(buf), fp)) {
+        std::cmatch match;
+        if (std::regex_search(buf, match, re)) {
+            std::string card = match[1];
+            std::string device = match[2];
+            for (const auto& prefix : {"plughw:", "hw:"}) {
+                std::string alias = std::string(prefix) + card + "," + device;
+                if (!seen.count(alias)) {
+                    aliases.push_back(alias);
+                    seen.insert(alias);
+                }
+            }
+        }
+    }
+    pclose(fp);
+
+    console->debug("parseArecordAliases(): discovered {} aliases", aliases.size());
+    for (const auto& alias : aliases) {
+        console->debug("  alias: {}", alias);
+    }
+    return aliases;
 }
 
 void CinePISound::soundThread() {
@@ -521,6 +594,11 @@ std::string CinePISound::getPreferredMonitorOutput() {
 void CinePISound::parseHardwareParams() {
     audioSampleRate = FIXED_AUDIO_SAMPLE_RATE;
 
+    audioFormat.clear();
+    defaultDevice.clear();
+    audioChannels  = 0;
+    canRecordAudio = false;
+
     if (tryAudioConfig("mic_24bit", "S24_3LE", 2, audioSampleRate)) {
         audioFormat    = "S24_3LE";
         audioChannels  = 2;
@@ -534,34 +612,34 @@ void CinePISound::parseHardwareParams() {
         canRecordAudio = true;
         console->info("parseHardwareParams(): using mic_16bit");
     } else {
-        audioFormat.clear();
-        defaultDevice.clear();
-        audioChannels   = 0;
-        canRecordAudio  = false;
-        console->error("parseHardwareParams(): no usable mic_* alias found");
+        auto aliases = parseArecordAliases();
+        for (const auto& alias : aliases) {
+            for (int channels : {1, 2}) {
+                if (tryAudioConfig(alias, "S16_LE", channels, audioSampleRate)) {
+                    audioFormat    = "S16_LE";
+                    audioChannels  = channels;
+                    defaultDevice  = alias;
+                    canRecordAudio = true;
+                    console->info("parseHardwareParams(): using fallback alias {} ({} ch)",
+                                  alias, channels);
+                    break;
+                }
+            }
+            if (canRecordAudio) break;
+        }
+        if (!canRecordAudio) {
+            console->error("parseHardwareParams(): no usable audio devices after probing aliases");
+        }
     }
 
     if (canRecordAudio) {
         publishMicSelection();
     }
 
-    if (monitor_pid > 0) {
-        kill(-monitor_pid, SIGTERM);
-        if (monitor_pipe) {
-            pclose2(monitor_pipe, monitor_pid);
-            monitor_pipe = nullptr;
-        }
-        monitor_pid = -1;
-    }
+    stopMonitoring();
 
     if (canRecordAudio) {
-        std::string outputDevice = getPreferredMonitorOutput();
-        std::ostringstream mon_cmd;
-        mon_cmd << "alsaloop -C " << defaultDevice
-                << " -P " << outputDevice
-                << " -t 10000 -A 1 -d";
-        console->info("Starting audio monitoring: {}", mon_cmd.str());
-        monitor_pipe = popen2(mon_cmd.str(), "r", monitor_pid);
+        startMonitoring();
     }
 }
 
