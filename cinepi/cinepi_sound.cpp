@@ -242,6 +242,8 @@ bool CinePISound::tryAudioConfig(const std::string& device, const std::string& f
         return true;
     } else {
         console->debug("Probe FAILED rc={} : {} | {}", exit_code, cmd.str(), stderr_one);
+        console->warn("Audio probe failed for {} (fmt {}, ch {}, {} Hz): {}", device, format, channels, rate,
+                     stderr_one.empty() ? "no error output" : stderr_one);
         return false;
     }
 }
@@ -276,7 +278,6 @@ void CinePISound::record_start() {
               << " -c " << audioChannels
               << " -r " << audioSampleRate
               << " -t wav"
-              << " --disable-resample"
               << " --disable-softvol"
               << " -V " << vu_mode
               << " " << filename << " 2>&1";
@@ -384,8 +385,6 @@ void CinePISound::startMonitoring() {
 std::vector<std::string> CinePISound::parseArecordAliases() {
     std::vector<std::string> aliases;
     std::unordered_set<std::string> seen;
-std::vector<std::string> CinePISound::parseArecordAliases() {
-    std::vector<std::string> aliases;
     FILE* fp = popen("arecord -l 2>/dev/null", "r");
     if (!fp) {
         console->warn("parseArecordAliases(): failed to run arecord -l");
@@ -401,21 +400,14 @@ std::vector<std::string> CinePISound::parseArecordAliases() {
             std::string device = match[2];
             for (const auto& prefix : {"plughw:", "hw:"}) {
                 std::string alias = std::string(prefix) + card + "," + device;
-                if (!seen.count(alias)) {
+                if (seen.insert(alias).second) {
                     aliases.push_back(alias);
-                    seen.insert(alias);
                 }
             }
-            aliases.push_back("plughw:" + card + "," + device);
-            aliases.push_back("hw:" + card + "," + device);
         }
     }
     pclose(fp);
 
-    console->debug("parseArecordAliases(): discovered {} aliases", aliases.size());
-    for (const auto& alias : aliases) {
-        console->debug("  alias: {}", alias);
-    }
     std::sort(aliases.begin(), aliases.end());
     aliases.erase(std::unique(aliases.begin(), aliases.end()), aliases.end());
 
@@ -427,7 +419,10 @@ void CinePISound::soundThread() {
     init_udev();
 
     while (!abortThread_) {
-        if (record_ && (pid > 0)) {
+        // Always drain the arecord pipe until the child exits, even after record_stop()
+        // clears the record_ flag. Otherwise the pipe would never be closed and the WAV
+        // file would remain incomplete/unwritten, resulting in 0 WAV clips.
+        if (pid > 0) {
             char buffer[256];
             std::string result = "";
             while (fgets(buffer, sizeof(buffer), arec_pipe) != NULL) {
