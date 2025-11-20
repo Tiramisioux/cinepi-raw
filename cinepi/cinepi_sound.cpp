@@ -5,7 +5,6 @@
 #include <boost/numeric/conversion/cast.hpp>
 #include <fstream>
 #include <regex>
-#include <unordered_set>
 #include <sys/wait.h>
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
@@ -346,7 +345,6 @@ void CinePISound::detectRecordingDevices() {
 
 std::vector<std::string> CinePISound::parseArecordAliases() {
     std::vector<std::string> aliases;
-    std::unordered_set<std::string> seen;
     FILE* fp = popen("arecord -l 2>/dev/null", "r");
     if (!fp) {
         console->warn("parseArecordAliases(): failed to run arecord -l");
@@ -360,21 +358,16 @@ std::vector<std::string> CinePISound::parseArecordAliases() {
         if (std::regex_search(buf, match, re)) {
             std::string card = match[1];
             std::string device = match[2];
-            for (const auto& prefix : {"plughw:", "hw:"}) {
-                std::string alias = std::string(prefix) + card + "," + device;
-                if (!seen.count(alias)) {
-                    aliases.push_back(alias);
-                    seen.insert(alias);
-                }
-            }
+            aliases.push_back("plughw:" + card + "," + device);
+            aliases.push_back("hw:" + card + "," + device);
         }
     }
     pclose(fp);
 
+    std::sort(aliases.begin(), aliases.end());
+    aliases.erase(std::unique(aliases.begin(), aliases.end()), aliases.end());
+
     console->debug("parseArecordAliases(): discovered {} aliases", aliases.size());
-    for (const auto& alias : aliases) {
-        console->debug("  alias: {}", alias);
-    }
     return aliases;
 }
 
