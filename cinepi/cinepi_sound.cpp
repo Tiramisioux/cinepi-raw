@@ -5,6 +5,7 @@
 #include <boost/numeric/conversion/cast.hpp>
 #include <fstream>
 #include <regex>
+#include <unordered_set>
 #include <sys/wait.h>
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
@@ -185,6 +186,7 @@ CinePISound::CinePISound(CinePIRecorder *app) :
     options_(app->GetOptions()),
     abortThread_(false),
     monitor_pipe(nullptr),
+    monitoring_(false),
     udev(nullptr),
     udev_dev(nullptr),
     udev_mon(nullptr),
@@ -252,6 +254,8 @@ void CinePISound::record_start() {
         return;
     }
 
+    stopMonitoring();
+
     std::ostringstream oss;
     oss << options_->mediaDest << '/' << options_->folder << '/' << options_->folder << ".wav";
     std::string filename = oss.str();
@@ -307,6 +311,10 @@ void CinePISound::record_stop() {
         kill(-pid, SIGTERM); // Send to full process group
     }
     console->info("Sound recording stopped.");
+
+    if (canRecordAudio) {
+        startMonitoring();
+    }
 }
 
 bool CinePISound::recording_ended() {
@@ -343,6 +351,39 @@ void CinePISound::detectRecordingDevices() {
     console->debug("Audio device present: {}", canRecordAudio ? "yes" : "no");
 }
 
+void CinePISound::stopMonitoring() {
+    if (monitor_pid > 0) {
+        kill(-monitor_pid, SIGTERM);
+        if (monitor_pipe) {
+            pclose2(monitor_pipe, monitor_pid);
+            monitor_pipe = nullptr;
+        }
+        monitor_pid = -1;
+        monitoring_ = false;
+        console->info("Stopped audio monitoring");
+    }
+}
+
+void CinePISound::startMonitoring() {
+    if (!canRecordAudio || recording_ || record_ || monitoring_) {
+        return;
+    }
+
+    std::string outputDevice = getPreferredMonitorOutput();
+    std::ostringstream mon_cmd;
+    mon_cmd << "alsaloop -C " << defaultDevice
+            << " -P " << outputDevice
+            << " -t 10000 -A 1 -d";
+    console->info("Starting audio monitoring: {}", mon_cmd.str());
+    monitor_pipe = popen2(mon_cmd.str(), "r", monitor_pid);
+    if (monitor_pid > 0 && monitor_pipe) {
+        monitoring_ = true;
+    }
+}
+
+std::vector<std::string> CinePISound::parseArecordAliases() {
+    std::vector<std::string> aliases;
+    std::unordered_set<std::string> seen;
 std::vector<std::string> CinePISound::parseArecordAliases() {
     std::vector<std::string> aliases;
     FILE* fp = popen("arecord -l 2>/dev/null", "r");
@@ -358,12 +399,23 @@ std::vector<std::string> CinePISound::parseArecordAliases() {
         if (std::regex_search(buf, match, re)) {
             std::string card = match[1];
             std::string device = match[2];
+            for (const auto& prefix : {"plughw:", "hw:"}) {
+                std::string alias = std::string(prefix) + card + "," + device;
+                if (!seen.count(alias)) {
+                    aliases.push_back(alias);
+                    seen.insert(alias);
+                }
+            }
             aliases.push_back("plughw:" + card + "," + device);
             aliases.push_back("hw:" + card + "," + device);
         }
     }
     pclose(fp);
 
+    console->debug("parseArecordAliases(): discovered {} aliases", aliases.size());
+    for (const auto& alias : aliases) {
+        console->debug("  alias: {}", alias);
+    }
     std::sort(aliases.begin(), aliases.end());
     aliases.erase(std::unique(aliases.begin(), aliases.end()), aliases.end());
 
@@ -592,23 +644,10 @@ void CinePISound::parseHardwareParams() {
         publishMicSelection();
     }
 
-    if (monitor_pid > 0) {
-        kill(-monitor_pid, SIGTERM);
-        if (monitor_pipe) {
-            pclose2(monitor_pipe, monitor_pid);
-            monitor_pipe = nullptr;
-        }
-        monitor_pid = -1;
-    }
+    stopMonitoring();
 
     if (canRecordAudio) {
-        std::string outputDevice = getPreferredMonitorOutput();
-        std::ostringstream mon_cmd;
-        mon_cmd << "alsaloop -C " << defaultDevice
-                << " -P " << outputDevice
-                << " -t 10000 -A 1 -d";
-        console->info("Starting audio monitoring: {}", mon_cmd.str());
-        monitor_pipe = popen2(mon_cmd.str(), "r", monitor_pid);
+        startMonitoring();
     }
 }
 

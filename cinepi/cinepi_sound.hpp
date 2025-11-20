@@ -54,6 +54,8 @@ private:
     void generateXML(std::string fn);
     void publishMicSelection();
     std::vector<std::string> parseArecordAliases();
+    void stopMonitoring();
+    void startMonitoring();
 
 
 
@@ -80,6 +82,7 @@ private:
     std::string getPreferredMonitorOutput();
     int monitor_pid = -1;
     FILE* monitor_pipe = nullptr;
+    bool monitoring_ = false;
 
     struct udev *udev;
     struct udev_device *udev_dev;
