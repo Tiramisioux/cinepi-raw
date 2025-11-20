@@ -4,6 +4,8 @@
 #include <boost/rational.hpp>
 #include <boost/numeric/conversion/cast.hpp>
 #include <fstream>
+#include <regex>
+#include <unordered_set>
 #include <sys/wait.h>
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
@@ -342,6 +344,40 @@ void CinePISound::detectRecordingDevices() {
     console->debug("Audio device present: {}", canRecordAudio ? "yes" : "no");
 }
 
+std::vector<std::string> CinePISound::parseArecordAliases() {
+    std::vector<std::string> aliases;
+    std::unordered_set<std::string> seen;
+    FILE* fp = popen("arecord -l 2>/dev/null", "r");
+    if (!fp) {
+        console->warn("parseArecordAliases(): failed to run arecord -l");
+        return aliases;
+    }
+
+    std::regex re(R"(card\s+(\d+):.*device\s+(\d+):)");
+    char buf[512];
+    while (fgets(buf, sizeof(buf), fp)) {
+        std::cmatch match;
+        if (std::regex_search(buf, match, re)) {
+            std::string card = match[1];
+            std::string device = match[2];
+            for (const auto& prefix : {"plughw:", "hw:"}) {
+                std::string alias = std::string(prefix) + card + "," + device;
+                if (!seen.count(alias)) {
+                    aliases.push_back(alias);
+                    seen.insert(alias);
+                }
+            }
+        }
+    }
+    pclose(fp);
+
+    console->debug("parseArecordAliases(): discovered {} aliases", aliases.size());
+    for (const auto& alias : aliases) {
+        console->debug("  alias: {}", alias);
+    }
+    return aliases;
+}
+
 void CinePISound::soundThread() {
     init_udev();
 
@@ -521,6 +557,11 @@ std::string CinePISound::getPreferredMonitorOutput() {
 void CinePISound::parseHardwareParams() {
     audioSampleRate = FIXED_AUDIO_SAMPLE_RATE;
 
+    audioFormat.clear();
+    defaultDevice.clear();
+    audioChannels  = 0;
+    canRecordAudio = false;
+
     if (tryAudioConfig("mic_24bit", "S24_3LE", 2, audioSampleRate)) {
         audioFormat    = "S24_3LE";
         audioChannels  = 2;
@@ -534,11 +575,24 @@ void CinePISound::parseHardwareParams() {
         canRecordAudio = true;
         console->info("parseHardwareParams(): using mic_16bit");
     } else {
-        audioFormat.clear();
-        defaultDevice.clear();
-        audioChannels   = 0;
-        canRecordAudio  = false;
-        console->error("parseHardwareParams(): no usable mic_* alias found");
+        auto aliases = parseArecordAliases();
+        for (const auto& alias : aliases) {
+            for (int channels : {1, 2}) {
+                if (tryAudioConfig(alias, "S16_LE", channels, audioSampleRate)) {
+                    audioFormat    = "S16_LE";
+                    audioChannels  = channels;
+                    defaultDevice  = alias;
+                    canRecordAudio = true;
+                    console->info("parseHardwareParams(): using fallback alias {} ({} ch)",
+                                  alias, channels);
+                    break;
+                }
+            }
+            if (canRecordAudio) break;
+        }
+        if (!canRecordAudio) {
+            console->error("parseHardwareParams(): no usable audio devices after probing aliases");
+        }
     }
 
     if (canRecordAudio) {
