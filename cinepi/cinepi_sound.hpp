@@ -1,15 +1,17 @@
 #pragma once
 
-#include <iostream>
-#include <cstdio>
-#include <cstdlib>
-#include <csignal>
-#include <sstream>
+#include <array>
 #include <chrono>
-#include <sys/wait.h>
+#include <cstdio>
+#include <csignal>
+#include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <regex>
+#include <sstream>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 
 #include <thread>
 #include <pthread.h>
@@ -51,6 +53,9 @@ private:
     bool recording_ended();
     void generateXML(std::string fn);
     void publishMicSelection();
+    std::vector<std::string> parseArecordAliases();
+    void stopMonitoring();
+    void startMonitoring();
 
 
 
@@ -77,6 +82,7 @@ private:
     std::string getPreferredMonitorOutput();
     int monitor_pid = -1;
     FILE* monitor_pipe = nullptr;
+    bool monitoring_ = false;
 
     struct udev *udev;
     struct udev_device *udev_dev;
