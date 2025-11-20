@@ -167,6 +167,8 @@ nano ~/.asoundrc
 
 ```bash
 
+    # Replace "Device" with the stable card name from `arecord -l`
+    # If your microphone is mono-only, set channels to 1 and use S16_LE
     pcm.dsnoop_24bit {
         type dsnoop
         ipc_key 2048
@@ -202,6 +204,9 @@ nano ~/.asoundrc
         type plug
         slave.pcm "dsnoop_16bit"
     }
+
+- Make sure the `pcm "hw:Device,0"` line matches your actual card name (e.g., "hw:USB", "hw:NTG").
+- Set `channels`/`format` to what the mic supports; a mono 16‑bit mic should use the `dsnoop_16bit` values, otherwise `arecord` will fail and no WAV is produced.
 
 ```
 

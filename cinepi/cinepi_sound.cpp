@@ -242,6 +242,8 @@ bool CinePISound::tryAudioConfig(const std::string& device, const std::string& f
         return true;
     } else {
         console->debug("Probe FAILED rc={} : {} | {}", exit_code, cmd.str(), stderr_one);
+        console->warn("Audio probe failed for {} (fmt {}, ch {}, {} Hz): {}", device, format, channels, rate,
+                     stderr_one.empty() ? "no error output" : stderr_one);
         return false;
     }
 }
@@ -276,7 +278,6 @@ void CinePISound::record_start() {
               << " -c " << audioChannels
               << " -r " << audioSampleRate
               << " -t wav"
-              << " --disable-resample"
               << " --disable-softvol"
               << " -V " << vu_mode
               << " " << filename << " 2>&1";
@@ -427,7 +428,10 @@ void CinePISound::soundThread() {
     init_udev();
 
     while (!abortThread_) {
-        if (record_ && (pid > 0)) {
+        // Always drain the arecord pipe until the child exits, even after record_stop()
+        // clears the record_ flag. Otherwise the pipe would never be closed and the WAV
+        // file would remain incomplete/unwritten, resulting in 0 WAV clips.
+        if (pid > 0) {
             char buffer[256];
             std::string result = "";
             while (fgets(buffer, sizeof(buffer), arec_pipe) != NULL) {
