@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
+constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
 
 constexpr double AUDIO_TRIM_OFFSET_MS = 120.0; // milliseconds
 
@@ -595,44 +596,55 @@ std::string CinePISound::getPreferredMonitorOutput() {
 }
 
 void CinePISound::parseHardwareParams() {
-    audioSampleRate = FIXED_AUDIO_SAMPLE_RATE;
-
     audioFormat.clear();
     defaultDevice.clear();
     audioChannels  = 0;
     canRecordAudio = false;
 
-    if (tryAudioConfig("mic_24bit", "S24_3LE", 2, audioSampleRate)) {
-        audioFormat    = "S24_3LE";
-        audioChannels  = 2;
-        defaultDevice  = "mic_24bit";
-        canRecordAudio = true;
-        console->info("parseHardwareParams(): using mic_24bit");
-    } else if (tryAudioConfig("mic_16bit", "S16_LE", 1, audioSampleRate)) {
-        audioFormat    = "S16_LE";
-        audioChannels  = 1;
-        defaultDevice  = "mic_16bit";
-        canRecordAudio = true;
-        console->info("parseHardwareParams(): using mic_16bit");
-    } else {
-        auto aliases = parseArecordAliases();
-        for (const auto& alias : aliases) {
-            for (int channels : {1, 2}) {
-                if (tryAudioConfig(alias, "S16_LE", channels, audioSampleRate)) {
-                    audioFormat    = "S16_LE";
-                    audioChannels  = channels;
-                    defaultDevice  = alias;
-                    canRecordAudio = true;
-                    console->info("parseHardwareParams(): using fallback alias {} ({} ch)",
-                                  alias, channels);
-                    break;
+    for (int rate : {FIXED_AUDIO_SAMPLE_RATE, FALLBACK_AUDIO_SAMPLE_RATE}) {
+        if (tryAudioConfig("mic_24bit", "S24_3LE", 2, rate)) {
+            audioSampleRate = rate;
+            audioFormat    = "S24_3LE";
+            audioChannels  = 2;
+            defaultDevice  = "mic_24bit";
+            canRecordAudio = true;
+            console->info("parseHardwareParams(): using mic_24bit @ {} Hz", rate);
+        } else if (tryAudioConfig("mic_16bit", "S16_LE", 1, rate)) {
+            audioSampleRate = rate;
+            audioFormat    = "S16_LE";
+            audioChannels  = 1;
+            defaultDevice  = "mic_16bit";
+            canRecordAudio = true;
+            console->info("parseHardwareParams(): using mic_16bit @ {} Hz", rate);
+        } else {
+            auto aliases = parseArecordAliases();
+            for (const auto& alias : aliases) {
+                for (int channels : {1, 2}) {
+                    if (tryAudioConfig(alias, "S16_LE", channels, rate)) {
+                        audioSampleRate = rate;
+                        audioFormat    = "S16_LE";
+                        audioChannels  = channels;
+                        defaultDevice  = alias;
+                        canRecordAudio = true;
+                        console->info("parseHardwareParams(): using fallback alias {} ({} ch) @ {} Hz",
+                                      alias, channels, rate);
+                        break;
+                    }
                 }
+                if (canRecordAudio) break;
             }
-            if (canRecordAudio) break;
+            if (!canRecordAudio) {
+                console->warn("parseHardwareParams(): no usable audio devices at {} Hz; trying next rate", rate);
+            }
         }
-        if (!canRecordAudio) {
-            console->error("parseHardwareParams(): no usable audio devices after probing aliases");
+
+        if (canRecordAudio) {
+            break;
         }
+    }
+
+    if (!canRecordAudio) {
+        console->error("parseHardwareParams(): no usable audio devices after probing aliases");
     }
 
     if (canRecordAudio) {
