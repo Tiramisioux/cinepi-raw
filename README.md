@@ -159,11 +159,7 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-rawâ
 
 ### .asoundrc Setup
 
-For `dsnoop` support, create a `~/etc/asound.conf` in home directory:
-
-```bash
-nano ~/etc/asound.conf
-```
+For `dsnoop` support, create a `~/etc/asound.conf`:
 
 ```bash
 
