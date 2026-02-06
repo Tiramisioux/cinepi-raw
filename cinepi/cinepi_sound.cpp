@@ -375,7 +375,9 @@ void CinePISound::startMonitoring() {
     std::ostringstream mon_cmd;
     mon_cmd << "alsaloop -C " << defaultDevice
             << " -P " << outputDevice
-            << " -t 10000 -A 1 -d";
+            << " -t 10000 -A 1 -d"
+            << " -q"
+            << " 2>/dev/null";
     console->info("Starting audio monitoring: {}", mon_cmd.str());
     monitor_pipe = popen2(mon_cmd.str(), "r", monitor_pid);
     if (monitor_pid > 0 && monitor_pipe) {
