@@ -117,6 +117,11 @@ private:
 
     std::shared_ptr<spdlog::logger> console;
 
+    std::string make_tag_;
+    std::string model_tag_;
+    std::string software_tag_;
+    std::string ucm_tag_;
+
         void encodeThread(int num);
         void diskThread(int num);
         void stopThreads();
@@ -223,7 +228,6 @@ private:
                 CompletedRequest::ControlList met;
                 int64_t timestamp_us;
                 uint64_t index;
-                std::string timecode;
         };
         std::queue<DiskItem> disk_buffer_;
         std::mutex disk_mutex_;

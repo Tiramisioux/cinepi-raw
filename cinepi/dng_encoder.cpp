@@ -43,10 +43,6 @@
 #include <sys/time.h>
 
 
-#ifdef __GLIBC__
-    #include <malloc.h>     // declares malloc_trim
-#endif
-
 namespace fs = std::filesystem;
 
 #define ONE_MB 1048576
@@ -201,6 +197,22 @@ static inline void pack_row_12bit(const uint16_t *src,
         dst[0] =  p0 >> 4;                     /* upper 8 bits of pixel 0      */
         dst[1] = (p0 << 4) | (p1 >> 8);        /* lower 4 + upper 4            */
         dst[2] =  p1;                          /* lower 8 bits of pixel 1       */
+        dst += 3;
+    }
+}
+
+/* Pack a 16-bit source row to packed 12-bit output while dropping 4 LSBs. */
+static inline void pack_row_16_to_12bit(const uint16_t *src,
+                                        uint8_t       *dst,
+                                        uint32_t       width)
+{
+    for (uint32_t x = 0; x < width; x += 2)
+    {
+        const uint16_t p0 = src[x] >> 4;
+        const uint16_t p1 = src[x + 1] >> 4;
+        dst[0] = p0 >> 4;
+        dst[1] = (p0 << 4) | (p1 >> 8);
+        dst[2] = p1;
         dst += 3;
     }
 }
@@ -550,6 +562,15 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.serial     = getHwId();
     dng_info.compression = COMPRESSION_NONE;
 
+    make_tag_ = dng_info.make;
+    make_tag_.push_back('\0');
+    model_tag_ = dng_info.model;
+    model_tag_.push_back('\0');
+    software_tag_ = dng_info.software;
+    software_tag_.push_back('\0');
+    ucm_tag_ = dng_info.ucm;
+    ucm_tag_.push_back('\0');
+
     /* ────────────────────────────────────────────────────────── */
     /*  Dynamic RAM limit: 90 % of current MemAvailable          */
     /* ────────────────────────────────────────────────────────── */
@@ -595,6 +616,8 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                             int64_t                             timestamp_us,
                             uint64_t                            fn)
 {
+    thread_local std::vector<uint8_t> rowBuf;
+
     /* ──  Memory writer / TIFF header  ────────────────────────── */
     MemoryBuffer buf{const_cast<uint8_t*>(mem_buf), 0, 0,
                      static_cast<uint32_t>(dng_info.buffer_size)};
@@ -615,26 +638,19 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     if (write12bit_)          /* source 16-bit, we emit packed 12-bit */
     {
         const uint32_t rowPacked = (info.width * 12 + 7) / 8;
-        std::vector<uint8_t> rowBuf(rowPacked);
+        rowBuf.resize(rowPacked);
 
         for (uint32_t y = 0; y < info.height; ++y) {
             const uint16_t *src = reinterpret_cast<const uint16_t *>(
                                     raw + y * info.stride);
-            /* trim 4 LSB then pack */
-            for (uint32_t x = 0; x < info.width; x += 2) {
-                uint16_t p0 = src[x]     >> 4;
-                uint16_t p1 = src[x + 1] >> 4;
-                rowBuf[3*x/2 + 0] =  p0 >> 4;
-                rowBuf[3*x/2 + 1] = (p0 << 4) | (p1 >> 8);
-                rowBuf[3*x/2 + 2] =  p1;
-            }
+            pack_row_16_to_12bit(src, rowBuf.data(), info.width);
             write_pod(buf, rowBuf.data(), rowPacked);
         }
     }
     else if (dng_info.bits == 12)
     {
         const uint32_t rowPacked = (info.width * 12 + 7) / 8;   /* 1.5 B / px */
-        std::vector<uint8_t> rowBuf(rowPacked);
+        rowBuf.resize(rowPacked);
 
         for (uint32_t y = 0; y < info.height; ++y)
         {
@@ -702,8 +718,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     sub.addEntry(339,  TIFF_SHORT, 1, &sampFmt);
     sub.addEntry(0xC612, TIFF_BYTE, 4, v);
     sub.addEntry(0xC613, TIFF_BYTE, 4, v);
-    std::string ucm = dng_info.ucm + '\0';
-    sub.addEntry(0xC614, TIFF_ASCII, ucm.size(), ucm.data());
+    sub.addEntry(0xC614, TIFF_ASCII, ucm_tag_.size(), ucm_tag_.data());
 
     sub.sortEntries(); sub.build(buf);
     const uint32_t subIFDoff = sub.baseOffset;
@@ -755,13 +770,10 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(0x828E, TIFF_BYTE , 4, dng_info.bayer_order);
 
     /* strings */
-    std::string make  = dng_info.make  + '\0';
-    std::string model = dng_info.model + '\0';
-    std::string soft  = dng_info.software + '\0';
-    ifd.addEntry(271, TIFF_ASCII, make .size(), make .data());
-    ifd.addEntry(272, TIFF_ASCII, model.size(), model.data());
-    ifd.addEntry(305, TIFF_ASCII, soft .size(), soft .data());
-    ifd.addEntry(0xC614, TIFF_ASCII, ucm.size(), ucm.data());
+    ifd.addEntry(271, TIFF_ASCII, make_tag_.size(), make_tag_.data());
+    ifd.addEntry(272, TIFF_ASCII, model_tag_.size(), model_tag_.data());
+    ifd.addEntry(305, TIFF_ASCII, software_tag_.size(), software_tag_.data());
+    ifd.addEntry(0xC614, TIFF_ASCII, ucm_tag_.size(), ucm_tag_.data());
 
     /* ▸ CinemaDNG tag 0xC764  –  FrameRate (SRATIONAL) */
 
@@ -899,19 +911,6 @@ void DngEncoder::encodeThread(int num)
             encode_item.timestamp_us,
             encode_item.index);
 
-        /* convert BCD timecode to string right after dng_save */
-        auto &tc_bcd = originationTimeCode;
-        int hour  = ((tc_bcd[3] >> 4) & 0xF) * 10 + (tc_bcd[3] & 0xF);
-        int minute= ((tc_bcd[2] >> 4) & 0xF) * 10 + (tc_bcd[2] & 0xF);
-        int second= ((tc_bcd[1] >> 4) & 0xF) * 10 + (tc_bcd[1] & 0xF);
-        int frame = ((tc_bcd[0] >> 4) & 0xF) * 10 + (tc_bcd[0] & 0xF);
-
-        std::ostringstream tc;
-        tc << std::setw(2) << std::setfill('0') << hour  << ':'
-           << std::setw(2) << minute << ':'
-           << std::setw(2) << second << ':'
-           << std::setw(2) << frame;
-
         /* queue for disk writer */
         {
             DiskItem item = {
@@ -920,8 +919,7 @@ void DngEncoder::encodeThread(int num)
                 encode_item.info,
                 encode_item.met,
                 encode_item.timestamp_us,
-                encode_item.index,
-                tc.str()
+                encode_item.index
             };
 
             std::lock_guard<std::mutex> lock(disk_mutex_);
@@ -977,7 +975,6 @@ void DngEncoder::diskThread(int num)
         console->trace("Thread[{}]  Save frame to disk: {}", num, disk_item.index);
 
         console->info("DNG written: {}", filename);
-        console->info("Timecode: {}", disk_item.timecode);
         
         auto start_time = std::chrono::high_resolution_clock::now();
         
@@ -987,8 +984,6 @@ void DngEncoder::diskThread(int num)
         if (fd != -1) {
             // Provide sequential access hint
             posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-            posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE);
-            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // drop file pages ASAP
 
 
             // Always use actual used size returned by dng_save
@@ -1008,14 +1003,8 @@ void DngEncoder::diskThread(int num)
             std::lock_guard<std::mutex> lk(ram_mtx_);
             if (ram_buffers_ > 0)
                 --ram_buffers_;          // <-- give permit back
-            ram_cv_.notify_all();
+            ram_cv_.notify_one();
         }
-
-        /* push any cached arenas back to the kernel */
-        #ifdef __GLIBC__
-            // hand empty arenas back to the kernel
-            malloc_trim(0);
-        #endif
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
