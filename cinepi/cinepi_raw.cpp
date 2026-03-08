@@ -7,6 +7,8 @@
 
 #include <chrono>
 #include <vector>
+#include <optional>
+#include <sstream>
 #include "cinepi_sound.hpp"
 #include "cinepi_controller.hpp"
 
@@ -25,6 +27,20 @@ using namespace std::placeholders;
 libcamera::ControlList emptyMetadata;
 
 static bool wasRecording = false;
+
+static std::string cpuListToString(const std::optional<std::vector<int>> &cpus)
+{
+	if (!cpus || cpus->empty())
+		return "auto";
+	std::ostringstream oss;
+	for (size_t i = 0; i < cpus->size(); ++i)
+	{
+		if (i)
+			oss << ',';
+		oss << (*cpus)[i];
+	}
+	return oss.str();
+}
 
 // The main even loop for the application.
 static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePISound &sound)
@@ -184,7 +200,16 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 		// show frame on display
 		if (!options->nopreview)
-			app.ShowPreview(completed_request, app.LoresStream());//app.GetMainStream());
+		{
+			bool show_preview = true;
+			if (nowRecording && options->recording_perf_mode == RawOptions::RecordingPerfMode::Max)
+			{
+				// In max mode during active record, throttle preview updates to reduce contention.
+				show_preview = ((count & 0x3u) == 0u);
+			}
+			if (show_preview)
+				app.ShowPreview(completed_request, app.LoresStream());//app.GetMainStream());
+		}
 
 		//console->info("Frame Number: {}", count);
 	}
@@ -211,12 +236,17 @@ int main(int argc, char *argv[])
 			if (options->verbose >= 2)
 				options->Print();
 
-			spdlog::info("cinepi-runtime: nopreview={} encode_workers={} disk_workers={} latency_sample_interval={} per_frame_logs={}",
+			spdlog::info("cinepi-runtime: nopreview={} encode_workers={} disk_workers={} encode_affinity={} disk_affinity={} encode_nice={} disk_nice={} latency_sample_interval={} per_frame_logs={} recording_perf_mode={}",
 				            options->nopreview ? "true" : "false",
 				            options->encode_workers,
 				            options->disk_workers,
+				            cpuListToString(options->encode_affinity),
+				            cpuListToString(options->disk_affinity),
+				            options->encode_nice ? std::to_string(*options->encode_nice) : std::string("auto"),
+				            options->disk_nice ? std::to_string(*options->disk_nice) : std::string("auto"),
 				            options->latency_sample_interval,
-				            options->per_frame_logs ? "true" : "false");
+				            options->per_frame_logs ? "true" : "false",
+				            RawOptions::RecordingPerfModeToString(options->recording_perf_mode));
 
 			event_loop(app, controller, sound);
 		}

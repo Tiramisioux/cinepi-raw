@@ -218,6 +218,8 @@ private:
         uint64_t frames_;
 
     RawOptions const *options_;
+    RawOptions::RecordingPerfMode recording_perf_mode_ { RawOptions::RecordingPerfMode::Balanced };
+    bool recording_perf_max_ { false };
 
         size_t encode_worker_count_ { 0 };
         size_t disk_worker_count_   { 0 };

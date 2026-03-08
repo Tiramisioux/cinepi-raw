@@ -340,6 +340,8 @@ DngEncoder::DngEncoder(RawOptions const *options)
         encode_nice_         = options_->encode_nice;
         disk_nice_           = options_->disk_nice;
         latency_sample_interval_ = std::max<uint32_t>(1, options_->latency_sample_interval);
+        recording_perf_mode_ = options_->recording_perf_mode;
+        recording_perf_max_  = (recording_perf_mode_ == RawOptions::RecordingPerfMode::Max);
     }
     else
     {
@@ -865,8 +867,11 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     tv.tv_sec  = ts_us / 1'000'000;
     tv.tv_usec = ts_us % 1'000'000;
 
-    struct tm *lt = localtime(&tv.tv_sec);
-    int fps = fpsRat[0] / fpsRat[1];
+    struct tm tm_buf{};
+    struct tm *lt = localtime_r(&tv.tv_sec, &tm_buf);
+    if (!lt)
+        lt = &tm_buf;
+    const int fps = std::max(1, fpsRat[0] / std::max(1, fpsRat[1]));
     int frame = static_cast<int>((tv.tv_usec * fps) / 1'000'000);
     uint8_t tc[8] = {
         static_cast<uint8_t>(((frame     /10)<<4)|(frame     %10)),
@@ -1041,30 +1046,59 @@ void DngEncoder::diskThread(int num)
             decrementIfPositive(disk_queue_size_);
         }
 
-        thread_local std::string filename;
-        filename.clear();
-        filename.reserve(options_->mediaDest.size() + options_->folder.size() * 2 + 24);
-        filename.append(options_->mediaDest);
-        filename.push_back('/');
-        filename.append(options_->folder);
-        filename.push_back('/');
-        filename.append(options_->folder);
-        filename.push_back('_');
-        char frame_suffix[32];
-        std::snprintf(frame_suffix, sizeof(frame_suffix), "%09llu.dng", static_cast<unsigned long long>(disk_item.index));
-        filename.append(frame_suffix);
-    
+        thread_local std::string folder_path;
+        thread_local std::string name_prefix;
+        thread_local std::string current_folder;
+        thread_local int folder_fd = -1;
+
+        if (current_folder != options_->folder || folder_fd == -1)
+        {
+            if (folder_fd != -1)
+            {
+                close(folder_fd);
+                folder_fd = -1;
+            }
+            current_folder = options_->folder;
+            folder_path.clear();
+            folder_path.reserve(options_->mediaDest.size() + current_folder.size() + 2);
+            folder_path.append(options_->mediaDest);
+            folder_path.push_back('/');
+            folder_path.append(current_folder);
+
+            folder_fd = open(folder_path.c_str(), O_RDONLY | O_DIRECTORY);
+
+            name_prefix.clear();
+            name_prefix.reserve(current_folder.size() + 2);
+            name_prefix.append(current_folder);
+            name_prefix.push_back('_');
+        }
+
+        char frame_name[64];
+        std::snprintf(frame_name, sizeof(frame_name), "%s%09llu.dng", name_prefix.c_str(), static_cast<unsigned long long>(disk_item.index));
+
         if (options_ && options_->per_frame_logs && console->should_log(spdlog::level::debug))
-            console->debug("DNG write start: {}", filename);
-        
+            console->debug("DNG write start: {}/{}", folder_path, frame_name);
+
         auto start_time = std::chrono::high_resolution_clock::now();
-        
-        // Use standard buffered IO instead of O_DIRECT
-        int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+        int fd = (folder_fd != -1)
+            ? openat(folder_fd, frame_name, O_WRONLY | O_CREAT | O_TRUNC, 0644)
+            : -1;
+
+        if (fd == -1)
+        {
+            thread_local std::string fallback_path;
+            fallback_path.clear();
+            fallback_path.reserve(folder_path.size() + 1 + sizeof(frame_name));
+            fallback_path.append(folder_path);
+            fallback_path.push_back('/');
+            fallback_path.append(frame_name);
+            fd = open(fallback_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        }
 
         if (fd != -1) {
-            // Provide sequential access hint
-            posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+            if (!recording_perf_max_)
+                posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
 
             // Always use actual used size returned by dng_save
@@ -1114,6 +1148,8 @@ void DngEncoder::diskThread(int num)
         if (options_ && options_->per_frame_logs && console->should_log(spdlog::level::debug))
             console->debug("Thread[{}] {} disk io={} ms", num, disk_item.index, duration);
     }
+
+    // best-effort thread-local folder fd cleanup is handled by thread exit
 }
 
 void DngEncoder::clearPool()

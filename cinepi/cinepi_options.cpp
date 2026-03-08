@@ -214,7 +214,10 @@ CinePiOptions::CinePiOptions()
                     "Publish encode/disk latency stats every N frames")
                 ("per-frame-logs",
                     value<bool>()->default_value(false)->implicit_value(true),
-                    "Enable verbose per-frame encode/disk logging (default: off)");
+                    "Enable verbose per-frame encode/disk logging (default: off)")
+                ("recording-perf-mode",
+                    value<std::string>()->default_value("balanced"),
+                    "Recording perf mode: off|balanced|max");
         options_.add(cinepi_group);
 }
 
@@ -297,6 +300,22 @@ static int parseNiceValue(const std::string &flag, const std::string &value)
         {
                 throw std::runtime_error(flag + " is out of range");
         }
+}
+
+
+static RawOptions::RecordingPerfMode parseRecordingPerfMode(const std::string &flag, std::string value)
+{
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return std::tolower(ch); });
+
+        if (value == "off")
+                return RawOptions::RecordingPerfMode::Off;
+        if (value == "balanced")
+                return RawOptions::RecordingPerfMode::Balanced;
+        if (value == "max")
+                return RawOptions::RecordingPerfMode::Max;
+
+        throw std::runtime_error(flag + " expects off|balanced|max, got: " + value);
 }
 
 static std::vector<int> parseCpuList(const std::string &flag, const std::string &value)
@@ -523,6 +542,17 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                         continue;
                 }
 
+                if (arg.rfind("--recording-perf-mode=", 0) == 0) {
+                        RawOptions::recording_perf_mode = parseRecordingPerfMode("--recording-perf-mode", arg.substr(sizeof("--recording-perf-mode=") - 1));
+                        continue;
+                }
+                if (arg == "--recording-perf-mode") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--recording-perf-mode requires a value");
+                        RawOptions::recording_perf_mode = parseRecordingPerfMode("--recording-perf-mode", argv[++i]);
+                        continue;
+                }
+
                 /* not a CinePi flag – forward it */
                 forward.push_back(argv[i]);
         }
@@ -584,7 +614,7 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                      Zoom(),
                      scaler_crops_rects.size());
 
-        spdlog::info("cinepi-cli: encode_workers={} disk_workers={} encode_affinity={} disk_affinity={} encode_nice={} disk_nice={} latency_sample_interval={} per_frame_logs={}",
+        spdlog::info("cinepi-cli: encode_workers={} disk_workers={} encode_affinity={} disk_affinity={} encode_nice={} disk_nice={} latency_sample_interval={} per_frame_logs={} recording_perf_mode={}",
                       RawOptions::encode_workers,
                       RawOptions::disk_workers,
                       cpuListToString(RawOptions::encode_affinity),
@@ -592,7 +622,8 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                       RawOptions::encode_nice ? std::to_string(*RawOptions::encode_nice) : std::string("auto"),
                       RawOptions::disk_nice ? std::to_string(*RawOptions::disk_nice) : std::string("auto"),
                       RawOptions::latency_sample_interval,
-                      RawOptions::per_frame_logs ? "true" : "false");
+                      RawOptions::per_frame_logs ? "true" : "false",
+                      RawOptions::RecordingPerfModeToString(RawOptions::recording_perf_mode));
 
         return ok;
 }

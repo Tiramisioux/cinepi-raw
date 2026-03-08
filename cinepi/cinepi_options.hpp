@@ -39,6 +39,8 @@ public:
     bool  ZoomRaw()     const { return zoom_raw; }
     void  SetZoomRaw(bool v) { zoom_raw = v; }
 
+    RawOptions::RecordingPerfMode RecordingPerfModeValue() const { return recording_perf_mode; }
+
     /* Vector of crop rectangles (fractions) in stream order.        */
     const std::vector<std::array<float,4>> &ScalerCrops() const
     { return scaler_crops_rects; }

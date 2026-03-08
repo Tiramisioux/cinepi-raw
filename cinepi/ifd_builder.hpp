@@ -95,7 +95,10 @@ class IFDBuilder
 
 public:
     explicit IFDBuilder(uint32_t width = 0, uint32_t height = 0)
-        : w(width), h(height) {}
+        : w(width), h(height)
+    {
+        entries_.reserve(48);
+    }
 
     /* add one tag – payload is copied immediately into `data`         */
     void addEntry(uint16_t tag,

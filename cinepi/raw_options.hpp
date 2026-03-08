@@ -14,6 +14,24 @@
 
 struct RawOptions : public VideoOptions
 {
+    enum class RecordingPerfMode
+    {
+        Off,
+        Balanced,
+        Max,
+    };
+
+    static const char *RecordingPerfModeToString(RecordingPerfMode mode)
+    {
+        switch (mode)
+        {
+        case RecordingPerfMode::Off: return "off";
+        case RecordingPerfMode::Balanced: return "balanced";
+        case RecordingPerfMode::Max: return "max";
+        }
+        return "balanced";
+    }
+
     RawOptions()
         : VideoOptions()
         , keep16(false)                     // NEW → default = pack to 12-bit
@@ -65,4 +83,7 @@ struct RawOptions : public VideoOptions
     /* observability / logging tuning */
     uint32_t latency_sample_interval { 20 };
     bool per_frame_logs { false };
+
+    /* recording hot-path CPU/jitter tuning */
+    RecordingPerfMode recording_perf_mode { RecordingPerfMode::Balanced };
 };
