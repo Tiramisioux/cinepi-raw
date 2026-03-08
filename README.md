@@ -123,6 +123,8 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-rawâ
 | `--disk-affinity <list>`  | `auto`  | Pin disk workers to the specified CPU list. |
 | `--encode-nice <int>`     | `auto`  | Nice level for encode workers (`-20` = highest priority, `19` = lowest). |
 | `--disk-nice <int>`       | `auto`  | Nice level applied to disk workers. |
+| `--latency-sample-interval <n>` | `10` | Sample encode/disk latency metrics every N frames for `cp_stats`. |
+| `--per-frame-logs[=bool]` | `false` | Enable verbose per-frame encoder/disk DEBUG logs (`true/false`, `1/0`). |
 
 ## Manual DNG encoder
 
@@ -236,3 +238,13 @@ SET zoom 1.5
 PUBLISH cp_controls zoom
 ```
 CinemaDNGs always contain the entire sensor.
+
+### cp_stats observability fields
+
+`cp_stats` now publishes additional fields for Cinemate v2/analyzer compatibility while preserving existing keys:
+
+- Per-frame fields: `sensorTimestamp`, `stats_seq`, `encode_queue_size`, `disk_queue_size`, `ram_buffers`.
+- Sampled fields: `encode_latency_ms`, `disk_latency_ms` (sampled every `--latency-sample-interval` frames, default `10`).
+- Sampling behavior: sampled latency keys are repeated with the last sampled value until the next sample refresh.
+
+High-frequency per-frame encode/disk logs are now DEBUG-gated and disabled by default; startup/configuration logs remain INFO/WARN/ERROR.

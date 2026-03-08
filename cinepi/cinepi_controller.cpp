@@ -255,12 +255,27 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     /*  2. Publish live stats                                        */
     /* ────────────────────────────────────────────────────────────── */
     Json::Value data;
-    data["framerate"]  = completed_request->framerate;
-    data["colorTemp"]  = info.colorTemp;
-    data["focus"]      = info.focus;
-    data["frameCount"] = app_->GetEncoder()->getFrameCount();
-    data["bufferSize"] = app_->GetEncoder()->bufferSize();
-    data["timestamp"]  = static_cast<Json::Int64>(epoch_ns);   // ← TOD ns
+    const uint64_t stats_seq = stats_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto *encoder = app_->GetEncoder();
+
+    data["framerate"]         = completed_request->framerate;
+    data["colorTemp"]         = info.colorTemp;
+    data["focus"]             = info.focus;
+    data["frameCount"]        = encoder->getFrameCount();
+    data["bufferSize"]        = encoder->bufferSize();
+    data["timestamp"]         = static_cast<Json::Int64>(epoch_ns);   // wall-clock ns
+    data["sensorTimestamp"]   = static_cast<Json::Int64>(info.ts);     // sensor monotonic ns
+    data["stats_seq"]         = static_cast<Json::UInt64>(stats_seq);
+    data["encode_queue_size"] = static_cast<Json::UInt64>(encoder->encodeQueueSize());
+    data["disk_queue_size"]   = static_cast<Json::UInt64>(encoder->diskQueueSize());
+    data["ram_buffers"]       = static_cast<Json::UInt64>(encoder->ramBuffers());
+
+    // Latencies are sampled every N frames in the encoder and repeated until refreshed.
+    if (auto encode_latency = encoder->sampledEncodeLatencyMs(); encode_latency)
+        data["encode_latency_ms"] = static_cast<Json::UInt>(*encode_latency);
+    if (auto disk_latency = encoder->sampledDiskLatencyMs(); disk_latency)
+        data["disk_latency_ms"] = static_cast<Json::UInt>(*disk_latency);
+
     redis_->publish(CHANNEL_STATS, data.toStyledString());
 
     /* cache per-camera timestamp key (TOD ns) */
