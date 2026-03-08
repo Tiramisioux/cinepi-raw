@@ -183,7 +183,8 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 
 		// show frame on display
-		app.ShowPreview(completed_request, app.LoresStream());//app.GetMainStream());
+		if (!options->nopreview)
+			app.ShowPreview(completed_request, app.LoresStream());//app.GetMainStream());
 
 		//console->info("Frame Number: {}", count);
 	}
@@ -209,6 +210,13 @@ int main(int argc, char *argv[])
 
 			if (options->verbose >= 2)
 				options->Print();
+
+			spdlog::info("cinepi-runtime: nopreview={} encode_workers={} disk_workers={} latency_sample_interval={} per_frame_logs={}",
+				            options->nopreview ? "true" : "false",
+				            options->encode_workers,
+				            options->disk_workers,
+				            options->latency_sample_interval,
+				            options->per_frame_logs ? "true" : "false");
 
 			event_loop(app, controller, sound);
 		}

@@ -12,6 +12,7 @@
  #include <libcamera/control_ids.h> // metadata.get(controls::...)
  #include <libcamera/formats.h>     // libcamera::formats::
  #include <cstring>
+ #include <cstdio>
  #include <stdexcept>
  #include <iomanip>
  
@@ -124,6 +125,21 @@ static const std::map<PixelFormat,int> mono_formats = {
 
 
 bool mono_ = false;   // add as a private member of DngEncoder
+
+static std::string cpuListToString(const std::optional<std::vector<int>> &cpus)
+{
+    if (!cpus || cpus->empty())
+        return "auto";
+
+    std::ostringstream oss;
+    for (size_t i = 0; i < cpus->size(); ++i)
+    {
+        if (i)
+            oss << ',';
+        oss << (*cpus)[i];
+    }
+    return oss.str();
+}
 
 static inline void decrementIfPositive(std::atomic<size_t> &counter)
 {
@@ -327,8 +343,9 @@ DngEncoder::DngEncoder(RawOptions const *options)
     }
     else
     {
-        encode_worker_count_ = 2;
-        disk_worker_count_   = 8;
+        encode_worker_count_ = 1;
+        disk_worker_count_   = 1;
+        latency_sample_interval_ = 20;
     }
 
     encode_threads_.reserve(encode_worker_count_);
@@ -339,9 +356,15 @@ DngEncoder::DngEncoder(RawOptions const *options)
     for (size_t i = 0; i < disk_worker_count_; ++i)
         disk_threads_.emplace_back(&DngEncoder::diskThread, this, static_cast<int>(i));
 
-    console->info("DngEncoder started with {} encode worker(s) and {} disk worker(s)",
+    console->info("DngEncoder started: encode_workers={} disk_workers={} encode_affinity={} disk_affinity={} encode_nice={} disk_nice={} latency_sample_interval={} per_frame_logs={}",
                   encode_worker_count_,
-                  disk_worker_count_);
+                  disk_worker_count_,
+                  encode_affinity_ && !encode_affinity_->empty() ? cpuListToString(encode_affinity_) : std::string("auto"),
+                  disk_affinity_ && !disk_affinity_->empty() ? cpuListToString(disk_affinity_) : std::string("auto"),
+                  encode_nice_ ? std::to_string(*encode_nice_) : std::string("auto"),
+                  disk_nice_ ? std::to_string(*disk_nice_) : std::string("auto"),
+                  latency_sample_interval_,
+                  options_ && options_->per_frame_logs ? "true" : "false");
 }
 
 DngEncoder::~DngEncoder()
@@ -638,6 +661,10 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
                   max_ram_buffers_, (max_ram_buffers_ * dng_info.buffer_size) >> 20);
 
 
+    encode_rational_array(dng_info.CAM_XYZ, 9, static_tag_cache_.matrixXY);
+    encode_rational_array(dng_info.NEUTRAL, 3, static_tag_cache_.neutral);
+    static_tag_cache_.ready = true;
+
     encoder_initialized_ = true;
     console->info("Encoder configured – {}×{} {}-bit, buffer {} MB",
                   cfg.size.width, cfg.size.height,
@@ -733,20 +760,14 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     else
         std::fill(std::begin(black), std::end(black), 256);
 
-    /* ──  4.  Prepare matrices  ───────────────────────────────── */
-    int32_t matrixXY[18]; encode_rational_array(dng_info.CAM_XYZ, 9, matrixXY);
-    int32_t neutral[6];   encode_rational_array(dng_info.NEUTRAL, 3, neutral);
+    /* ──  4.  Prepare per-frame mutable tags only  ─────────────── */
+    thread_local int32_t blackRat[8];
 
     /* ──  5.  Build thumbnail IFD (SubIFD[0])  ───────────────── */
     IFDBuilder sub(dng_info.thumbWidth, dng_info.thumbHeight);
     sub.baseOffset = buf.usedSize;
 
-    uint32_t subType = 1;                 /* reduced-res */
-    uint16_t planar  = 1;
-    uint16_t sampFmt = SAMPLEFORMAT_UINT;
-    static const uint8_t v[4] = {1, 4, 0, 0};
-
-    sub.addEntry(254,  TIFF_LONG , 1, &subType);
+    sub.addEntry(254,  TIFF_LONG , 1, &static_tag_cache_.sub_type);
     sub.addEntry(256,  TIFF_SHORT, 1, &dng_info.thumbWidth);
     sub.addEntry(257,  TIFF_SHORT, 1, &dng_info.thumbHeight);
     sub.addEntry(258,  TIFF_SHORT, 1, &dng_info.thumbBitsPerSample);
@@ -756,10 +777,10 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     sub.addEntry(278,  TIFF_SHORT, 1, &dng_info.thumbHeight);
     sub.addEntry(279,  TIFF_LONG , 1, &thumbSize);
     sub.addEntry(277,  TIFF_SHORT, 1, &dng_info.thumbSamplesPerPixel);
-    sub.addEntry(284,  TIFF_SHORT, 1, &planar);
-    sub.addEntry(339,  TIFF_SHORT, 1, &sampFmt);
-    sub.addEntry(0xC612, TIFF_BYTE, 4, v);
-    sub.addEntry(0xC613, TIFF_BYTE, 4, v);
+    sub.addEntry(284,  TIFF_SHORT, 1, &static_tag_cache_.planar);
+    sub.addEntry(339,  TIFF_SHORT, 1, &static_tag_cache_.sample_format);
+    sub.addEntry(0xC612, TIFF_BYTE, 4, static_tag_cache_.dng_version);
+    sub.addEntry(0xC613, TIFF_BYTE, 4, static_tag_cache_.dng_version);
     sub.addEntry(0xC614, TIFF_ASCII, ucm_tag_.size(), ucm_tag_.data());
 
     sub.sortEntries(); sub.build(buf);
@@ -785,26 +806,24 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(278 , TIFF_LONG , 1, &info.height);
     ifd.addEntry(279 , TIFF_LONG , 1, &rawSize);
     ifd.addEntry(277 , TIFF_SHORT, 1, &dng_info.samples_per_pixel);
-    ifd.addEntry(284 , TIFF_SHORT, 1, &planar);
-    ifd.addEntry(339 , TIFF_SHORT, 1, &sampFmt);
+    ifd.addEntry(284 , TIFF_SHORT, 1, &static_tag_cache_.planar);
+    ifd.addEntry(339 , TIFF_SHORT, 1, &static_tag_cache_.sample_format);
     ifd.addEntry(0x014A, TIFF_LONG, 1, &subIFDoff);
-    ifd.addEntry(0xC612, TIFF_BYTE, 4, v);
-    ifd.addEntry(0xC613, TIFF_BYTE, 4, v);
+    ifd.addEntry(0xC612, TIFF_BYTE, 4, static_tag_cache_.dng_version);
+    ifd.addEntry(0xC613, TIFF_BYTE, 4, static_tag_cache_.dng_version);
 
     /* black / white */
-    int32_t blackRat[8];
     for (int i = 0; i < 4; ++i) { blackRat[2 * i] = black[i]; blackRat[2 * i + 1] = 1; }
     ifd.addEntry(0xC61A, TIFF_RATIONAL, 4, blackRat);
     uint16_t white16 = static_cast<uint16_t>(dng_info.white);
     ifd.addEntry(0xC61D, TIFF_SHORT, 1, &white16);
 
     /* colour matrices */
-    ifd.addEntry(0xC621, TIFF_SRATIONAL, 9, matrixXY);   /* ColorMatrix1 */
-    ifd.addEntry(0xC622, TIFF_SRATIONAL, 9, matrixXY);   /* ColorMatrix2 */
-    uint16_t illum = 21;                                 /* D65 */
-    ifd.addEntry(0xC65A, TIFF_SHORT, 1, &illum);
-    ifd.addEntry(0xC65B, TIFF_SHORT, 1, &illum);
-    ifd.addEntry(0xC628, TIFF_RATIONAL, 3, neutral);     /* AsShotNeutral */
+    ifd.addEntry(0xC621, TIFF_SRATIONAL, 9, static_tag_cache_.matrixXY);   /* ColorMatrix1 */
+    ifd.addEntry(0xC622, TIFF_SRATIONAL, 9, static_tag_cache_.matrixXY);   /* ColorMatrix2 */
+    ifd.addEntry(0xC65A, TIFF_SHORT, 1, &static_tag_cache_.illumination);
+    ifd.addEntry(0xC65B, TIFF_SHORT, 1, &static_tag_cache_.illumination);
+    ifd.addEntry(0xC628, TIFF_RATIONAL, 3, static_tag_cache_.neutral);     /* AsShotNeutral */
 
     /* CFA pattern */
     ifd.addEntry(0xC619, TIFF_SHORT, 2, dng_info.black_level_repeat_dim);
@@ -866,7 +885,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(0xC763, TIFF_BYTE, 8, tc);
 
     /* DateTimeOriginal */
-    char dateStr[20];
+    thread_local char dateStr[20];
     strftime(dateStr, sizeof(dateStr), "%Y:%m:%d %H:%M:%S", lt);
     ifd.addEntry(0x9003, TIFF_ASCII, 20, dateStr);
 
@@ -903,7 +922,6 @@ void DngEncoder::encodeThread(int num)
         }
 
         frames_ = encode_item.index;
-        console->trace("Thread[{}] encode frame: {}", num, encode_item.index);
 
         /* ────────────────────────────────────────────────────── */
         /*  RAM back-pressure + aligned allocation               */
@@ -1023,19 +1041,21 @@ void DngEncoder::diskThread(int num)
             decrementIfPositive(disk_queue_size_);
         }
 
-        std::ostringstream oss;
-        oss << options_->mediaDest << '/'
-            << options_->folder << '/'
-            << options_->folder << '_'
-            << std::setw(9) << std::setfill('0') << disk_item.index 
-            << ".dng";
-
-        std::string filename = oss.str();
+        thread_local std::string filename;
+        filename.clear();
+        filename.reserve(options_->mediaDest.size() + options_->folder.size() * 2 + 24);
+        filename.append(options_->mediaDest);
+        filename.push_back('/');
+        filename.append(options_->folder);
+        filename.push_back('/');
+        filename.append(options_->folder);
+        filename.push_back('_');
+        char frame_suffix[32];
+        std::snprintf(frame_suffix, sizeof(frame_suffix), "%09llu.dng", static_cast<unsigned long long>(disk_item.index));
+        filename.append(frame_suffix);
     
-        console->trace("Thread[{}]  Save frame to disk: {}", num, disk_item.index);
-
         if (options_ && options_->per_frame_logs && console->should_log(spdlog::level::debug))
-            console->debug("DNG written: {}", filename);
+            console->debug("DNG write start: {}", filename);
         
         auto start_time = std::chrono::high_resolution_clock::now();
         
@@ -1048,10 +1068,24 @@ void DngEncoder::diskThread(int num)
 
 
             // Always use actual used size returned by dng_save
-            ssize_t bytes_written = write(fd, disk_item.mem_buf, disk_item.size);
-            if (bytes_written < 0 || static_cast<size_t>(bytes_written) != disk_item.size) {
-                perror("Error writing to file");
+            size_t total_written = 0;
+            const uint8_t *src = static_cast<const uint8_t *>(disk_item.mem_buf);
+            while (total_written < disk_item.size)
+            {
+                ssize_t bytes_written = write(fd, src + total_written, disk_item.size - total_written);
+                if (bytes_written < 0)
+                {
+                    if (errno == EINTR)
+                        continue;
+                    perror("Error writing to file");
+                    break;
+                }
+                if (bytes_written == 0)
+                    break;
+                total_written += static_cast<size_t>(bytes_written);
             }
+            if (total_written != disk_item.size)
+                perror("Short write to file");
             close(fd);
         } else {
             perror("Failed to open file for writing");
