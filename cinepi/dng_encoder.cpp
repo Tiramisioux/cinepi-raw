@@ -125,6 +125,18 @@ static const std::map<PixelFormat,int> mono_formats = {
 
 bool mono_ = false;   // add as a private member of DngEncoder
 
+static inline void decrementIfPositive(std::atomic<size_t> &counter)
+{
+    size_t current = counter.load(std::memory_order_relaxed);
+    while (current > 0 &&
+           !counter.compare_exchange_weak(current,
+                                          current - 1,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed))
+    {
+    }
+}
+
 void DngEncoder::setWallClockTimestamp(uint64_t us)
 {
     wallclock_ts_us_ = us;
@@ -362,6 +374,15 @@ void DngEncoder::stopThreads()
 
     encode_threads_.clear();
     disk_threads_.clear();
+
+    {
+        std::lock_guard<std::mutex> lock(encode_mutex_);
+        encode_queue_size_.store(encode_queue_.size(), std::memory_order_relaxed);
+    }
+    {
+        std::lock_guard<std::mutex> lock(disk_mutex_);
+        disk_queue_size_.store(disk_buffer_.size(), std::memory_order_relaxed);
+    }
 }
 
 void DngEncoder::configureThreadContext(const std::string &baseName,
@@ -878,7 +899,7 @@ void DngEncoder::encodeThread(int num)
 
             encode_item = encode_queue_.front();
             encode_queue_.pop();
-            encode_queue_size_.fetch_sub(1, std::memory_order_relaxed);
+            decrementIfPositive(encode_queue_size_);
         }
 
         frames_ = encode_item.index;
@@ -999,7 +1020,7 @@ void DngEncoder::diskThread(int num)
 
             disk_item = disk_buffer_.front();
             disk_buffer_.pop();
-            disk_queue_size_.fetch_sub(1, std::memory_order_relaxed);
+            decrementIfPositive(disk_queue_size_);
         }
 
         std::ostringstream oss;
@@ -1075,8 +1096,9 @@ void DngEncoder::clearPool()
                 if (ram_buffers_ > 0) --ram_buffers_;
             }
             disk_buffer_.pop();
-            disk_queue_size_.fetch_sub(1, std::memory_order_relaxed);
+            decrementIfPositive(disk_queue_size_);
         }
+        disk_queue_size_.store(disk_buffer_.size(), std::memory_order_relaxed);
         ram_cv_.notify_all();
     }
 }

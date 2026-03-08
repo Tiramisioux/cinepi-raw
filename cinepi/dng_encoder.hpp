@@ -52,7 +52,8 @@ public:
 		uint64_t fn);
 
 	int bufferSize(){
-		return static_cast<int>(disk_queue_size_.load(std::memory_order_relaxed));
+		std::lock_guard<std::mutex> lock(disk_mutex_);
+		return static_cast<int>(disk_buffer_.size());
 	}
 	uint64_t getFrameCount(){
 		return frames_;
