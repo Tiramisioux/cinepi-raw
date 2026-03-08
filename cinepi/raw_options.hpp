@@ -55,14 +55,14 @@ struct RawOptions : public VideoOptions
     bool keep16;                           // set by --keep16 in CinePiOptions
 
     /* worker pool sizing + tuning */
-    uint32_t encode_workers { 2 };
-    uint32_t disk_workers   { 8 };
+    uint32_t encode_workers { 1 };
+    uint32_t disk_workers   { 1 };
     std::optional<std::vector<int>> encode_affinity;
     std::optional<std::vector<int>> disk_affinity;
     std::optional<int> encode_nice;
     std::optional<int> disk_nice;
 
     /* observability / logging tuning */
-    uint32_t latency_sample_interval { 10 };
+    uint32_t latency_sample_interval { 20 };
     bool per_frame_logs { false };
 };

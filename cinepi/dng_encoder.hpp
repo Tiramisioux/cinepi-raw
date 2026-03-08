@@ -111,7 +111,7 @@ private:
     std::atomic<uint32_t> sampled_disk_latency_ms_{0};
     std::atomic<bool>     has_sampled_encode_latency_{false};
     std::atomic<bool>     has_sampled_disk_latency_{false};
-    uint32_t              latency_sample_interval_{10};
+    uint32_t              latency_sample_interval_{20};
     size_t                max_ram_buffers_;  /* hard cap calculated at setup  */
     std::mutex            ram_mtx_;
     std::condition_variable ram_cv_;
@@ -135,6 +135,19 @@ private:
     std::string model_tag_;
     std::string software_tag_;
     std::string ucm_tag_;
+    struct StaticTagCache
+    {
+        int32_t matrixXY[18]{};
+        int32_t neutral[6]{};
+        uint16_t planar{1};
+        uint16_t sample_format{1};
+        uint16_t illumination{21};
+        uint32_t sub_type{1};
+        uint8_t dng_version[4]{1, 4, 0, 0};
+        bool ready{false};
+    };
+    StaticTagCache static_tag_cache_;
+
 
         void encodeThread(int num);
         void diskThread(int num);
