@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <thread>
 #include <chrono>
+#include <atomic>
 
 //external dependancies
 #include <sw/redis++/redis++.h>
@@ -237,6 +238,8 @@ class CinePIController : public CinePIState
         std::unique_ptr<sw::redis::Redis> redis_;
 
         Json::Value allData;
+
+        std::atomic<uint64_t> stats_seq_{0};
 
         bool abortThread_;
         std::thread main_thread_;

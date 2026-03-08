@@ -208,7 +208,13 @@ CinePiOptions::CinePiOptions()
                     "Nice level (-20..19) for encode workers")
                 ("disk-nice",
                     value<int>(),
-                    "Nice level (-20..19) for disk workers");
+                    "Nice level (-20..19) for disk workers")
+                ("latency-sample-interval",
+                    value<unsigned int>()->default_value(10),
+                    "Publish encode/disk latency stats every N frames")
+                ("per-frame-logs",
+                    value<bool>()->default_value(false)->implicit_value(true),
+                    "Enable verbose per-frame encode/disk logging (default: off)");
         options_.add(cinepi_group);
 }
 
@@ -232,6 +238,19 @@ static std::string trimToken(const std::string &token)
                 return "";
         const auto end = token.find_last_not_of(" \t");
         return token.substr(start, end - start + 1);
+}
+
+static bool parseBoolString(const std::string &flag, std::string value)
+{
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return std::tolower(ch); });
+
+        if (value == "1" || value == "true" || value == "yes" || value == "on")
+                return true;
+        if (value == "0" || value == "false" || value == "no" || value == "off")
+                return false;
+
+        throw std::runtime_error(flag + " expects true/false (or 1/0), got: " + value);
 }
 
 static unsigned int parseWorkerCount(const std::string &flag, const std::string &value)
@@ -481,6 +500,29 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                         continue;
                 }
 
+                if (arg.rfind("--latency-sample-interval=", 0) == 0) {
+                        RawOptions::latency_sample_interval = parseWorkerCount("--latency-sample-interval", arg.substr(sizeof("--latency-sample-interval=") - 1));
+                        continue;
+                }
+                if (arg == "--latency-sample-interval") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--latency-sample-interval requires a value");
+                        RawOptions::latency_sample_interval = parseWorkerCount("--latency-sample-interval", argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--per-frame-logs=", 0) == 0) {
+                        RawOptions::per_frame_logs = parseBoolString("--per-frame-logs", arg.substr(sizeof("--per-frame-logs=") - 1));
+                        continue;
+                }
+                if (arg == "--per-frame-logs") {
+                        if (i + 1 < argc && argv[i + 1][0] != '-')
+                                RawOptions::per_frame_logs = parseBoolString("--per-frame-logs", argv[++i]);
+                        else
+                                RawOptions::per_frame_logs = true;
+                        continue;
+                }
+
                 /* not a CinePi flag – forward it */
                 forward.push_back(argv[i]);
         }
@@ -542,13 +584,15 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                      Zoom(),
                      scaler_crops_rects.size());
 
-        spdlog::info("cinepi-cli: encode_workers={} disk_workers={} encode_affinity={} disk_affinity={} encode_nice={} disk_nice={}",
+        spdlog::info("cinepi-cli: encode_workers={} disk_workers={} encode_affinity={} disk_affinity={} encode_nice={} disk_nice={} latency_sample_interval={} per_frame_logs={}",
                       RawOptions::encode_workers,
                       RawOptions::disk_workers,
                       cpuListToString(RawOptions::encode_affinity),
                       cpuListToString(RawOptions::disk_affinity),
                       RawOptions::encode_nice ? std::to_string(*RawOptions::encode_nice) : std::string("auto"),
-                      RawOptions::disk_nice ? std::to_string(*RawOptions::disk_nice) : std::string("auto"));
+                      RawOptions::disk_nice ? std::to_string(*RawOptions::disk_nice) : std::string("auto"),
+                      RawOptions::latency_sample_interval,
+                      RawOptions::per_frame_logs ? "true" : "false");
 
         return ok;
 }

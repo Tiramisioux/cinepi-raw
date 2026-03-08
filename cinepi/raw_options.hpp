@@ -61,4 +61,8 @@ struct RawOptions : public VideoOptions
     std::optional<std::vector<int>> disk_affinity;
     std::optional<int> encode_nice;
     std::optional<int> disk_nice;
+
+    /* observability / logging tuning */
+    uint32_t latency_sample_interval { 10 };
+    bool per_frame_logs { false };
 };

@@ -52,11 +52,18 @@ public:
 		uint64_t fn);
 
 	int bufferSize(){
-		return disk_buffer_.size();
+		std::lock_guard<std::mutex> lock(disk_mutex_);
+		return static_cast<int>(disk_buffer_.size());
 	}
 	uint64_t getFrameCount(){
 		return frames_;
 	}
+
+	size_t encodeQueueSize() const { return encode_queue_size_.load(std::memory_order_relaxed); }
+	size_t diskQueueSize() const { return disk_queue_size_.load(std::memory_order_relaxed); }
+	size_t ramBuffers() const { return ram_buffers_.load(std::memory_order_relaxed); }
+	std::optional<uint32_t> sampledEncodeLatencyMs() const;
+	std::optional<uint32_t> sampledDiskLatencyMs() const;
 
 	uint16_t photometric;
 	uint16_t samples_per_pixel;
@@ -98,6 +105,13 @@ private:
 
     /* ──  NEW: in-RAM buffer accounting  ─────────────────────── */
     std::atomic<size_t>   ram_buffers_{0};   /* # TIFF blocks living in RAM   */
+    std::atomic<size_t>   encode_queue_size_{0};
+    std::atomic<size_t>   disk_queue_size_{0};
+    std::atomic<uint32_t> sampled_encode_latency_ms_{0};
+    std::atomic<uint32_t> sampled_disk_latency_ms_{0};
+    std::atomic<bool>     has_sampled_encode_latency_{false};
+    std::atomic<bool>     has_sampled_disk_latency_{false};
+    uint32_t              latency_sample_interval_{10};
     size_t                max_ram_buffers_;  /* hard cap calculated at setup  */
     std::mutex            ram_mtx_;
     std::condition_variable ram_cv_;

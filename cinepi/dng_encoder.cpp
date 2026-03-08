@@ -125,9 +125,37 @@ static const std::map<PixelFormat,int> mono_formats = {
 
 bool mono_ = false;   // add as a private member of DngEncoder
 
+static inline void decrementIfPositive(std::atomic<size_t> &counter)
+{
+    size_t current = counter.load(std::memory_order_relaxed);
+    while (current > 0 &&
+           !counter.compare_exchange_weak(current,
+                                          current - 1,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed))
+    {
+    }
+}
+
 void DngEncoder::setWallClockTimestamp(uint64_t us)
 {
     wallclock_ts_us_ = us;
+}
+
+std::optional<uint32_t> DngEncoder::sampledEncodeLatencyMs() const
+{
+    if (!has_sampled_encode_latency_.load(std::memory_order_acquire))
+        return std::nullopt;
+
+    return sampled_encode_latency_ms_.load(std::memory_order_relaxed);
+}
+
+std::optional<uint32_t> DngEncoder::sampledDiskLatencyMs() const
+{
+    if (!has_sampled_disk_latency_.load(std::memory_order_acquire))
+        return std::nullopt;
+
+    return sampled_disk_latency_ms_.load(std::memory_order_relaxed);
 }
 
 void pack_8bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
@@ -284,6 +312,9 @@ DngEncoder::DngEncoder(RawOptions const *options)
     if (!console)
         console = spdlog::stdout_color_mt("dng_encoder");
 
+    if (options_ && options_->per_frame_logs)
+        console->set_level(spdlog::level::debug);
+
     if (options_)
     {
         encode_worker_count_ = std::max<uint32_t>(1, options_->encode_workers);
@@ -292,6 +323,7 @@ DngEncoder::DngEncoder(RawOptions const *options)
         disk_affinity_       = options_->disk_affinity;
         encode_nice_         = options_->encode_nice;
         disk_nice_           = options_->disk_nice;
+        latency_sample_interval_ = std::max<uint32_t>(1, options_->latency_sample_interval);
     }
     else
     {
@@ -342,6 +374,15 @@ void DngEncoder::stopThreads()
 
     encode_threads_.clear();
     disk_threads_.clear();
+
+    {
+        std::lock_guard<std::mutex> lock(encode_mutex_);
+        encode_queue_size_.store(encode_queue_.size(), std::memory_order_relaxed);
+    }
+    {
+        std::lock_guard<std::mutex> lock(disk_mutex_);
+        disk_queue_size_.store(disk_buffer_.size(), std::memory_order_relaxed);
+    }
 }
 
 void DngEncoder::configureThreadContext(const std::string &baseName,
@@ -430,6 +471,7 @@ void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const 
         std::lock_guard<std::mutex> lock(encode_mutex_);
         EncodeItem item = { mem, size, info, lomem, losize, loinfo, metadata, timestamp_us, index_++ };
         encode_queue_.push(item);
+        encode_queue_size_.fetch_add(1, std::memory_order_relaxed);
         encode_cond_var_.notify_one();
     }
 }
@@ -857,6 +899,7 @@ void DngEncoder::encodeThread(int num)
 
             encode_item = encode_queue_.front();
             encode_queue_.pop();
+            decrementIfPositive(encode_queue_size_);
         }
 
         frames_ = encode_item.index;
@@ -924,13 +967,29 @@ void DngEncoder::encodeThread(int num)
 
             std::lock_guard<std::mutex> lock(disk_mutex_);
             disk_buffer_.push(std::move(item));
+            disk_queue_size_.fetch_add(1, std::memory_order_relaxed);
             disk_cond_var_.notify_one();
         }
 
         auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        console->info("Thread[{}] {} Time taken for the encode: {} ms, disk queue:{}  Size:{}",
-                      num, encode_item.index, duration, disk_buffer_.size(), tiff_size);
+        const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+        const bool sample_latency = ((encode_item.index % latency_sample_interval_) == 0);
+        if (sample_latency)
+        {
+            sampled_encode_latency_ms_.store(static_cast<uint32_t>(duration), std::memory_order_relaxed);
+            has_sampled_encode_latency_.store(true, std::memory_order_release);
+        }
+
+        if (options_ && options_->per_frame_logs && console->should_log(spdlog::level::debug))
+        {
+            console->debug("Thread[{}] {} encode={} ms, disk queue:{} size:{}",
+                           num,
+                           encode_item.index,
+                           duration,
+                           disk_queue_size_.load(std::memory_order_relaxed),
+                           tiff_size);
+        }
 
         /* mark the camera buffer as reusable */
         input_done_callback_(nullptr);
@@ -961,6 +1020,7 @@ void DngEncoder::diskThread(int num)
 
             disk_item = disk_buffer_.front();
             disk_buffer_.pop();
+            decrementIfPositive(disk_queue_size_);
         }
 
         std::ostringstream oss;
@@ -974,7 +1034,8 @@ void DngEncoder::diskThread(int num)
     
         console->trace("Thread[{}]  Save frame to disk: {}", num, disk_item.index);
 
-        console->info("DNG written: {}", filename);
+        if (options_ && options_->per_frame_logs && console->should_log(spdlog::level::debug))
+            console->debug("DNG written: {}", filename);
         
         auto start_time = std::chrono::high_resolution_clock::now();
         
@@ -1007,8 +1068,17 @@ void DngEncoder::diskThread(int num)
         }
 
         auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        console->info("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
+        const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+        const bool sample_latency = ((disk_item.index % latency_sample_interval_) == 0);
+        if (sample_latency)
+        {
+            sampled_disk_latency_ms_.store(static_cast<uint32_t>(duration), std::memory_order_relaxed);
+            has_sampled_disk_latency_.store(true, std::memory_order_release);
+        }
+
+        if (options_ && options_->per_frame_logs && console->should_log(spdlog::level::debug))
+            console->debug("Thread[{}] {} disk io={} ms", num, disk_item.index, duration);
     }
 }
 
@@ -1026,7 +1096,9 @@ void DngEncoder::clearPool()
                 if (ram_buffers_ > 0) --ram_buffers_;
             }
             disk_buffer_.pop();
+            decrementIfPositive(disk_queue_size_);
         }
+        disk_queue_size_.store(disk_buffer_.size(), std::memory_order_relaxed);
         ram_cv_.notify_all();
     }
 }
