@@ -1,9 +1,13 @@
 #include "cinepi_sound.hpp"
+#include <algorithm>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
 #include <boost/rational.hpp>
 #include <boost/numeric/conversion/cast.hpp>
+#include <cmath>
+#include <cstring>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <unordered_set>
 #include <sys/wait.h>
@@ -11,7 +15,208 @@
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
 constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
 
-constexpr double AUDIO_TRIM_OFFSET_MS = 120.0; // milliseconds
+// The first audio buffer marker lands after the hardware has already started
+// filling the capture pipeline. Subtract this latency when estimating the
+// point where the recorded content actually begins.
+constexpr double AUDIO_CAPTURE_LATENCY_MS = 120.0; // milliseconds
+constexpr double FILTER_EPSILON_SECONDS = 1.0e-6;
+
+namespace {
+
+std::string shellQuote(const std::string &value)
+{
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'')
+            quoted += "'\\''";
+        else
+            quoted += ch;
+    }
+    quoted += "'";
+    return quoted;
+}
+
+std::string formatSeconds(double value)
+{
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(6) << std::max(0.0, value);
+    return oss.str();
+}
+
+std::optional<double> probeDurationSeconds(const std::string &filename)
+{
+    std::ostringstream cmd;
+    cmd << "ffprobe -v error -show_entries format=duration "
+        << "-of default=noprint_wrappers=1:nokey=1 "
+        << shellQuote(filename);
+
+    FILE *fp = popen(cmd.str().c_str(), "r");
+    if (!fp)
+        return std::nullopt;
+
+    char buffer[256];
+    std::string output;
+    while (fgets(buffer, sizeof(buffer), fp) != nullptr)
+        output += buffer;
+
+    int rc = pclose(fp);
+    if (rc != 0)
+        return std::nullopt;
+
+    try {
+        size_t parsed = 0;
+        double seconds = std::stod(output, &parsed);
+        (void)parsed;
+        if (std::isfinite(seconds) && seconds >= 0.0)
+            return seconds;
+    } catch (...) {
+    }
+
+    return std::nullopt;
+}
+
+std::string buildAtempoFilter(double tempo)
+{
+    if (!std::isfinite(tempo) || tempo <= 0.0)
+        return {};
+
+    std::vector<double> stages;
+    while (tempo < 0.5) {
+        stages.push_back(0.5);
+        tempo /= 0.5;
+    }
+    while (tempo > 2.0) {
+        stages.push_back(2.0);
+        tempo /= 2.0;
+    }
+    stages.push_back(tempo);
+
+    std::ostringstream oss;
+    bool first = true;
+    for (double stage : stages) {
+        if (!first)
+            oss << ',';
+        oss << "atempo=" << formatSeconds(stage);
+        first = false;
+    }
+    return oss.str();
+}
+
+uint64_t chooseAudioStartTimestamp(uint64_t first_buffer_before,
+                                   uint64_t first_buffer_after,
+                                   uint64_t process_start)
+{
+    uint64_t chosen = 0;
+    for (uint64_t candidate : { first_buffer_before, first_buffer_after }) {
+        if (candidate == 0)
+            continue;
+        if (chosen == 0 || candidate < chosen)
+            chosen = candidate;
+    }
+
+    if (chosen == 0)
+        chosen = process_start;
+
+    return chosen;
+}
+
+double fallbackDurationFromSamples(int samplesCaptured, int sampleRate)
+{
+    if (samplesCaptured <= 0 || sampleRate <= 0)
+        return 0.0;
+
+    return static_cast<double>(samplesCaptured) / static_cast<double>(sampleRate);
+}
+
+int bcdToInt(uint8_t value)
+{
+    return ((value >> 4) & 0x0f) * 10 + (value & 0x0f);
+}
+
+std::string buildTimecodeString(const std::array<uint8_t, 8> &timecode)
+{
+    std::ostringstream oss;
+    oss << std::setw(2) << std::setfill('0') << bcdToInt(timecode[3]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[2]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[1]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[0]);
+    return oss.str();
+}
+
+std::string formatOriginationDate(const std::array<uint16_t, 3> &originationDate)
+{
+    std::ostringstream oss;
+    oss << std::setw(4) << std::setfill('0') << static_cast<int>(originationDate[0]) << '-'
+        << std::setw(2) << std::setfill('0') << static_cast<int>(originationDate[1]) << '-'
+        << std::setw(2) << std::setfill('0') << static_cast<int>(originationDate[2]);
+    return oss.str();
+}
+
+std::string formatOriginationTime(const std::array<uint8_t, 8> &timecode)
+{
+    std::ostringstream oss;
+    oss << std::setw(2) << std::setfill('0') << bcdToInt(timecode[3]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[2]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[1]);
+    return oss.str();
+}
+
+uint64_t computeTimeReferenceSamples(const std::array<uint8_t, 8> &timecode,
+                                     int sampleRate,
+                                     double framerate)
+{
+    if (sampleRate <= 0)
+        return 0;
+
+    const uint64_t hours = static_cast<uint64_t>(bcdToInt(timecode[3]));
+    const uint64_t minutes = static_cast<uint64_t>(bcdToInt(timecode[2]));
+    const uint64_t seconds = static_cast<uint64_t>(bcdToInt(timecode[1]));
+    const uint64_t frames = static_cast<uint64_t>(bcdToInt(timecode[0]));
+
+    uint64_t timeReference = ((hours * 3600ULL) + (minutes * 60ULL) + seconds) *
+                             static_cast<uint64_t>(sampleRate);
+
+    if (std::isfinite(framerate) && framerate > 0.0 && frames > 0) {
+        const double frameSamples =
+            static_cast<double>(frames) * static_cast<double>(sampleRate) / framerate;
+        timeReference += static_cast<uint64_t>(std::llround(frameSamples));
+    }
+
+    return timeReference;
+}
+
+std::string ffmpegCodecForAudioFormat(const std::string &audioFormat)
+{
+    if (audioFormat == "S24_3LE")
+        return "pcm_s24le";
+    if (audioFormat == "S16_LE")
+        return "pcm_s16le";
+    return "pcm_s16le";
+}
+
+void writeLe32(std::ostream &stream, uint32_t value)
+{
+    const char bytes[4] = {
+        static_cast<char>(value & 0xff),
+        static_cast<char>((value >> 8) & 0xff),
+        static_cast<char>((value >> 16) & 0xff),
+        static_cast<char>((value >> 24) & 0xff),
+    };
+    stream.write(bytes, sizeof(bytes));
+}
+
+int shellExitCode(int status)
+{
+    if (status < 0)
+        return status;
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return status;
+}
+
+} // namespace
 
 // A helper function to convert a double to a rational number
 boost::rational<int> doubleToRational(double value, double tolerance = 1.0e-6) {
@@ -44,10 +249,6 @@ boost::rational<int> doubleToRational(double value, double tolerance = 1.0e-6) {
     }
 
     return boost::rational<int>(middle_n * sign, middle_d);
-}
-
-bool file_exists(const std::string& path) {
-    return std::filesystem::exists(path);
 }
 
 FILE * popen2(std::string command, std::string type, int & pid)
@@ -468,65 +669,156 @@ void CinePISound::soundThread() {
                 vts_end = app_->GetEncoder()->timestamps.back();
             }
 
-            double vts_delta = (vts_end - vts_start) / 1e9;
-            if (vts_start < static_cast<int64_t>(ts_first_buffer_b)) {
-                console->critical("Frame start before audio!!!!");
-                return;
+            if (frames <= 0 || vts_end < vts_start) {
+                console->critical("Cannot retime WAV: invalid video timestamp range");
+                continue;
             }
 
-            double trim_offset_seconds = AUDIO_TRIM_OFFSET_MS / 1000.0;
-            double start_time = (vts_start - ts_first_buffer_b) / 1e9 - trim_offset_seconds;
+            double video_span_seconds = (vts_end - vts_start) / 1e9;
+            double average_frame_duration_seconds = 0.0;
+            if (frames > 1)
+                average_frame_duration_seconds = video_span_seconds / static_cast<double>(frames - 1);
+            else if (options_->framerate && *options_->framerate > 0.0)
+                average_frame_duration_seconds = 1.0 / static_cast<double>(*options_->framerate);
+
+            double video_duration_seconds = video_span_seconds + average_frame_duration_seconds;
+            if (video_duration_seconds <= 0.0)
+                video_duration_seconds = video_span_seconds;
+
+            const uint64_t audio_marker_ns = chooseAudioStartTimestamp(
+                ts_first_buffer_b,
+                ts_first_buffer_a,
+                ts_start);
+            if (audio_marker_ns == 0) {
+                console->critical("Cannot retime WAV: no audio start marker received");
+                continue;
+            }
+
+            const double latency_bias_seconds = AUDIO_CAPTURE_LATENCY_MS / 1000.0;
+            const double audio_content_start_seconds =
+                static_cast<double>(audio_marker_ns) / 1e9 - latency_bias_seconds;
+            const double video_start_seconds =
+                static_cast<double>(vts_start) / 1e9;
+            const double start_delta_seconds =
+                audio_content_start_seconds - video_start_seconds;
+
+            double trim_start_seconds = 0.0;
+            double pad_start_seconds = 0.0;
+            if (start_delta_seconds < 0.0)
+                trim_start_seconds = -start_delta_seconds;
+            else
+                pad_start_seconds = start_delta_seconds;
+
+            auto probed_input_duration = probeDurationSeconds(filename);
+            double input_duration_seconds = probed_input_duration.value_or(
+                fallbackDurationFromSamples(samples_captured, audioSampleRate));
+
+            if (input_duration_seconds <= 0.0) {
+                console->critical("Cannot retime WAV: failed to determine audio duration");
+                continue;
+            }
+
+            trim_start_seconds = std::clamp(trim_start_seconds, 0.0, input_duration_seconds);
+            double content_input_duration_seconds =
+                std::max(0.0, input_duration_seconds - trim_start_seconds);
+            double content_target_duration_seconds =
+                std::max(0.0, video_duration_seconds - pad_start_seconds);
+
+            double tempo = 1.0;
+            if (content_input_duration_seconds > FILTER_EPSILON_SECONDS &&
+                content_target_duration_seconds > FILTER_EPSILON_SECONDS) {
+                tempo = content_input_duration_seconds / content_target_duration_seconds;
+            }
+
+            console->info(
+                "Retiming WAV: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, trim {:.6f}s, pad {:.6f}s, tempo {:.6f}",
+                video_duration_seconds,
+                input_duration_seconds,
+                start_delta_seconds,
+                trim_start_seconds,
+                pad_start_seconds,
+                tempo);
 
             std::ostringstream tmp_oss;
             tmp_oss << options_->mediaDest << '/' << options_->folder << "/temp.wav";
-            std::ostringstream xml_oss;
-            xml_oss << options_->mediaDest << '/' << options_->folder << "/" << options_->folder << ".xml";
+
+            std::vector<std::string> filters;
+            if (trim_start_seconds > FILTER_EPSILON_SECONDS)
+                filters.push_back("atrim=start=" + formatSeconds(trim_start_seconds));
+            filters.push_back("asetpts=PTS-STARTPTS");
+
+            if (std::abs(tempo - 1.0) > 1.0e-4) {
+                auto atempo = buildAtempoFilter(tempo);
+                if (!atempo.empty())
+                    filters.push_back(atempo);
+            }
+
+            if (pad_start_seconds > FILTER_EPSILON_SECONDS) {
+                long long pad_start_ms = llround(pad_start_seconds * 1000.0);
+                filters.push_back("adelay=" + std::to_string(std::max<long long>(0, pad_start_ms)) + ":all=true");
+            }
+
+            filters.push_back("apad");
+
+            std::ostringstream filter_oss;
+            for (size_t i = 0; i < filters.size(); ++i) {
+                if (i)
+                    filter_oss << ',';
+                filter_oss << filters[i];
+            }
+
             std::ostringstream ffmpeg_oss;
-            ffmpeg_oss << "ffmpeg -y -i " << filename
-                       << " -ss " << start_time
-                       << " -t " << vts_delta
+            auto& oTC = app_->GetEncoder()->originationTimeCode;
+            auto& oDt = app_->GetEncoder()->originationDate;
+            const double output_framerate =
+                (options_->framerate && *options_->framerate > 0.0) ? *options_->framerate : 0.0;
+            const std::string timecode_tag = buildTimecodeString(oTC);
+            const std::string origination_date = formatOriginationDate(oDt);
+            const std::string origination_time = formatOriginationTime(oTC);
+            const uint64_t time_reference =
+                computeTimeReferenceSamples(oTC, audioSampleRate, output_framerate);
+
+            const std::string ffmpeg_codec = ffmpegCodecForAudioFormat(audioFormat);
+
+            ffmpeg_oss << "ffmpeg -hide_banner -loglevel error -y -i " << shellQuote(filename)
+                       << " -filter:a " << shellQuote(filter_oss.str())
+                       << " -t " << formatSeconds(video_duration_seconds)
+                       << " -ac " << audioChannels
                        << " -ar " << audioSampleRate
-                       << " -acodec pcm_s16le " << tmp_oss.str() << " > /dev/null 2>&1";
+                       << " -c:a " << ffmpeg_codec
+                       << " -write_bext 1"
+                       << " -metadata " << shellQuote("description=CinePI Description")
+                       << " -metadata " << shellQuote("originator=" + options_->ucm.value_or("CinePI"))
+                       << " -metadata " << shellQuote("originator_reference=" + options_->serial)
+                       << " -metadata " << shellQuote("origination_date=" + origination_date)
+                       << " -metadata " << shellQuote("origination_time=" + origination_time)
+                       << " -metadata " << shellQuote("time_reference=" + std::to_string(time_reference))
+                       << " -metadata " << shellQuote("timecode=" + timecode_tag)
+                       << ' ' << shellQuote(tmp_oss.str());
 
-            system(ffmpeg_oss.str().c_str());
-            system(("mv " + tmp_oss.str() + " " + filename).c_str());
+            std::string ffmpeg_error;
+            const int ffmpeg_status = run_with_stderr_capture(ffmpeg_oss.str(), ffmpeg_error);
+            if (shellExitCode(ffmpeg_status) != 0) {
+                console->critical("ffmpeg WAV retime failed (rc={}): {}",
+                                  shellExitCode(ffmpeg_status),
+                                  ffmpeg_error.empty() ? "no stderr output" : ffmpeg_error);
+                continue;
+            }
 
-            generateXML(xml_oss.str());
+            std::error_code rename_ec;
+            std::filesystem::rename(tmp_oss.str(), filename, rename_ec);
+            if (rename_ec) {
+                console->critical("Failed to replace WAV with retimed version: {}", rename_ec.message());
+                continue;
+            }
 
-            if (file_exists(xml_oss.str())) {
-                std::ostringstream bwfedit;
-                bwfedit << "bwfmetaedit " << filename << " --in-iXML=" << xml_oss.str();
-                std::ostringstream bwfedit_core;
-                auto& oTC = app_->GetEncoder()->originationTimeCode;
-                auto& oDt = app_->GetEncoder()->originationDate;
-
-                uint64_t timeReference = (static_cast<uint64_t>(oTC[0]) * 3600 * audioSampleRate)
-                                       + (static_cast<uint64_t>(oTC[1]) * 60 * audioSampleRate)
-                                       + (static_cast<uint64_t>(oTC[2]) * audioSampleRate);
-
-                std::ostringstream timeStr;
-                timeStr << std::setw(2) << std::setfill('0') << static_cast<int>(oTC[0]) << ":"
-                        << std::setw(2) << std::setfill('0') << static_cast<int>(oTC[1]) << ":"
-                        << std::setw(2) << std::setfill('0') << static_cast<int>(oTC[2]);
-                std::ostringstream dateStr;
-                dateStr << std::setw(4) << std::setfill('0') << static_cast<int>(oDt[0]) << "-"
-                        << std::setw(2) << static_cast<int>(oDt[1]) << "-"
-                        << std::setw(2) << static_cast<int>(oDt[2]);
-
-                bwfedit_core << "bwfmetaedit " << filename
-                             << " --BextVersion=1"
-                             << " --Description='CinePI Description'"
-                             << " --Originator='" << options_->ucm.value_or("CinePI") << "'"
-                             << " --OriginatorReference='" << options_->serial << "'"
-                             << " --OriginationDate=" << dateStr.str()
-                             << " --OriginationTime=" << timeStr.str()
-                             << " --TimeReference=" << timeReference;
-
-                system(bwfedit.str().c_str());
-                system(("rm " + xml_oss.str()).c_str());
-                system(bwfedit_core.str().c_str());
+            const std::string ixml = generateIXML();
+            if (!appendIXMLChunk(filename, ixml)) {
+                console->critical("Failed to append iXML chunk to WAV");
             } else {
-                console->critical("XML does not exist!");
+                console->info("Attached WAV metadata: timecode {}, rate {}, BEXT + iXML",
+                              timecode_tag,
+                              output_framerate);
             }
 
             vu_meter.fill(0);
@@ -563,7 +855,7 @@ void CinePISound::soundThread() {
     }
 }
 
-void CinePISound::generateXML(std::string fn) {
+std::string CinePISound::generateIXML() const {
     boost::property_tree::ptree tree;
 
     tree.put("BWFXML.IXML_VERSION", "1.5");
@@ -572,7 +864,9 @@ void CinePISound::generateXML(std::string fn) {
     tree.put("BWFXML.CIRCLED", "true");
     tree.put("BWFXML.TAPE", "CINEPI");
 
-    boost::rational<int> r = doubleToRational(*options_->framerate);
+    const double framerate =
+        (options_->framerate && *options_->framerate > 0.0) ? *options_->framerate : 0.0;
+    boost::rational<int> r = doubleToRational(framerate > 0.0 ? framerate : 25.0);
     std::string tfps = std::to_string(r.numerator()) + "/" + std::to_string(r.denominator());
 
     tree.put("BWFXML.SPEED.MASTER_SPEED", tfps);
@@ -581,7 +875,43 @@ void CinePISound::generateXML(std::string fn) {
     tree.put("BWFXML.SPEED.TIMECODE_FLAG", "NDF");
 
     boost::property_tree::xml_writer_settings<std::string> settings('\t', 1);
-    boost::property_tree::write_xml(fn, tree, std::locale(), settings);
+    std::ostringstream oss;
+    boost::property_tree::write_xml(oss, tree, settings);
+    return oss.str();
+}
+
+bool CinePISound::appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload) {
+    std::fstream stream(wav_path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!stream) {
+        console->error("appendIXMLChunk(): failed to open {}", wav_path);
+        return false;
+    }
+
+    char riff_header[12];
+    stream.read(riff_header, sizeof(riff_header));
+    if (stream.gcount() != static_cast<std::streamsize>(sizeof(riff_header)) ||
+        std::memcmp(riff_header, "RIFF", 4) != 0 ||
+        std::memcmp(riff_header + 8, "WAVE", 4) != 0) {
+        console->error("appendIXMLChunk(): {} is not a RIFF/WAVE file", wav_path);
+        return false;
+    }
+
+    stream.seekp(0, std::ios::end);
+    stream.write("iXML", 4);
+    writeLe32(stream, static_cast<uint32_t>(xml_payload.size()));
+    stream.write(xml_payload.data(), static_cast<std::streamsize>(xml_payload.size()));
+    if (xml_payload.size() % 2 != 0)
+        stream.put('\0');
+
+    const std::streamoff file_size = stream.tellp();
+    if (file_size < 8) {
+        console->error("appendIXMLChunk(): invalid final WAV size for {}", wav_path);
+        return false;
+    }
+
+    stream.seekp(4, std::ios::beg);
+    writeLe32(stream, static_cast<uint32_t>(file_size - 8));
+    return stream.good();
 }
 
 std::string CinePISound::getPreferredMonitorOutput() {

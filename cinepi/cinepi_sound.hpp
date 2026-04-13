@@ -51,7 +51,8 @@ private:
     void parseHardwareParams();
     bool tryAudioConfig(const std::string& device, const std::string& format, int channels, int rate);
     bool recording_ended();
-    void generateXML(std::string fn);
+    std::string generateIXML() const;
+    bool appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload);
     void publishMicSelection();
     std::vector<std::string> parseArecordAliases();
     void stopMonitoring();
