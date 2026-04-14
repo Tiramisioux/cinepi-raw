@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <csignal>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <regex>
@@ -51,8 +52,9 @@ private:
     void parseHardwareParams();
     bool tryAudioConfig(const std::string& device, const std::string& format, int channels, int rate);
     bool recording_ended();
-    std::string generateIXML() const;
+    std::string generateIXML(const std::array<uint8_t, 8>& timecode, double framerate) const;
     bool appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload);
+    void resetTakeMetadata();
     void publishMicSelection();
     std::vector<std::string> parseArecordAliases();
     void stopMonitoring();
@@ -79,6 +81,10 @@ private:
     RawOptions *options_;
     bool abortThread_;
     std::thread sound_thread_;
+    std::array<uint8_t, 8> takeStartTimeCode_{};
+    std::array<uint16_t, 3> takeStartOriginationDate_{};
+    double takeStartFramerate_ = 0.0;
+    bool takeStartMetadataValid_ = false;
 
     std::string getPreferredMonitorOutput();
     int monitor_pid = -1;

@@ -6,8 +6,10 @@
 #include <boost/numeric/conversion/cast.hpp>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <regex>
 #include <unordered_set>
 #include <sys/wait.h>
@@ -133,6 +135,12 @@ int bcdToInt(uint8_t value)
     return ((value >> 4) & 0x0f) * 10 + (value & 0x0f);
 }
 
+uint8_t intToBcd(int value)
+{
+    value = std::clamp(value, 0, 99);
+    return static_cast<uint8_t>(((value / 10) << 4) | (value % 10));
+}
+
 std::string buildTimecodeString(const std::array<uint8_t, 8> &timecode)
 {
     std::ostringstream oss;
@@ -214,6 +222,99 @@ int shellExitCode(int status)
     if (WIFSIGNALED(status))
         return 128 + WTERMSIG(status);
     return status;
+}
+
+double configuredFramerate(const RawOptions *options)
+{
+    return (options && options->framerate && *options->framerate > 0.0)
+               ? *options->framerate
+               : 0.0;
+}
+
+struct ParsedWavMetadata
+{
+    std::array<uint8_t, 8> timecode{};
+    std::array<uint16_t, 3> originationDate{};
+    double framerate = 0.0;
+};
+
+std::optional<ParsedWavMetadata> buildMetadataFromWallclockNs(int64_t timestampNs,
+                                                              double framerate)
+{
+    if (timestampNs < 0)
+        return std::nullopt;
+
+    const time_t seconds = static_cast<time_t>(timestampNs / 1000000000LL);
+    const int64_t subsecondNs = timestampNs % 1000000000LL;
+    std::tm *localTime = localtime(&seconds);
+    if (!localTime)
+        return std::nullopt;
+
+    int frame = 0;
+    if (std::isfinite(framerate) && framerate > 0.0) {
+        const double fraction = static_cast<double>(subsecondNs) / 1e9;
+        frame = static_cast<int>(std::floor((fraction * framerate) + 1.0e-9));
+        const int maxFrame = std::max(0, static_cast<int>(std::ceil(framerate)) - 1);
+        frame = std::clamp(frame, 0, maxFrame);
+    }
+
+    ParsedWavMetadata metadata;
+    metadata.timecode = {
+        intToBcd(frame),
+        intToBcd(localTime->tm_sec),
+        intToBcd(localTime->tm_min),
+        intToBcd(localTime->tm_hour),
+        0, 0, 0, 0
+    };
+    metadata.originationDate = {
+        static_cast<uint16_t>(localTime->tm_year + 1900),
+        static_cast<uint16_t>(localTime->tm_mon + 1),
+        static_cast<uint16_t>(localTime->tm_mday)
+    };
+    metadata.framerate = framerate;
+    return metadata;
+}
+
+std::optional<ParsedWavMetadata> parseTakeMetadataFromFolder(const std::string &folder,
+                                                             double fallbackFramerate)
+{
+    static const std::regex takeRegex(
+        R"(^CINEPI_(\d{2})-(\d{2})-(\d{2})_(\d{2})(\d{2})(\d{2})_F(\d{2})_C\d+_(cam[01X])$)");
+
+    std::smatch match;
+    if (!std::regex_match(folder, match, takeRegex))
+        return std::nullopt;
+
+    const int year = 2000 + std::stoi(match[1].str());
+    const int month = std::stoi(match[2].str());
+    const int day = std::stoi(match[3].str());
+    const int hour = std::stoi(match[4].str());
+    const int minute = std::stoi(match[5].str());
+    const int second = std::stoi(match[6].str());
+    const double folderFramerate = static_cast<double>(std::stoi(match[7].str()));
+
+    if (month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+        second < 0 || second > 59) {
+        return std::nullopt;
+    }
+
+    ParsedWavMetadata metadata;
+    // Take names are second-precision only, so frame 00 is the deterministic fallback.
+    metadata.timecode = {
+        intToBcd(0),
+        intToBcd(second),
+        intToBcd(minute),
+        intToBcd(hour),
+        0, 0, 0, 0
+    };
+    metadata.originationDate = {
+        static_cast<uint16_t>(year),
+        static_cast<uint16_t>(month),
+        static_cast<uint16_t>(day)
+    };
+    metadata.framerate = folderFramerate > 0.0 ? folderFramerate : fallbackFramerate;
+    return metadata;
 }
 
 } // namespace
@@ -459,6 +560,24 @@ void CinePISound::record_start() {
     }
 
     stopMonitoring();
+    resetTakeMetadata();
+
+    if (auto fallbackMetadata =
+            parseTakeMetadataFromFolder(options_->folder, configuredFramerate(options_))) {
+        takeStartTimeCode_ = fallbackMetadata->timecode;
+        takeStartOriginationDate_ = fallbackMetadata->originationDate;
+        takeStartFramerate_ = fallbackMetadata->framerate;
+        takeStartMetadataValid_ = true;
+
+        const std::string fallbackRate =
+            takeStartFramerate_ > 0.0 ? formatSeconds(takeStartFramerate_) : std::string("unknown");
+        console->info("Cached fallback WAV metadata from take name: {} ({} fps)",
+                      buildTimecodeString(takeStartTimeCode_),
+                      fallbackRate);
+    } else {
+        console->warn("Unable to parse deterministic fallback WAV metadata from take name: {}",
+                      options_->folder);
+    }
 
     std::ostringstream oss;
     oss << options_->mediaDest << '/' << options_->folder << '/' << options_->folder << ".wav";
@@ -768,15 +887,36 @@ void CinePISound::soundThread() {
             }
 
             std::ostringstream ffmpeg_oss;
-            auto& oTC = app_->GetEncoder()->originationTimeCode;
-            auto& oDt = app_->GetEncoder()->originationDate;
-            const double output_framerate =
-                (options_->framerate && *options_->framerate > 0.0) ? *options_->framerate : 0.0;
-            const std::string timecode_tag = buildTimecodeString(oTC);
-            const std::string origination_date = formatOriginationDate(oDt);
-            const std::string origination_time = formatOriginationTime(oTC);
+            const auto &encoderTimecode = app_->GetEncoder()->originationTimeCode;
+            const auto &encoderDate = app_->GetEncoder()->originationDate;
+            double output_framerate =
+                takeStartFramerate_ > 0.0 ? takeStartFramerate_ : configuredFramerate(options_);
+
+            std::array<uint8_t, 8> metadataTimecode = encoderTimecode;
+            std::array<uint16_t, 3> metadataDate = encoderDate;
+            std::string metadataSource = "encoder";
+
+            const int64_t audioContentStartNs =
+                static_cast<int64_t>(std::llround(audio_content_start_seconds * 1e9));
+            if (auto audioStartMetadata =
+                    buildMetadataFromWallclockNs(audioContentStartNs, output_framerate)) {
+                metadataTimecode = audioStartMetadata->timecode;
+                metadataDate = audioStartMetadata->originationDate;
+                output_framerate = audioStartMetadata->framerate;
+                metadataSource = "audio-start";
+            } else if (takeStartMetadataValid_) {
+                metadataTimecode = takeStartTimeCode_;
+                metadataDate = takeStartOriginationDate_;
+                if (takeStartFramerate_ > 0.0)
+                    output_framerate = takeStartFramerate_;
+                metadataSource = "take-name";
+            }
+
+            const std::string timecode_tag = buildTimecodeString(metadataTimecode);
+            const std::string origination_date = formatOriginationDate(metadataDate);
+            const std::string origination_time = formatOriginationTime(metadataTimecode);
             const uint64_t time_reference =
-                computeTimeReferenceSamples(oTC, audioSampleRate, output_framerate);
+                computeTimeReferenceSamples(metadataTimecode, audioSampleRate, output_framerate);
 
             const std::string ffmpeg_codec = ffmpegCodecForAudioFormat(audioFormat);
 
@@ -812,13 +952,14 @@ void CinePISound::soundThread() {
                 continue;
             }
 
-            const std::string ixml = generateIXML();
+            const std::string ixml = generateIXML(metadataTimecode, output_framerate);
             if (!appendIXMLChunk(filename, ixml)) {
                 console->critical("Failed to append iXML chunk to WAV");
             } else {
-                console->info("Attached WAV metadata: timecode {}, rate {}, BEXT + iXML",
+                console->info("Attached WAV metadata: timecode {}, rate {}, source {}, BEXT + iXML",
                               timecode_tag,
-                              output_framerate);
+                              output_framerate,
+                              metadataSource);
             }
 
             vu_meter.fill(0);
@@ -855,7 +996,16 @@ void CinePISound::soundThread() {
     }
 }
 
-std::string CinePISound::generateIXML() const {
+void CinePISound::resetTakeMetadata()
+{
+    takeStartTimeCode_.fill(0);
+    takeStartOriginationDate_.fill(0);
+    takeStartFramerate_ = 0.0;
+    takeStartMetadataValid_ = false;
+}
+
+std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
+                                      double framerate) const {
     boost::property_tree::ptree tree;
 
     tree.put("BWFXML.IXML_VERSION", "1.5");
@@ -863,9 +1013,7 @@ std::string CinePISound::generateIXML() const {
     tree.put("BWFXML.NOTE", "CinePI Note");
     tree.put("BWFXML.CIRCLED", "true");
     tree.put("BWFXML.TAPE", "CINEPI");
-
-    const double framerate =
-        (options_->framerate && *options_->framerate > 0.0) ? *options_->framerate : 0.0;
+    tree.put("BWFXML.TIMECODE", buildTimecodeString(timecode));
     boost::rational<int> r = doubleToRational(framerate > 0.0 ? framerate : 25.0);
     std::string tfps = std::to_string(r.numerator()) + "/" + std::to_string(r.denominator());
 
