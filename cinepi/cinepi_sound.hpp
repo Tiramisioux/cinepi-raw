@@ -65,6 +65,7 @@ private:
 
     int samples_captured;
     uint64_t ts_start, ts_first_buffer_b, ts_first_buffer_a, ts_close_file, ts_end;
+    uint64_t ts_audio_start_realtime;
     std::string audioFormat;
     int audioChannels;
     int audioSampleRate;
