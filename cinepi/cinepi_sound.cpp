@@ -17,10 +17,9 @@
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
 constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
-// Until we capture a true audio-start timestamp, helper-managed takes show the
-// recorded audio beginning about three frames after the picture take start.
-// Apply that deterministic offset only when WAV metadata falls back to the
-// take name, so the embedded WAV TC describes the first recorded samples.
+// When precise audio-start markers are unavailable, helper-managed takes often
+// show the recorded audio beginning about three frames after the picture take
+// start. Apply that deterministic offset only for take-name fallback metadata.
 constexpr int TAKE_NAME_AUDIO_START_OFFSET_FRAMES = 3;
 
 // The first audio buffer marker lands after the hardware has already started
@@ -959,23 +958,32 @@ void CinePISound::soundThread() {
                     continue;
                 }
 
-                if (!have_precise_audio_start_marker) {
-                    if (start_delta_seconds < 0.0)
-                        trim_start_seconds = -start_delta_seconds;
-                    else
-                        pad_start_seconds = start_delta_seconds;
+                if (start_delta_seconds < 0.0)
+                    trim_start_seconds = -start_delta_seconds;
+                else
+                    pad_start_seconds = start_delta_seconds;
 
-                    trim_start_seconds = std::clamp(trim_start_seconds, 0.0, input_duration_seconds);
-                    double content_input_duration_seconds =
-                        std::max(0.0, input_duration_seconds - trim_start_seconds);
-                    double content_target_duration_seconds =
-                        std::max(0.0, video_duration_seconds - pad_start_seconds);
+                trim_start_seconds = std::clamp(trim_start_seconds, 0.0, input_duration_seconds);
+                double content_input_duration_seconds =
+                    std::max(0.0, input_duration_seconds - trim_start_seconds);
+                double content_target_duration_seconds =
+                    std::max(0.0, video_duration_seconds - pad_start_seconds);
 
-                    if (content_input_duration_seconds > FILTER_EPSILON_SECONDS &&
-                        content_target_duration_seconds > FILTER_EPSILON_SECONDS) {
-                        tempo = content_input_duration_seconds / content_target_duration_seconds;
-                    }
+                if (!have_precise_audio_start_marker &&
+                    content_input_duration_seconds > FILTER_EPSILON_SECONDS &&
+                    content_target_duration_seconds > FILTER_EPSILON_SECONDS) {
+                    tempo = content_input_duration_seconds / content_target_duration_seconds;
+                }
 
+                if (have_precise_audio_start_marker) {
+                    console->info(
+                        "Aligning precise audio-start marker: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, trim {:.6f}s, pad {:.6f}s; preserving captured audio timing inside picture window",
+                        video_duration_seconds,
+                        input_duration_seconds,
+                        start_delta_seconds,
+                        trim_start_seconds,
+                        pad_start_seconds);
+                } else {
                     console->info(
                         "Retiming WAV: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, trim {:.6f}s, pad {:.6f}s, tempo {:.6f}",
                         video_duration_seconds,
@@ -984,12 +992,6 @@ void CinePISound::soundThread() {
                         trim_start_seconds,
                         pad_start_seconds,
                         tempo);
-                } else {
-                    console->info(
-                        "Using precise audio-start marker: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s; preserving captured WAV timing",
-                        video_duration_seconds,
-                        input_duration_seconds,
-                        start_delta_seconds);
                 }
             }
 
@@ -998,12 +1000,13 @@ void CinePISound::soundThread() {
 
             std::vector<std::string> filters;
             std::ostringstream filter_oss;
-            if (have_audio_start_marker && !have_precise_audio_start_marker) {
+            if (have_audio_start_marker) {
                 if (trim_start_seconds > FILTER_EPSILON_SECONDS)
                     filters.push_back("atrim=start=" + formatSeconds(trim_start_seconds));
                 filters.push_back("asetpts=PTS-STARTPTS");
 
-                if (std::abs(tempo - 1.0) > 1.0e-4) {
+                if (!have_precise_audio_start_marker &&
+                    std::abs(tempo - 1.0) > 1.0e-4) {
                     auto atempo = buildAtempoFilter(tempo);
                     if (!atempo.empty())
                         filters.push_back(atempo);
@@ -1037,19 +1040,29 @@ void CinePISound::soundThread() {
 
             if (have_audio_start_marker) {
                 if (have_precise_audio_start_marker) {
-                    if (auto audioStartMetadata =
-                            buildMetadataFromWallclockNs(static_cast<int64_t>(ts_audio_start_realtime),
-                                                         output_framerate)) {
-                        metadataTimecode = audioStartMetadata->timecode;
-                        metadataDate = audioStartMetadata->originationDate;
-                        output_framerate = audioStartMetadata->framerate;
-                        metadataSource = "audio-start";
-                    } else if (takeStartMetadataValid_) {
+                    if (takeStartMetadataValid_) {
                         metadataTimecode = takeStartTimeCode_;
                         metadataDate = takeStartOriginationDate_;
                         if (takeStartFramerate_ > 0.0)
                             output_framerate = takeStartFramerate_;
-                        metadataSource = "take-name";
+                        metadataSource = "video-start";
+                    } else if (auto videoStartMetadata =
+                                   buildMetadataFromWallclockNs(
+                                       static_cast<int64_t>(std::llround(
+                                           static_cast<double>(ts_audio_start_realtime) -
+                                           (start_delta_seconds * 1e9))),
+                                       output_framerate)) {
+                        metadataTimecode = videoStartMetadata->timecode;
+                        metadataDate = videoStartMetadata->originationDate;
+                        output_framerate = videoStartMetadata->framerate;
+                        metadataSource = "video-start";
+                    } else if (auto audioStartMetadata =
+                                   buildMetadataFromWallclockNs(static_cast<int64_t>(ts_audio_start_realtime),
+                                                                output_framerate)) {
+                        metadataTimecode = audioStartMetadata->timecode;
+                        metadataDate = audioStartMetadata->originationDate;
+                        output_framerate = audioStartMetadata->framerate;
+                        metadataSource = "audio-start";
                     }
                 } else if (takeStartMetadataValid_) {
                     metadataTimecode = takeStartTimeCode_;
@@ -1108,7 +1121,7 @@ void CinePISound::soundThread() {
             const std::string ffmpeg_codec = ffmpegCodecForAudioFormat(audioFormat);
 
             ffmpeg_oss << "ffmpeg -hide_banner -loglevel error -y -i " << shellQuote(filename);
-            if (have_audio_start_marker && !have_precise_audio_start_marker && !filters.empty()) {
+            if (have_audio_start_marker && !filters.empty()) {
                 ffmpeg_oss << " -filter:a " << shellQuote(filter_oss.str())
                            << " -t " << formatSeconds(video_duration_seconds);
             }

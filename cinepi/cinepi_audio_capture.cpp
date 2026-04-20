@@ -317,12 +317,45 @@ int main(int argc, char **argv)
     uint64_t framesCaptured = 0;
     bool emittedFirstBufferAfter = false;
     uint64_t dataBytes = 0;
+    bool draining = false;
+    std::optional<std::chrono::steady_clock::time_point> drainDeadline;
+    const auto drainGrace =
+        std::chrono::milliseconds(std::max<unsigned int>(5, periodTimeUs / 1000));
 
-    while (!stopRequested.load()) {
+    while (true) {
+        snd_pcm_sframes_t framesToRead = static_cast<snd_pcm_sframes_t>(periodFrames);
+        if (draining) {
+            snd_pcm_sframes_t available = snd_pcm_avail_update(pcm);
+            if (available < 0) {
+                err = recoverCaptureError(pcm, static_cast<int>(available));
+                if (err < 0) {
+                    std::cerr << "Capture drain failed: " << snd_strerror(err) << '\n';
+                    break;
+                }
+                continue;
+            }
+
+            if (available == 0) {
+                if (drainDeadline &&
+                    std::chrono::steady_clock::now() < *drainDeadline) {
+                    snd_pcm_wait(pcm, 1);
+                    continue;
+                }
+                break;
+            }
+
+            framesToRead = std::min<snd_pcm_sframes_t>(framesToRead, available);
+        }
+
         snd_pcm_sframes_t framesRead =
-            snd_pcm_readi(pcm, buffer.data(), periodFrames);
-        if (framesRead == -EINTR && stopRequested.load())
-            break;
+            snd_pcm_readi(pcm, buffer.data(), framesToRead);
+        if (framesRead == -EINTR && stopRequested.load()) {
+            if (!draining) {
+                draining = true;
+                drainDeadline = std::chrono::steady_clock::now() + drainGrace;
+            }
+            continue;
+        }
         if (framesRead < 0) {
             err = recoverCaptureError(pcm, static_cast<int>(framesRead));
             if (err < 0) {
@@ -348,6 +381,11 @@ int main(int argc, char **argv)
         dataBytes += static_cast<uint64_t>(bytesRead);
         framesCaptured += static_cast<uint64_t>(framesRead);
         emitVu(buffer.data(), framesRead, options.channels, formatInfo);
+
+        if (stopRequested.load() && !draining) {
+            draining = true;
+            drainDeadline = std::chrono::steady_clock::now() + drainGrace;
+        }
     }
 
     std::cout << "<SAMPLES_CAPTURED: " << framesCaptured << ">\n";
