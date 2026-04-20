@@ -334,6 +334,17 @@ std::optional<ParsedWavMetadata> offsetMetadataFrames(const ParsedWavMetadata &m
     return adjusted;
 }
 
+std::optional<ParsedWavMetadata> offsetMetadataSeconds(const ParsedWavMetadata &metadata,
+                                                       double secondsOffset)
+{
+    const double timecodeFramerate = nominalTimecodeFramerate(metadata.framerate);
+    if (timecodeFramerate <= 0.0)
+        return std::nullopt;
+
+    const int frameOffset = static_cast<int>(std::llround(secondsOffset * timecodeFramerate));
+    return offsetMetadataFrames(metadata, frameOffset);
+}
+
 std::optional<ParsedWavMetadata> buildMetadataFromWallclockNs(int64_t timestampNs,
                                                               double framerate)
 {
@@ -977,7 +988,7 @@ void CinePISound::soundThread() {
 
                 if (have_precise_audio_start_marker) {
                     console->info(
-                        "Aligning precise audio-start marker: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, trim {:.6f}s, pad {:.6f}s; preserving captured audio timing inside picture window",
+                        "Aligning precise audio-start marker: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, trim {:.6f}s, pad {:.6f}s; preserving captured audio timing inside picture window and locking WAV timecode to video start",
                         video_duration_seconds,
                         input_duration_seconds,
                         start_delta_seconds,
@@ -1059,10 +1070,21 @@ void CinePISound::soundThread() {
                     } else if (auto audioStartMetadata =
                                    buildMetadataFromWallclockNs(static_cast<int64_t>(ts_audio_start_realtime),
                                                                 output_framerate)) {
-                        metadataTimecode = audioStartMetadata->timecode;
-                        metadataDate = audioStartMetadata->originationDate;
-                        output_framerate = audioStartMetadata->framerate;
-                        metadataSource = "audio-start";
+                        auto videoAlignedMetadata =
+                            offsetMetadataSeconds(*audioStartMetadata, -start_delta_seconds);
+                        if (videoAlignedMetadata) {
+                            metadataTimecode = videoAlignedMetadata->timecode;
+                            metadataDate = videoAlignedMetadata->originationDate;
+                            output_framerate = videoAlignedMetadata->framerate;
+                            metadataSource = "video-start";
+                        } else {
+                            metadataTimecode = audioStartMetadata->timecode;
+                            metadataDate = audioStartMetadata->originationDate;
+                            output_framerate = audioStartMetadata->framerate;
+                            metadataSource = "audio-start";
+                            console->warn(
+                                "Fell back to audio-start WAV metadata because the video-start offset could not be derived from the precise marker");
+                        }
                     }
                 } else if (takeStartMetadataValid_) {
                     metadataTimecode = takeStartTimeCode_;
