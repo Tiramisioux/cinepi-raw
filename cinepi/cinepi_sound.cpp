@@ -587,6 +587,7 @@ uint64_t extractTime(const std::string& line) {
 CinePISound::CinePISound(CinePIRecorder *app) :
     vu_meter({0, 0, 0, 0}),
     samples_captured(0),
+    capturedAudioSampleRate(0),
     ts_start(0),
     ts_first_buffer_b(0),
     ts_first_buffer_a(0),
@@ -736,6 +737,7 @@ void CinePISound::record_start() {
     console->info("Executing audio capture command: {}", cmdStream.str());
 
     samples_captured = 0;
+    capturedAudioSampleRate = 0;
     vu_meter.fill(0);
     ts_start = 0;
     ts_first_buffer_b = 0;
@@ -894,6 +896,8 @@ void CinePISound::soundThread() {
                         ts_first_buffer_a = extractTime(line);
                     } else if (line.find("<TS_AUDIO_START_REALTIME:") != std::string::npos) {
                         ts_audio_start_realtime = extractTime(line);
+                    } else if (line.find("<NEGOTIATED_SAMPLE_RATE:") != std::string::npos) {
+                        sscanf(line.c_str(), "<NEGOTIATED_SAMPLE_RATE: %d>", &capturedAudioSampleRate);
                     } else if (line.find("<SAMPLES_CAPTURED:") != std::string::npos) {
                         sscanf(line.c_str(), "<SAMPLES_CAPTURED: %d>", &samples_captured);
                     } else if (line.find("<TS_CLOSE_FILE:") != std::string::npos) {
@@ -949,6 +953,7 @@ void CinePISound::soundThread() {
             double trim_start_seconds = 0.0;
             double pad_start_seconds = 0.0;
             double input_duration_seconds = 0.0;
+            double content_duration_delta_seconds = 0.0;
             double tempo = 1.0;
 
             if (have_audio_start_marker) {
@@ -960,9 +965,11 @@ void CinePISound::soundThread() {
                     static_cast<double>(vts_start) / 1e9;
                 start_delta_seconds = audio_content_start_seconds - video_start_seconds;
 
+                const int inputSampleRate =
+                    capturedAudioSampleRate > 0 ? capturedAudioSampleRate : audioSampleRate;
                 auto probed_input_duration = probeDurationSeconds(filename);
                 input_duration_seconds = probed_input_duration.value_or(
-                    fallbackDurationFromSamples(samples_captured, audioSampleRate));
+                    fallbackDurationFromSamples(samples_captured, inputSampleRate));
 
                 if (input_duration_seconds <= 0.0) {
                     console->critical("Cannot retime WAV: failed to determine audio duration");
@@ -979,6 +986,8 @@ void CinePISound::soundThread() {
                     std::max(0.0, input_duration_seconds - trim_start_seconds);
                 double content_target_duration_seconds =
                     std::max(0.0, video_duration_seconds - pad_start_seconds);
+                content_duration_delta_seconds =
+                    content_target_duration_seconds - content_input_duration_seconds;
 
                 if (!have_precise_audio_start_marker &&
                     content_input_duration_seconds > FILTER_EPSILON_SECONDS &&
@@ -988,21 +997,24 @@ void CinePISound::soundThread() {
 
                 if (have_precise_audio_start_marker) {
                     console->info(
-                        "Aligning precise audio-start marker: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, trim {:.6f}s, pad {:.6f}s; preserving captured audio timing inside picture window and locking WAV timecode to video start",
-                        video_duration_seconds,
-                        input_duration_seconds,
-                        start_delta_seconds,
-                        trim_start_seconds,
-                        pad_start_seconds);
-                } else {
-                    console->info(
-                        "Retiming WAV: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, trim {:.6f}s, pad {:.6f}s, tempo {:.6f}",
+                        "Aligning precise audio-start marker: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, trim {:.6f}s, head pad {:.6f}s, trailing delta {:+.6f}s, capture rate {} Hz; locking WAV timecode to video start and padding the picture window without time-stretch",
                         video_duration_seconds,
                         input_duration_seconds,
                         start_delta_seconds,
                         trim_start_seconds,
                         pad_start_seconds,
-                        tempo);
+                        content_duration_delta_seconds,
+                        inputSampleRate);
+                } else {
+                    console->info(
+                        "Retiming WAV: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, trim {:.6f}s, pad {:.6f}s, tempo {:.6f}, capture rate {} Hz",
+                        video_duration_seconds,
+                        input_duration_seconds,
+                        start_delta_seconds,
+                        trim_start_seconds,
+                        pad_start_seconds,
+                        tempo,
+                        inputSampleRate);
                 }
             }
 

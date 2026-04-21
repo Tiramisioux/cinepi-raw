@@ -248,8 +248,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    writeWaveHeader(output, options.channels, options.rate, formatInfo.bitsPerSample, 0);
-
     snd_pcm_t *pcm = nullptr;
     int err = snd_pcm_open(&pcm, options.device.c_str(), SND_PCM_STREAM_CAPTURE, 0);
     if (err < 0) {
@@ -275,6 +273,8 @@ int main(int argc, char **argv)
         snd_pcm_close(pcm);
         return 1;
     }
+
+    writeWaveHeader(output, options.channels, rate, formatInfo.bitsPerSample, 0);
 
     unsigned int periodTimeUs = 10000;
     unsigned int bufferTimeUs = 40000;
@@ -307,6 +307,7 @@ int main(int argc, char **argv)
     const timespec triggerMono = currentClock(CLOCK_MONOTONIC);
     const timespec triggerReal = currentClock(CLOCK_REALTIME);
 
+    std::cout << "<NEGOTIATED_SAMPLE_RATE: " << rate << ">\n";
     emitTimestamp("TS_START", triggerMono);
     emitTimestamp("TS_FIRST_BUFFER_B", triggerMono);
     emitTimestamp("TS_AUDIO_START_REALTIME", triggerReal);
@@ -320,7 +321,7 @@ int main(int argc, char **argv)
     bool draining = false;
     std::optional<std::chrono::steady_clock::time_point> drainDeadline;
     const auto drainGrace =
-        std::chrono::milliseconds(std::max<unsigned int>(5, periodTimeUs / 1000));
+        std::chrono::milliseconds(std::max<unsigned int>(1000, bufferTimeUs / 1000));
 
     while (true) {
         snd_pcm_sframes_t framesToRead = static_cast<snd_pcm_sframes_t>(periodFrames);
@@ -393,7 +394,7 @@ int main(int argc, char **argv)
 
     writeWaveHeader(output,
                     options.channels,
-                    options.rate,
+                    rate,
                     formatInfo.bitsPerSample,
                     static_cast<uint32_t>(std::min<uint64_t>(dataBytes, std::numeric_limits<uint32_t>::max())));
     output.close();
