@@ -1,9 +1,16 @@
 #include "cinepi_sound.hpp"
+#include <algorithm>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
 #include <boost/rational.hpp>
 #include <boost/numeric/conversion/cast.hpp>
+#include <climits>
+#include <cmath>
+#include <cstring>
+#include <ctime>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <regex>
 #include <unordered_set>
 #include <sys/wait.h>
@@ -11,7 +18,412 @@
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
 constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
 
-constexpr double AUDIO_TRIM_OFFSET_MS = 120.0; // milliseconds
+// The first audio buffer marker lands after the hardware has already started
+// filling the capture pipeline. Subtract this latency when estimating the
+// point where the recorded content actually begins.
+constexpr double AUDIO_CAPTURE_LATENCY_MS = 120.0; // milliseconds
+
+namespace {
+
+std::string shellQuote(const std::string &value)
+{
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'')
+            quoted += "'\\''";
+        else
+            quoted += ch;
+    }
+    quoted += "'";
+    return quoted;
+}
+
+std::string locateAudioCaptureHelper()
+{
+    std::vector<std::filesystem::path> candidates;
+
+    char exePath[PATH_MAX] = {};
+    const ssize_t exeLen = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (exeLen > 0) {
+        exePath[exeLen] = '\0';
+        candidates.emplace_back(std::filesystem::path(exePath).parent_path() / "cinepi-audio-capture");
+    }
+
+    candidates.emplace_back("/usr/local/bin/cinepi-audio-capture");
+    candidates.emplace_back("/usr/bin/cinepi-audio-capture");
+
+    for (const auto &candidate : candidates) {
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec))
+            return candidate.string();
+    }
+
+    return {};
+}
+
+std::string formatSeconds(double value)
+{
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(6) << std::max(0.0, value);
+    return oss.str();
+}
+
+std::optional<double> probeDurationSeconds(const std::string &filename)
+{
+    std::ostringstream cmd;
+    cmd << "ffprobe -v error -show_entries format=duration "
+        << "-of default=noprint_wrappers=1:nokey=1 "
+        << shellQuote(filename);
+
+    FILE *fp = popen(cmd.str().c_str(), "r");
+    if (!fp)
+        return std::nullopt;
+
+    char buffer[256];
+    std::string output;
+    while (fgets(buffer, sizeof(buffer), fp) != nullptr)
+        output += buffer;
+
+    int rc = pclose(fp);
+    if (rc != 0)
+        return std::nullopt;
+
+    try {
+        size_t parsed = 0;
+        double seconds = std::stod(output, &parsed);
+        (void)parsed;
+        if (std::isfinite(seconds) && seconds >= 0.0)
+            return seconds;
+    } catch (...) {
+    }
+
+    return std::nullopt;
+}
+
+uint64_t chooseAudioStartTimestamp(uint64_t first_buffer_before,
+                                   uint64_t first_buffer_after,
+                                   uint64_t process_start)
+{
+    uint64_t chosen = 0;
+    for (uint64_t candidate : { first_buffer_before, first_buffer_after }) {
+        if (candidate == 0)
+            continue;
+        if (chosen == 0 || candidate < chosen)
+            chosen = candidate;
+    }
+
+    if (chosen == 0)
+        chosen = process_start;
+
+    return chosen;
+}
+
+double fallbackDurationFromSamples(int samplesCaptured, int sampleRate)
+{
+    if (samplesCaptured <= 0 || sampleRate <= 0)
+        return 0.0;
+
+    return static_cast<double>(samplesCaptured) / static_cast<double>(sampleRate);
+}
+
+int bcdToInt(uint8_t value)
+{
+    return ((value >> 4) & 0x0f) * 10 + (value & 0x0f);
+}
+
+uint8_t intToBcd(int value)
+{
+    value = std::clamp(value, 0, 99);
+    return static_cast<uint8_t>(((value / 10) << 4) | (value % 10));
+}
+
+double nominalTimecodeFramerate(double framerate)
+{
+    if (!std::isfinite(framerate) || framerate <= 0.0)
+        return 0.0;
+
+    return std::max(1.0, std::round(framerate));
+}
+
+std::string buildTimecodeString(const std::array<uint8_t, 8> &timecode)
+{
+    std::ostringstream oss;
+    oss << std::setw(2) << std::setfill('0') << bcdToInt(timecode[3]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[2]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[1]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[0]);
+    return oss.str();
+}
+
+std::string formatOriginationDate(const std::array<uint16_t, 3> &originationDate)
+{
+    std::ostringstream oss;
+    oss << std::setw(4) << std::setfill('0') << static_cast<int>(originationDate[0]) << '-'
+        << std::setw(2) << std::setfill('0') << static_cast<int>(originationDate[1]) << '-'
+        << std::setw(2) << std::setfill('0') << static_cast<int>(originationDate[2]);
+    return oss.str();
+}
+
+std::string formatOriginationTime(const std::array<uint8_t, 8> &timecode)
+{
+    std::ostringstream oss;
+    oss << std::setw(2) << std::setfill('0') << bcdToInt(timecode[3]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[2]) << ':'
+        << std::setw(2) << std::setfill('0') << bcdToInt(timecode[1]);
+    return oss.str();
+}
+
+uint64_t computeTimeReferenceSamples(const std::array<uint8_t, 8> &timecode,
+                                     int sampleRate,
+                                     double framerate)
+{
+    if (sampleRate <= 0)
+        return 0;
+
+    const double timecodeFramerate = nominalTimecodeFramerate(framerate);
+
+    const uint64_t hours = static_cast<uint64_t>(bcdToInt(timecode[3]));
+    const uint64_t minutes = static_cast<uint64_t>(bcdToInt(timecode[2]));
+    const uint64_t seconds = static_cast<uint64_t>(bcdToInt(timecode[1]));
+    const uint64_t frames = static_cast<uint64_t>(bcdToInt(timecode[0]));
+
+    uint64_t timeReference = ((hours * 3600ULL) + (minutes * 60ULL) + seconds) *
+                             static_cast<uint64_t>(sampleRate);
+
+    if (timecodeFramerate > 0.0 && frames > 0) {
+        const double frameSamples =
+            static_cast<double>(frames) * static_cast<double>(sampleRate) / timecodeFramerate;
+        timeReference += static_cast<uint64_t>(std::llround(frameSamples));
+    }
+
+    return timeReference;
+}
+
+std::optional<uintmax_t> waitForStableFile(const std::string &filename,
+                                           int maxAttempts = 50,
+                                           std::chrono::milliseconds interval =
+                                               std::chrono::milliseconds(100))
+{
+    uintmax_t previousSize = 0;
+    int stableReads = 0;
+
+    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+        std::error_code ec;
+        if (std::filesystem::exists(filename, ec)) {
+            const auto currentSize = std::filesystem::file_size(filename, ec);
+            if (!ec && currentSize > 0) {
+                if (currentSize == previousSize)
+                    ++stableReads;
+                else
+                    stableReads = 0;
+
+                previousSize = currentSize;
+                if (stableReads >= 2)
+                    return currentSize;
+            }
+        }
+
+        std::this_thread::sleep_for(interval);
+    }
+
+    return std::nullopt;
+}
+
+void writeLe32(std::ostream &stream, uint32_t value)
+{
+    const char bytes[4] = {
+        static_cast<char>(value & 0xff),
+        static_cast<char>((value >> 8) & 0xff),
+        static_cast<char>((value >> 16) & 0xff),
+        static_cast<char>((value >> 24) & 0xff),
+    };
+    stream.write(bytes, sizeof(bytes));
+}
+
+int shellExitCode(int status)
+{
+    if (status < 0)
+        return status;
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return status;
+}
+
+double configuredFramerate(const RawOptions *options)
+{
+    return (options && options->framerate && *options->framerate > 0.0)
+               ? *options->framerate
+               : 0.0;
+}
+
+struct ParsedWavMetadata
+{
+    std::array<uint8_t, 8> timecode{};
+    std::array<uint16_t, 3> originationDate{};
+    double framerate = 0.0;
+};
+
+std::optional<ParsedWavMetadata> offsetMetadataFrames(const ParsedWavMetadata &metadata,
+                                                      int frameOffset)
+{
+    if (frameOffset == 0)
+        return metadata;
+
+    const double timecodeFramerate = nominalTimecodeFramerate(metadata.framerate);
+    if (timecodeFramerate <= 0.0)
+        return std::nullopt;
+
+    const int fps = static_cast<int>(std::llround(timecodeFramerate));
+    if (fps <= 0)
+        return std::nullopt;
+
+    std::tm localTime{};
+    localTime.tm_year = static_cast<int>(metadata.originationDate[0]) - 1900;
+    localTime.tm_mon = static_cast<int>(metadata.originationDate[1]) - 1;
+    localTime.tm_mday = static_cast<int>(metadata.originationDate[2]);
+    localTime.tm_hour = bcdToInt(metadata.timecode[3]);
+    localTime.tm_min = bcdToInt(metadata.timecode[2]);
+    localTime.tm_sec = bcdToInt(metadata.timecode[1]);
+    localTime.tm_isdst = -1;
+
+    time_t baseSeconds = std::mktime(&localTime);
+    if (baseSeconds == static_cast<time_t>(-1))
+        return std::nullopt;
+
+    int frame = bcdToInt(metadata.timecode[0]) + frameOffset;
+    int secondsOffset = frame / fps;
+    int normalizedFrame = frame % fps;
+    if (normalizedFrame < 0) {
+        normalizedFrame += fps;
+        --secondsOffset;
+    }
+
+    baseSeconds += secondsOffset;
+
+    std::tm *adjustedLocalTime = std::localtime(&baseSeconds);
+    if (!adjustedLocalTime)
+        return std::nullopt;
+
+    ParsedWavMetadata adjusted = metadata;
+    adjusted.timecode = {
+        intToBcd(normalizedFrame),
+        intToBcd(adjustedLocalTime->tm_sec),
+        intToBcd(adjustedLocalTime->tm_min),
+        intToBcd(adjustedLocalTime->tm_hour),
+        0, 0, 0, 0
+    };
+    adjusted.originationDate = {
+        static_cast<uint16_t>(adjustedLocalTime->tm_year + 1900),
+        static_cast<uint16_t>(adjustedLocalTime->tm_mon + 1),
+        static_cast<uint16_t>(adjustedLocalTime->tm_mday)
+    };
+    adjusted.framerate = timecodeFramerate;
+    return adjusted;
+}
+
+std::optional<ParsedWavMetadata> offsetMetadataSeconds(const ParsedWavMetadata &metadata,
+                                                       double secondsOffset)
+{
+    const double timecodeFramerate = nominalTimecodeFramerate(metadata.framerate);
+    if (timecodeFramerate <= 0.0)
+        return std::nullopt;
+
+    const int frameOffset = static_cast<int>(std::llround(secondsOffset * timecodeFramerate));
+    return offsetMetadataFrames(metadata, frameOffset);
+}
+
+std::optional<ParsedWavMetadata> buildMetadataFromWallclockNs(int64_t timestampNs,
+                                                              double framerate)
+{
+    if (timestampNs < 0)
+        return std::nullopt;
+
+    const double timecodeFramerate = nominalTimecodeFramerate(framerate);
+
+    const time_t seconds = static_cast<time_t>(timestampNs / 1000000000LL);
+    const int64_t subsecondNs = timestampNs % 1000000000LL;
+    std::tm *localTime = localtime(&seconds);
+    if (!localTime)
+        return std::nullopt;
+
+    int frame = 0;
+    if (timecodeFramerate > 0.0) {
+        const double fraction = static_cast<double>(subsecondNs) / 1e9;
+        frame = static_cast<int>(std::floor((fraction * timecodeFramerate) + 1.0e-9));
+        const int maxFrame = std::max(0, static_cast<int>(std::ceil(timecodeFramerate)) - 1);
+        frame = std::clamp(frame, 0, maxFrame);
+    }
+
+    ParsedWavMetadata metadata;
+    metadata.timecode = {
+        intToBcd(frame),
+        intToBcd(localTime->tm_sec),
+        intToBcd(localTime->tm_min),
+        intToBcd(localTime->tm_hour),
+        0, 0, 0, 0
+    };
+    metadata.originationDate = {
+        static_cast<uint16_t>(localTime->tm_year + 1900),
+        static_cast<uint16_t>(localTime->tm_mon + 1),
+        static_cast<uint16_t>(localTime->tm_mday)
+    };
+    metadata.framerate = timecodeFramerate;
+    return metadata;
+}
+
+std::optional<ParsedWavMetadata> parseTakeMetadataFromFolder(const std::string &folder,
+                                                             double fallbackFramerate)
+{
+    static const std::regex takeRegex(
+        R"(^CINEPI_(\d{2})-(\d{2})-(\d{2})_(\d{2})(\d{2})(\d{2})_F(\d{2})_C\d+_(cam[01X])$)");
+
+    std::smatch match;
+    if (!std::regex_match(folder, match, takeRegex))
+        return std::nullopt;
+
+    const double timecodeFramerate = nominalTimecodeFramerate(fallbackFramerate);
+
+    const int year = 2000 + std::stoi(match[1].str());
+    const int month = std::stoi(match[2].str());
+    const int day = std::stoi(match[3].str());
+    const int hour = std::stoi(match[4].str());
+    const int minute = std::stoi(match[5].str());
+    const int second = std::stoi(match[6].str());
+    int frame = std::stoi(match[7].str());
+
+    if (month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+        second < 0 || second > 59) {
+        return std::nullopt;
+    }
+
+    if (timecodeFramerate > 0.0) {
+        const int maxFrame = std::max(0, static_cast<int>(std::ceil(timecodeFramerate)) - 1);
+        frame = std::clamp(frame, 0, maxFrame);
+    } else {
+        frame = std::clamp(frame, 0, 99);
+    }
+
+    ParsedWavMetadata metadata;
+    metadata.timecode = {
+        intToBcd(frame),
+        intToBcd(second),
+        intToBcd(minute),
+        intToBcd(hour),
+        0, 0, 0, 0
+    };
+    metadata.originationDate = {
+        static_cast<uint16_t>(year),
+        static_cast<uint16_t>(month),
+        static_cast<uint16_t>(day)
+    };
+    metadata.framerate = timecodeFramerate;
+    return metadata;
+}
+
+} // namespace
 
 // A helper function to convert a double to a rational number
 boost::rational<int> doubleToRational(double value, double tolerance = 1.0e-6) {
@@ -44,10 +456,6 @@ boost::rational<int> doubleToRational(double value, double tolerance = 1.0e-6) {
     }
 
     return boost::rational<int>(middle_n * sign, middle_d);
-}
-
-bool file_exists(const std::string& path) {
-    return std::filesystem::exists(path);
 }
 
 FILE * popen2(std::string command, std::string type, int & pid)
@@ -168,11 +576,13 @@ uint64_t extractTime(const std::string& line) {
 CinePISound::CinePISound(CinePIRecorder *app) :
     vu_meter({0, 0, 0, 0}),
     samples_captured(0),
+    capturedAudioSampleRate(0),
     ts_start(0),
     ts_first_buffer_b(0),
     ts_first_buffer_a(0),
     ts_close_file(0),
     ts_end(0),
+    ts_audio_start_realtime(0),
     audioFormat("S16_LE"),
     audioChannels(1),
     audioSampleRate(FIXED_AUDIO_SAMPLE_RATE),
@@ -258,6 +668,24 @@ void CinePISound::record_start() {
     }
 
     stopMonitoring();
+    resetTakeMetadata();
+
+    if (auto fallbackMetadata =
+            parseTakeMetadataFromFolder(options_->folder, configuredFramerate(options_))) {
+        takeStartTimeCode_ = fallbackMetadata->timecode;
+        takeStartOriginationDate_ = fallbackMetadata->originationDate;
+        takeStartFramerate_ = fallbackMetadata->framerate;
+        takeStartMetadataValid_ = true;
+
+        const std::string fallbackRate =
+            takeStartFramerate_ > 0.0 ? formatSeconds(takeStartFramerate_) : std::string("unknown");
+        console->info("Cached fallback WAV metadata from take name: {} ({} fps)",
+                      buildTimecodeString(takeStartTimeCode_),
+                      fallbackRate);
+    } else {
+        console->warn("Unable to parse deterministic fallback WAV metadata from take name: {}",
+                      options_->folder);
+    }
 
     std::ostringstream oss;
     oss << options_->mediaDest << '/' << options_->folder << '/' << options_->folder << ".wav";
@@ -269,29 +697,43 @@ void CinePISound::record_start() {
         return;
     }
 
-    std::string vu_mode = (audioChannels == 2) ? "stereo" : "mono";
+    const std::string helperBinary = locateAudioCaptureHelper();
 
     cmdStream.str("");
     cmdStream.clear();
-    cmdStream << "arecord"
-              << " -D " << defaultDevice
-              << " -f " << audioFormat
-              << " -c " << audioChannels
-              << " -r " << audioSampleRate
-              << " -t wav"
-              << " --disable-softvol"
-              << " -V " << vu_mode
-              << " " << filename << " 2>&1";
+    if (!helperBinary.empty()) {
+        cmdStream << shellQuote(helperBinary)
+                  << " --device " << shellQuote(defaultDevice)
+                  << " --format " << shellQuote(audioFormat)
+                  << " --channels " << audioChannels
+                  << " --rate " << audioSampleRate
+                  << " --output " << shellQuote(filename)
+                  << " 2>&1";
+    } else {
+        std::string vu_mode = (audioChannels == 2) ? "stereo" : "mono";
+        console->warn("cinepi-audio-capture helper not found; falling back to arecord without precise audio-start markers");
+        cmdStream << "arecord"
+                  << " -D " << defaultDevice
+                  << " -f " << audioFormat
+                  << " -c " << audioChannels
+                  << " -r " << audioSampleRate
+                  << " -t wav"
+                  << " --disable-softvol"
+                  << " -V " << vu_mode
+                  << " " << filename << " 2>&1";
+    }
 
-    console->info("Executing arecord: {}", cmdStream.str());
+    console->info("Executing audio capture command: {}", cmdStream.str());
 
     samples_captured = 0;
+    capturedAudioSampleRate = 0;
     vu_meter.fill(0);
     ts_start = 0;
     ts_first_buffer_b = 0;
     ts_first_buffer_a = 0;
     ts_close_file = 0;
     ts_end = 0;
+    ts_audio_start_realtime = 0;
 
     arec_pipe = popen2(cmdStream.str(), "r", pid);
 
@@ -441,6 +883,10 @@ void CinePISound::soundThread() {
                         ts_first_buffer_b = extractTime(line);
                     } else if (line.find("<TS_FIRST_BUFFER_A:") != std::string::npos) {
                         ts_first_buffer_a = extractTime(line);
+                    } else if (line.find("<TS_AUDIO_START_REALTIME:") != std::string::npos) {
+                        ts_audio_start_realtime = extractTime(line);
+                    } else if (line.find("<NEGOTIATED_SAMPLE_RATE:") != std::string::npos) {
+                        sscanf(line.c_str(), "<NEGOTIATED_SAMPLE_RATE: %d>", &capturedAudioSampleRate);
                     } else if (line.find("<SAMPLES_CAPTURED:") != std::string::npos) {
                         sscanf(line.c_str(), "<SAMPLES_CAPTURED: %d>", &samples_captured);
                     } else if (line.find("<TS_CLOSE_FILE:") != std::string::npos) {
@@ -459,7 +905,13 @@ void CinePISound::soundThread() {
             fn_oss << options_->mediaDest << '/' << options_->folder << '/' << options_->folder << ".wav";
             std::string filename = fn_oss.str();
 
-            if (!std::filesystem::exists(filename)) break;
+            const auto wavSize = waitForStableFile(filename);
+            if (!wavSize) {
+                console->critical("Cannot attach WAV metadata: {} did not become ready after recording stopped",
+                                  filename);
+                continue;
+            }
+            console->debug("WAV ready for metadata update: {} bytes", *wavSize);
 
             int64_t vts_start = 0, vts_end = 0;
             int64_t frames = app_->GetEncoder()->timestamps.size();
@@ -468,65 +920,209 @@ void CinePISound::soundThread() {
                 vts_end = app_->GetEncoder()->timestamps.back();
             }
 
-            double vts_delta = (vts_end - vts_start) / 1e9;
-            if (vts_start < static_cast<int64_t>(ts_first_buffer_b)) {
-                console->critical("Frame start before audio!!!!");
-                return;
+            if (frames <= 0 || vts_end < vts_start) {
+                console->critical("Cannot retime WAV: invalid video timestamp range");
+                continue;
             }
 
-            double trim_offset_seconds = AUDIO_TRIM_OFFSET_MS / 1000.0;
-            double start_time = (vts_start - ts_first_buffer_b) / 1e9 - trim_offset_seconds;
+            double video_span_seconds = (vts_end - vts_start) / 1e9;
+            double average_frame_duration_seconds = 0.0;
+            if (frames > 1)
+                average_frame_duration_seconds = video_span_seconds / static_cast<double>(frames - 1);
+            else if (options_->framerate && *options_->framerate > 0.0)
+                average_frame_duration_seconds = 1.0 / static_cast<double>(*options_->framerate);
+
+            double video_duration_seconds = video_span_seconds + average_frame_duration_seconds;
+            if (video_duration_seconds <= 0.0)
+                video_duration_seconds = video_span_seconds;
+
+            const uint64_t audio_marker_ns = chooseAudioStartTimestamp(
+                ts_first_buffer_b,
+                ts_first_buffer_a,
+                ts_start);
+            const bool have_audio_start_marker = audio_marker_ns != 0;
+            const bool have_precise_audio_start_marker = ts_audio_start_realtime != 0;
+            const int inputSampleRate =
+                capturedAudioSampleRate > 0 ? capturedAudioSampleRate : audioSampleRate;
+
+            double audio_content_start_seconds = 0.0;
+            double start_delta_seconds = 0.0;
+            double input_duration_seconds = 0.0;
+
+            if (have_audio_start_marker) {
+                const double latency_bias_seconds =
+                    have_precise_audio_start_marker ? 0.0 : (AUDIO_CAPTURE_LATENCY_MS / 1000.0);
+                audio_content_start_seconds =
+                    static_cast<double>(audio_marker_ns) / 1e9 - latency_bias_seconds;
+                const double video_start_seconds =
+                    static_cast<double>(vts_start) / 1e9;
+                start_delta_seconds = audio_content_start_seconds - video_start_seconds;
+
+                auto probed_input_duration = probeDurationSeconds(filename);
+                input_duration_seconds = probed_input_duration.value_or(
+                    fallbackDurationFromSamples(samples_captured, inputSampleRate));
+
+                if (have_precise_audio_start_marker) {
+                    console->info(
+                        "Using precise audio-start marker for honest WAV timecode: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, capture rate {} Hz; leaving PCM untouched",
+                        video_duration_seconds,
+                        input_duration_seconds,
+                        start_delta_seconds,
+                        inputSampleRate);
+                } else {
+                    console->info(
+                        "Using estimated audio-start metadata for honest WAV timecode: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, capture rate {} Hz; leaving PCM untouched",
+                        video_duration_seconds,
+                        input_duration_seconds,
+                        start_delta_seconds,
+                        inputSampleRate);
+                }
+            }
 
             std::ostringstream tmp_oss;
             tmp_oss << options_->mediaDest << '/' << options_->folder << "/temp.wav";
-            std::ostringstream xml_oss;
-            xml_oss << options_->mediaDest << '/' << options_->folder << "/" << options_->folder << ".xml";
+
             std::ostringstream ffmpeg_oss;
-            ffmpeg_oss << "ffmpeg -y -i " << filename
-                       << " -ss " << start_time
-                       << " -t " << vts_delta
-                       << " -ar " << audioSampleRate
-                       << " -acodec pcm_s16le " << tmp_oss.str() << " > /dev/null 2>&1";
+            const auto &encoderTimecode = app_->GetEncoder()->originationTimeCode;
+            const auto &encoderDate = app_->GetEncoder()->originationDate;
+            double output_framerate =
+                takeStartFramerate_ > 0.0
+                    ? takeStartFramerate_
+                    : nominalTimecodeFramerate(configuredFramerate(options_));
 
-            system(ffmpeg_oss.str().c_str());
-            system(("mv " + tmp_oss.str() + " " + filename).c_str());
+            std::array<uint8_t, 8> metadataTimecode = encoderTimecode;
+            std::array<uint16_t, 3> metadataDate = encoderDate;
+            std::string metadataSource = "encoder";
 
-            generateXML(xml_oss.str());
+            if (have_precise_audio_start_marker) {
+                if (auto audioStartMetadata =
+                        buildMetadataFromWallclockNs(static_cast<int64_t>(ts_audio_start_realtime),
+                                                     output_framerate)) {
+                    metadataTimecode = audioStartMetadata->timecode;
+                    metadataDate = audioStartMetadata->originationDate;
+                    output_framerate = audioStartMetadata->framerate;
+                    metadataSource = "audio-start";
+                } else if (takeStartMetadataValid_) {
+                    ParsedWavMetadata takeStartMetadata;
+                    takeStartMetadata.timecode = takeStartTimeCode_;
+                    takeStartMetadata.originationDate = takeStartOriginationDate_;
+                    takeStartMetadata.framerate =
+                        takeStartFramerate_ > 0.0 ? takeStartFramerate_ : output_framerate;
+                    if (auto estimatedAudioStartMetadata =
+                            offsetMetadataSeconds(takeStartMetadata, start_delta_seconds)) {
+                        metadataTimecode = estimatedAudioStartMetadata->timecode;
+                        metadataDate = estimatedAudioStartMetadata->originationDate;
+                        output_framerate = estimatedAudioStartMetadata->framerate;
+                        metadataSource = "audio-start-estimate";
+                        console->warn(
+                            "Failed to derive realtime audio-start metadata; estimated honest WAV timecode from take start instead");
+                    } else {
+                        metadataTimecode = takeStartMetadata.timecode;
+                        metadataDate = takeStartMetadata.originationDate;
+                        output_framerate = takeStartMetadata.framerate;
+                        metadataSource = "video-start-fallback";
+                        console->warn(
+                            "Failed to derive realtime audio-start metadata and could not offset take-start metadata; falling back to take start");
+                    }
+                }
+            } else if (have_audio_start_marker && takeStartMetadataValid_) {
+                ParsedWavMetadata takeStartMetadata;
+                takeStartMetadata.timecode = takeStartTimeCode_;
+                takeStartMetadata.originationDate = takeStartOriginationDate_;
+                takeStartMetadata.framerate =
+                    takeStartFramerate_ > 0.0 ? takeStartFramerate_ : output_framerate;
+                if (auto estimatedAudioStartMetadata =
+                        offsetMetadataSeconds(takeStartMetadata, start_delta_seconds)) {
+                    metadataTimecode = estimatedAudioStartMetadata->timecode;
+                    metadataDate = estimatedAudioStartMetadata->originationDate;
+                    output_framerate = estimatedAudioStartMetadata->framerate;
+                    metadataSource = "audio-start-estimate";
+                } else {
+                    metadataTimecode = takeStartMetadata.timecode;
+                    metadataDate = takeStartMetadata.originationDate;
+                    output_framerate = takeStartMetadata.framerate;
+                    metadataSource = "video-start-fallback";
+                    console->warn(
+                        "Failed to offset take-start metadata to the measured audio start; falling back to take start");
+                }
+            } else if (takeStartMetadataValid_) {
+                metadataTimecode = takeStartTimeCode_;
+                metadataDate = takeStartOriginationDate_;
+                if (takeStartFramerate_ > 0.0)
+                    output_framerate = takeStartFramerate_;
+                metadataSource = "take-start-fallback";
+            }
 
-            if (file_exists(xml_oss.str())) {
-                std::ostringstream bwfedit;
-                bwfedit << "bwfmetaedit " << filename << " --in-iXML=" << xml_oss.str();
-                std::ostringstream bwfedit_core;
-                auto& oTC = app_->GetEncoder()->originationTimeCode;
-                auto& oDt = app_->GetEncoder()->originationDate;
+            if (!have_audio_start_marker) {
+                console->warn("No audio start marker received; writing WAV metadata from {} without touching PCM",
+                              metadataSource);
+            }
 
-                uint64_t timeReference = (static_cast<uint64_t>(oTC[0]) * 3600 * audioSampleRate)
-                                       + (static_cast<uint64_t>(oTC[1]) * 60 * audioSampleRate)
-                                       + (static_cast<uint64_t>(oTC[2]) * audioSampleRate);
+            const double nominalOutputFramerate = nominalTimecodeFramerate(output_framerate);
+            const int audioStartOffsetFrames =
+                (have_audio_start_marker && nominalOutputFramerate > 0.0)
+                    ? static_cast<int>(std::llround(start_delta_seconds * nominalOutputFramerate))
+                    : 0;
+            const long long audioStartOffsetSamples =
+                have_audio_start_marker
+                    ? std::llround(start_delta_seconds * static_cast<double>(inputSampleRate))
+                    : 0;
+            const std::string timecode_tag = buildTimecodeString(metadataTimecode);
+            const std::string origination_date = formatOriginationDate(metadataDate);
+            const std::string origination_time = formatOriginationTime(metadataTimecode);
+            const int outputSampleRate =
+                inputSampleRate > 0 ? inputSampleRate : audioSampleRate;
+            const uint64_t time_reference =
+                computeTimeReferenceSamples(metadataTimecode, outputSampleRate, output_framerate);
 
-                std::ostringstream timeStr;
-                timeStr << std::setw(2) << std::setfill('0') << static_cast<int>(oTC[0]) << ":"
-                        << std::setw(2) << std::setfill('0') << static_cast<int>(oTC[1]) << ":"
-                        << std::setw(2) << std::setfill('0') << static_cast<int>(oTC[2]);
-                std::ostringstream dateStr;
-                dateStr << std::setw(4) << std::setfill('0') << static_cast<int>(oDt[0]) << "-"
-                        << std::setw(2) << static_cast<int>(oDt[1]) << "-"
-                        << std::setw(2) << static_cast<int>(oDt[2]);
+            ffmpeg_oss << "ffmpeg -hide_banner -loglevel error -y -i " << shellQuote(filename);
+            ffmpeg_oss
+                       << " -map 0:a:0"
+                       << " -c:a copy"
+                       << " -write_bext 1"
+                       << " -metadata " << shellQuote("description=CinePI Description")
+                       << " -metadata " << shellQuote("originator=" + options_->ucm.value_or("CinePI"))
+                       << " -metadata " << shellQuote("originator_reference=" + options_->serial)
+                       << " -metadata " << shellQuote("origination_date=" + origination_date)
+                       << " -metadata " << shellQuote("origination_time=" + origination_time)
+                       << " -metadata " << shellQuote("time_reference=" + std::to_string(time_reference))
+                       << " -metadata " << shellQuote("timecode=" + timecode_tag)
+                       << ' ' << shellQuote(tmp_oss.str());
 
-                bwfedit_core << "bwfmetaedit " << filename
-                             << " --BextVersion=1"
-                             << " --Description='CinePI Description'"
-                             << " --Originator='" << options_->ucm.value_or("CinePI") << "'"
-                             << " --OriginatorReference='" << options_->serial << "'"
-                             << " --OriginationDate=" << dateStr.str()
-                             << " --OriginationTime=" << timeStr.str()
-                             << " --TimeReference=" << timeReference;
+            std::string ffmpeg_error;
+            const int ffmpeg_status = run_with_stderr_capture(ffmpeg_oss.str(), ffmpeg_error);
+            if (shellExitCode(ffmpeg_status) != 0) {
+                console->critical("ffmpeg WAV metadata write failed (rc={}): {}",
+                                  shellExitCode(ffmpeg_status),
+                                  ffmpeg_error.empty() ? "no stderr output" : ffmpeg_error);
+                continue;
+            }
 
-                system(bwfedit.str().c_str());
-                system(("rm " + xml_oss.str()).c_str());
-                system(bwfedit_core.str().c_str());
+            std::error_code rename_ec;
+            std::filesystem::rename(tmp_oss.str(), filename, rename_ec);
+            if (rename_ec) {
+                console->critical("Failed to replace WAV with metadata-updated version: {}", rename_ec.message());
+                continue;
+            }
+
+            const std::string ixml =
+                generateIXML(metadataTimecode,
+                             output_framerate,
+                             metadataSource,
+                             have_audio_start_marker,
+                             start_delta_seconds,
+                             audioStartOffsetFrames,
+                             audioStartOffsetSamples);
+            if (!appendIXMLChunk(filename, ixml)) {
+                console->critical("Failed to append iXML chunk to WAV");
             } else {
-                console->critical("XML does not exist!");
+                console->info("Attached WAV metadata without altering PCM: timecode {}, rate {}, source {}, audio start offset {:+.6f}s ({} frames, {} samples), BEXT + iXML",
+                              timecode_tag,
+                              output_framerate,
+                              metadataSource,
+                              start_delta_seconds,
+                              audioStartOffsetFrames,
+                              audioStartOffsetSamples);
             }
 
             vu_meter.fill(0);
@@ -563,7 +1159,21 @@ void CinePISound::soundThread() {
     }
 }
 
-void CinePISound::generateXML(std::string fn) {
+void CinePISound::resetTakeMetadata()
+{
+    takeStartTimeCode_.fill(0);
+    takeStartOriginationDate_.fill(0);
+    takeStartFramerate_ = 0.0;
+    takeStartMetadataValid_ = false;
+}
+
+std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
+                                      double framerate,
+                                      const std::string &timecodeSource,
+                                      bool haveAudioStartOffset,
+                                      double audioStartOffsetSeconds,
+                                      int audioStartOffsetFrames,
+                                      long long audioStartOffsetSamples) const {
     boost::property_tree::ptree tree;
 
     tree.put("BWFXML.IXML_VERSION", "1.5");
@@ -571,17 +1181,62 @@ void CinePISound::generateXML(std::string fn) {
     tree.put("BWFXML.NOTE", "CinePI Note");
     tree.put("BWFXML.CIRCLED", "true");
     tree.put("BWFXML.TAPE", "CINEPI");
-
-    boost::rational<int> r = doubleToRational(*options_->framerate);
+    tree.put("BWFXML.TIMECODE", buildTimecodeString(timecode));
+    const double timecodeFramerate = nominalTimecodeFramerate(framerate);
+    boost::rational<int> r = doubleToRational(timecodeFramerate > 0.0 ? timecodeFramerate : 25.0);
     std::string tfps = std::to_string(r.numerator()) + "/" + std::to_string(r.denominator());
 
     tree.put("BWFXML.SPEED.MASTER_SPEED", tfps);
     tree.put("BWFXML.SPEED.CURRENT_SPEED", tfps);
     tree.put("BWFXML.SPEED.TIMECODE_RATE", tfps);
     tree.put("BWFXML.SPEED.TIMECODE_FLAG", "NDF");
+    tree.put("BWFXML.CINEPI_TIMECODE_SOURCE", timecodeSource);
+    if (haveAudioStartOffset) {
+        std::ostringstream offsetSeconds;
+        offsetSeconds << std::showpos << std::fixed << std::setprecision(6) << audioStartOffsetSeconds;
+        tree.put("BWFXML.CINEPI_AUDIO_START_OFFSET_SECONDS", offsetSeconds.str());
+        tree.put("BWFXML.CINEPI_AUDIO_START_OFFSET_FRAMES", std::to_string(audioStartOffsetFrames));
+        tree.put("BWFXML.CINEPI_AUDIO_START_OFFSET_SAMPLES", std::to_string(audioStartOffsetSamples));
+    }
 
     boost::property_tree::xml_writer_settings<std::string> settings('\t', 1);
-    boost::property_tree::write_xml(fn, tree, std::locale(), settings);
+    std::ostringstream oss;
+    boost::property_tree::write_xml(oss, tree, settings);
+    return oss.str();
+}
+
+bool CinePISound::appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload) {
+    std::fstream stream(wav_path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!stream) {
+        console->error("appendIXMLChunk(): failed to open {}", wav_path);
+        return false;
+    }
+
+    char riff_header[12];
+    stream.read(riff_header, sizeof(riff_header));
+    if (stream.gcount() != static_cast<std::streamsize>(sizeof(riff_header)) ||
+        std::memcmp(riff_header, "RIFF", 4) != 0 ||
+        std::memcmp(riff_header + 8, "WAVE", 4) != 0) {
+        console->error("appendIXMLChunk(): {} is not a RIFF/WAVE file", wav_path);
+        return false;
+    }
+
+    stream.seekp(0, std::ios::end);
+    stream.write("iXML", 4);
+    writeLe32(stream, static_cast<uint32_t>(xml_payload.size()));
+    stream.write(xml_payload.data(), static_cast<std::streamsize>(xml_payload.size()));
+    if (xml_payload.size() % 2 != 0)
+        stream.put('\0');
+
+    const std::streamoff file_size = stream.tellp();
+    if (file_size < 8) {
+        console->error("appendIXMLChunk(): invalid final WAV size for {}", wav_path);
+        return false;
+    }
+
+    stream.seekp(4, std::ios::beg);
+    writeLe32(stream, static_cast<uint32_t>(file_size - 8));
+    return stream.good();
 }
 
 std::string CinePISound::getPreferredMonitorOutput() {

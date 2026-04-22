@@ -146,9 +146,10 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
         if (trigger > 0) {                       // recording just started
 			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
+            if (controller.folderOpen)
+                sound.record_start();
             app.GetEncoder()->resetFrameCount(); // folder already open
-			app.GetEncoder()->reset_encoder(); 
-            sound.record_start();
+			app.GetEncoder()->reset_encoder();
         }
         else if (trigger < 0) {                  // recording stopped
 			controller.folderOpen = false;

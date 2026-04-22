@@ -52,3 +52,7 @@ cinepi_raw = executable('cinepi-raw', sources,
              link_with : rpicam_app,
              install : true)
 
+executable('cinepi-audio-capture',
+           'cinepi_audio_capture.cpp',
+           dependencies : [alsa_dep],
+           install : true)

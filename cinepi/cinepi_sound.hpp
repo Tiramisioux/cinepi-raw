@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <csignal>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <regex>
@@ -51,7 +52,15 @@ private:
     void parseHardwareParams();
     bool tryAudioConfig(const std::string& device, const std::string& format, int channels, int rate);
     bool recording_ended();
-    void generateXML(std::string fn);
+    std::string generateIXML(const std::array<uint8_t, 8>& timecode,
+                             double framerate,
+                             const std::string& timecodeSource,
+                             bool haveAudioStartOffset,
+                             double audioStartOffsetSeconds,
+                             int audioStartOffsetFrames,
+                             long long audioStartOffsetSamples) const;
+    bool appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload);
+    void resetTakeMetadata();
     void publishMicSelection();
     std::vector<std::string> parseArecordAliases();
     void stopMonitoring();
@@ -61,7 +70,9 @@ private:
 
 
     int samples_captured;
+    int capturedAudioSampleRate;
     uint64_t ts_start, ts_first_buffer_b, ts_first_buffer_a, ts_close_file, ts_end;
+    uint64_t ts_audio_start_realtime;
     std::string audioFormat;
     int audioChannels;
     int audioSampleRate;
@@ -78,6 +89,10 @@ private:
     RawOptions *options_;
     bool abortThread_;
     std::thread sound_thread_;
+    std::array<uint8_t, 8> takeStartTimeCode_{};
+    std::array<uint16_t, 3> takeStartOriginationDate_{};
+    double takeStartFramerate_ = 0.0;
+    bool takeStartMetadataValid_ = false;
 
     std::string getPreferredMonitorOutput();
     int monitor_pid = -1;
