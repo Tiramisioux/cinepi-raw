@@ -52,7 +52,13 @@ private:
     void parseHardwareParams();
     bool tryAudioConfig(const std::string& device, const std::string& format, int channels, int rate);
     bool recording_ended();
-    std::string generateIXML(const std::array<uint8_t, 8>& timecode, double framerate) const;
+    std::string generateIXML(const std::array<uint8_t, 8>& timecode,
+                             double framerate,
+                             const std::string& timecodeSource,
+                             bool haveAudioStartOffset,
+                             double audioStartOffsetSeconds,
+                             int audioStartOffsetFrames,
+                             long long audioStartOffsetSamples) const;
     bool appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload);
     void resetTakeMetadata();
     void publishMicSelection();

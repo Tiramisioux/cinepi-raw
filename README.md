@@ -14,7 +14,7 @@ The source code is made available under the simplified [BSD 2-Clause license](ht
 If you run Raspberry Pi OS Lite, begin by installing the following packages:
 
 ```bash
-sudo apt install -y python-pip git python3-jinja2
+sudo apt install -y python-pip git python3-jinja2 ffmpeg
 ````
 
 ## Install libcamera
@@ -58,8 +58,10 @@ sudo apt install -y libspdlog-dev libjsoncpp-dev && cd /home/pi && git clone htt
 
 ## Install cinepi-raw dependencies
 
+`ffmpeg` is required on the Pi for WAV BEXT/iXML timecode metadata writes.
+
 ```shell
-sudo apt install -y cmake libepoxy-dev libavdevice-dev build-essential cmake libboost-program-options-dev libdrm-dev libexif-dev libcamera-dev libjpeg-dev libtiff5-dev libpng-dev redis-server libhiredis-dev libasound2-dev libjsoncpp-dev libpng-dev meson ninja-build libavcodec-dev libavdevice-dev libavformat-dev libswresample-dev && sudo apt-get install libjsoncpp-dev && cd ~ && git clone https://github.com/sewenew/redis-plus-plus.git && cd redis-plus-plus && mkdir build && cd build && cmake .. && make && sudo make install && cd ~
+sudo apt install -y cmake libepoxy-dev libavdevice-dev build-essential cmake libboost-program-options-dev libdrm-dev libexif-dev libcamera-dev libjpeg-dev libtiff5-dev libpng-dev redis-server libhiredis-dev libasound2-dev libjsoncpp-dev libpng-dev meson ninja-build libavcodec-dev libavdevice-dev libavformat-dev libswresample-dev ffmpeg && sudo apt-get install libjsoncpp-dev && cd ~ && git clone https://github.com/sewenew/redis-plus-plus.git && cd redis-plus-plus && mkdir build && cd build && cmake .. && make && sudo make install && cd ~
 ```
 
 ```shell
