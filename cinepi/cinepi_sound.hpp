@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <regex>
 #include <sstream>
 #include <sys/wait.h>
@@ -22,6 +23,7 @@
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <sw/redis++/redis++.h>
 
 #include "cinepi_recorder.hpp"
 #include "raw_options.hpp"
@@ -62,6 +64,9 @@ private:
     bool appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload);
     void resetTakeMetadata();
     void publishMicSelection();
+    void initRedis();
+    void publishRecorderVuMeter(bool force = false);
+    void clearRecorderVuMeter();
     std::vector<std::string> parseArecordAliases();
     void stopMonitoring();
     void startMonitoring();
@@ -87,8 +92,11 @@ private:
     std::stringstream cmdStream;
     CinePIRecorder *app_;
     RawOptions *options_;
+    std::unique_ptr<sw::redis::Redis> redis_;
     bool abortThread_;
     std::thread sound_thread_;
+    std::array<int, 4> last_published_vu_{};
+    std::chrono::steady_clock::time_point last_vu_publish_ts_{};
     std::array<uint8_t, 8> takeStartTimeCode_{};
     std::array<uint16_t, 3> takeStartOriginationDate_{};
     double takeStartFramerate_ = 0.0;

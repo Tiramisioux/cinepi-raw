@@ -17,6 +17,9 @@
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
 constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
+constexpr char RECORDER_VU_REDIS_KEY[] = "audio_vu";
+constexpr char REDIS_DEFAULT_URL[] = "redis://127.0.0.1:6379/0";
+constexpr auto RECORDER_VU_PUBLISH_INTERVAL = std::chrono::milliseconds(33);
 
 // The first audio buffer marker lands after the hardware has already started
 // filling the capture pipeline. Subtract this latency when estimating the
@@ -605,14 +608,67 @@ CinePISound::CinePISound(CinePIRecorder *app) :
 {
     console = spdlog::stdout_color_mt("cinepi_sound");
     console->set_level(spdlog::level::debug);  // or trace if you want even more
-
+    initRedis();
 }
 
 CinePISound::~CinePISound() {
     abortThread_ = true;
     if (sound_thread_.joinable())
         sound_thread_.join();
+    clearRecorderVuMeter();
     udev_unref(udev);
+}
+
+void CinePISound::initRedis()
+{
+    try {
+        const std::string redisUrl =
+            options_ && options_->redis ? *options_->redis : std::string(REDIS_DEFAULT_URL);
+        redis_ = std::make_unique<sw::redis::Redis>(redisUrl);
+        console->debug("Connected CinePISound Redis client to {}", redisUrl);
+    } catch (const std::exception &exc) {
+        redis_.reset();
+        console->warn("CinePISound could not connect to Redis for recorder VU publishing: {}",
+                      exc.what());
+    }
+}
+
+void CinePISound::publishRecorderVuMeter(bool force)
+{
+    if (!redis_)
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && (now - last_vu_publish_ts_) < RECORDER_VU_PUBLISH_INTERVAL)
+        return;
+
+    try {
+        std::ostringstream value;
+        value << vu_meter[0] << '|'
+              << vu_meter[1] << '|'
+              << vu_meter[2] << '|'
+              << vu_meter[3];
+        redis_->set(RECORDER_VU_REDIS_KEY, value.str());
+        last_published_vu_ = vu_meter;
+        last_vu_publish_ts_ = now;
+    } catch (const std::exception &exc) {
+        console->debug("Failed to publish recorder VU to Redis: {}", exc.what());
+    }
+}
+
+void CinePISound::clearRecorderVuMeter()
+{
+    if (!redis_)
+        return;
+
+    try {
+        redis_->del(RECORDER_VU_REDIS_KEY);
+    } catch (const std::exception &exc) {
+        console->debug("Failed to clear recorder VU from Redis: {}", exc.what());
+    }
+
+    last_published_vu_.fill(0);
+    last_vu_publish_ts_ = std::chrono::steady_clock::time_point{};
 }
 
 void CinePISound::start() {
@@ -734,6 +790,7 @@ void CinePISound::record_start() {
     ts_close_file = 0;
     ts_end = 0;
     ts_audio_start_realtime = 0;
+    publishRecorderVuMeter(true);
 
     arec_pipe = popen2(cmdStream.str(), "r", pid);
 
@@ -877,6 +934,7 @@ void CinePISound::soundThread() {
                     if (line.empty()) continue;
                     if (line.find("<VU:") != std::string::npos) {
                         sscanf(line.c_str(), "<VU:%d|%d|%d|%d>", &vu_meter[0], &vu_meter[1], &vu_meter[2], &vu_meter[3]);
+                        publishRecorderVuMeter();
                     } else if (line.find("<TS_START:") != std::string::npos) {
                         ts_start = extractTime(line);
                     } else if (line.find("<TS_FIRST_BUFFER_B:") != std::string::npos) {
@@ -1126,6 +1184,7 @@ void CinePISound::soundThread() {
             }
 
             vu_meter.fill(0);
+            clearRecorderVuMeter();
         }
 
         fd_set fds;
