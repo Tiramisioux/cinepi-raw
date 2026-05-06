@@ -973,8 +973,12 @@ void CinePISound::idleVuThread()
     char buffer[256];
     while (!abortThread_ && monitor_vu_pipe_ && fgets(buffer, sizeof(buffer), monitor_vu_pipe_) != NULL) {
         std::string line(buffer);
-        if (line.find("<VU:") == std::string::npos)
+        if (line.find("<VU:") == std::string::npos) {
+            line.erase(std::remove(line.begin(), line.end(), '\n'), line.end());
+            if (!line.empty())
+                console->warn("Idle audio monitor: {}", line);
             continue;
+        }
         if (parseVuLine(line, vu_meter))
             publishRecorderVuMeter();
     }

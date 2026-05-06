@@ -396,16 +396,18 @@ int main(int argc, char **argv)
     if (!options.monitorOutput.empty()) {
         err = snd_pcm_open(&monitorPcm, options.monitorOutput.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
         if (err < 0) {
-            std::cerr << "snd_pcm_open monitor output failed: " << snd_strerror(err) << '\n';
-            snd_pcm_close(pcm);
-            return 1;
+            std::cerr << "snd_pcm_open monitor output failed: " << snd_strerror(err)
+                      << " (continuing without live monitor output)\n";
+            monitorPcm = nullptr;
         }
 
-        const unsigned int playbackChannels = (options.channels == 1) ? 2 : options.channels;
-        if (!configurePlaybackPcm(monitorPcm, formatInfo.alsaFormat, playbackChannels, rate)) {
-            snd_pcm_close(monitorPcm);
-            snd_pcm_close(pcm);
-            return 1;
+        if (monitorPcm) {
+            const unsigned int playbackChannels = (options.channels == 1) ? 2 : options.channels;
+            if (!configurePlaybackPcm(monitorPcm, formatInfo.alsaFormat, playbackChannels, rate)) {
+                snd_pcm_close(monitorPcm);
+                monitorPcm = nullptr;
+                std::cerr << "Monitor output setup failed; continuing without live monitor output\n";
+            }
         }
     }
 
@@ -518,7 +520,10 @@ int main(int argc, char **argv)
                                 options.channels,
                                 formatInfo,
                                 playbackScratch)) {
-            break;
+            snd_pcm_drop(monitorPcm);
+            snd_pcm_close(monitorPcm);
+            monitorPcm = nullptr;
+            std::cerr << "Disabling live monitor output after playback failure; VU capture continues\n";
         }
 
         if (stopRequested.load() && !draining) {
