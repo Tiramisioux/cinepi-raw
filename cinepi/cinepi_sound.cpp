@@ -578,6 +578,30 @@ static int run_with_stderr_capture(const std::string& cmd, std::string& first_li
     return pclose(fp);
 }
 
+void cleanupStaleIdleMonitorProcesses(const std::shared_ptr<spdlog::logger> &console)
+{
+    const std::array<std::pair<const char *, const char *>, 2> cleanupCommands = {{
+        {
+            "pkill -f \"cinepi-audio-capture.*--discard-output\"",
+            "stale idle audio monitor helpers",
+        },
+        {
+            "pkill -f \"alsaloop -C .* -P .* -t 10000 -A 1 -d\"",
+            "stale legacy HDMI monitor loops",
+        },
+    }};
+
+    for (const auto &[command, description] : cleanupCommands) {
+        const int rc = std::system(command);
+        const int exitCode = shellExitCode(rc);
+        if (exitCode == 0) {
+            console->info("Cleaned up {}", description);
+        } else if (exitCode != 1) {
+            console->warn("Cleanup command failed for {} (rc={})", description, exitCode);
+        }
+    }
+}
+
 uint64_t extractTime(const std::string& line) {
     size_t colon_pos = line.find(':');
     size_t dot_pos = line.find('.');
@@ -690,6 +714,7 @@ void CinePISound::clearRecorderVuMeter()
 }
 
 void CinePISound::start() {
+    cleanupStaleIdleMonitorProcesses(console);
     detectRecordingDevices();
     parseHardwareParams();  // ensure audio config is ready before recording
 
