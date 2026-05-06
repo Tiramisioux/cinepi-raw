@@ -70,6 +70,11 @@ private:
     std::vector<std::string> parseArecordAliases();
     void stopMonitoring();
     void startMonitoring();
+    void startPlaybackMonitoring();
+    void stopPlaybackMonitoring();
+    void startIdleVuMonitoring();
+    void stopIdleVuMonitoring();
+    void idleVuThread();
 
 
 
@@ -103,9 +108,13 @@ private:
     bool takeStartMetadataValid_ = false;
 
     std::string getPreferredMonitorOutput();
-    int monitor_pid = -1;
-    FILE* monitor_pipe = nullptr;
-    bool monitoring_ = false;
+    int monitor_playback_pid_ = -1;
+    FILE* monitor_playback_pipe_ = nullptr;
+    bool monitoring_playback_ = false;
+    int monitor_vu_pid_ = -1;
+    FILE* monitor_vu_pipe_ = nullptr;
+    bool monitoring_vu_ = false;
+    std::thread idle_vu_thread_;
 
     struct udev *udev;
     struct udev_device *udev_dev;

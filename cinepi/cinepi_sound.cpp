@@ -202,6 +202,19 @@ uint64_t computeTimeReferenceSamples(const std::array<uint8_t, 8> &timecode,
     return timeReference;
 }
 
+bool parseVuLine(const std::string &line, std::array<int, 4> &vuMeter)
+{
+    int left = 0, right = 0, aux1 = 0, aux2 = 0;
+    if (std::sscanf(line.c_str(), "<VU:%d|%d|%d|%d>", &left, &right, &aux1, &aux2) != 4)
+        return false;
+
+    vuMeter[0] = left;
+    vuMeter[1] = right;
+    vuMeter[2] = aux1;
+    vuMeter[3] = aux2;
+    return true;
+}
+
 std::optional<uintmax_t> waitForStableFile(const std::string &filename,
                                            int maxAttempts = 50,
                                            std::chrono::milliseconds interval =
@@ -599,8 +612,10 @@ CinePISound::CinePISound(CinePIRecorder *app) :
     app_(app),
     options_(app->GetOptions()),
     abortThread_(false),
-    monitor_pipe(nullptr),
-    monitoring_(false),
+    monitor_playback_pipe_(nullptr),
+    monitoring_playback_(false),
+    monitor_vu_pipe_(nullptr),
+    monitoring_vu_(false),
     udev(nullptr),
     udev_dev(nullptr),
     udev_mon(nullptr),
@@ -613,9 +628,12 @@ CinePISound::CinePISound(CinePIRecorder *app) :
 
 CinePISound::~CinePISound() {
     abortThread_ = true;
+    stopMonitoring();
     if (sound_thread_.joinable())
         sound_thread_.join();
     clearRecorderVuMeter();
+    if (udev_mon)
+        udev_monitor_unref(udev_mon);
     udev_unref(udev);
 }
 
@@ -675,9 +693,11 @@ void CinePISound::start() {
     detectRecordingDevices();
     parseHardwareParams();  // ensure audio config is ready before recording
 
-    if (canRecordAudio) {
+    if (!sound_thread_.joinable()) {
         sound_thread_ = std::thread(std::bind(&CinePISound::soundThread, this));
-    } else {
+    }
+
+    if (!canRecordAudio) {
         console->warn("start(): Audio not ready — recording disabled");
     }
 }
@@ -853,20 +873,36 @@ void CinePISound::detectRecordingDevices() {
 }
 
 void CinePISound::stopMonitoring() {
-    if (monitor_pid > 0) {
-        kill(-monitor_pid, SIGTERM);
-        if (monitor_pipe) {
-            pclose2(monitor_pipe, monitor_pid);
-            monitor_pipe = nullptr;
-        }
-        monitor_pid = -1;
-        monitoring_ = false;
-        console->info("Stopped audio monitoring");
-    }
+    stopPlaybackMonitoring();
+    stopIdleVuMonitoring();
+    vu_meter.fill(0);
+    clearRecorderVuMeter();
 }
 
 void CinePISound::startMonitoring() {
-    if (!canRecordAudio || recording_ || record_ || monitoring_) {
+    if (!canRecordAudio || recording_ || record_) {
+        return;
+    }
+
+    startPlaybackMonitoring();
+    startIdleVuMonitoring();
+}
+
+void CinePISound::stopPlaybackMonitoring() {
+    if (monitor_playback_pid_ > 0) {
+        kill(-monitor_playback_pid_, SIGTERM);
+        if (monitor_playback_pipe_) {
+            pclose2(monitor_playback_pipe_, monitor_playback_pid_);
+            monitor_playback_pipe_ = nullptr;
+        }
+        monitor_playback_pid_ = -1;
+        monitoring_playback_ = false;
+        console->info("Stopped audio monitoring playback");
+    }
+}
+
+void CinePISound::startPlaybackMonitoring() {
+    if (monitoring_playback_) {
         return;
     }
 
@@ -877,9 +913,79 @@ void CinePISound::startMonitoring() {
             << " -t 10000 -A 1 -d"
             << " 2>/dev/null";
     console->info("Starting audio monitoring: {}", mon_cmd.str());
-    monitor_pipe = popen2(mon_cmd.str(), "r", monitor_pid);
-    if (monitor_pid > 0 && monitor_pipe) {
-        monitoring_ = true;
+    monitor_playback_pipe_ = popen2(mon_cmd.str(), "r", monitor_playback_pid_);
+    if (monitor_playback_pid_ > 0 && monitor_playback_pipe_) {
+        monitoring_playback_ = true;
+    }
+}
+
+void CinePISound::stopIdleVuMonitoring()
+{
+    if (monitor_vu_pid_ > 0)
+        kill(-monitor_vu_pid_, SIGTERM);
+
+    if (idle_vu_thread_.joinable())
+        idle_vu_thread_.join();
+
+    if (monitor_vu_pipe_) {
+        pclose2(monitor_vu_pipe_, monitor_vu_pid_);
+        monitor_vu_pipe_ = nullptr;
+        monitor_vu_pid_ = -1;
+    }
+    monitoring_vu_ = false;
+}
+
+void CinePISound::startIdleVuMonitoring()
+{
+    if (monitoring_vu_)
+        return;
+
+    const std::string helperBinary = locateAudioCaptureHelper();
+    if (helperBinary.empty()) {
+        console->warn("cinepi-audio-capture helper not found; idle VU monitoring disabled");
+        return;
+    }
+
+    std::ostringstream mon_cmd;
+    mon_cmd << shellQuote(helperBinary)
+            << " --device " << shellQuote(defaultDevice)
+            << " --format " << shellQuote(audioFormat)
+            << " --channels " << audioChannels
+            << " --rate " << audioSampleRate
+            << " --discard-output"
+            << " 2>&1";
+    console->info("Starting idle VU monitor: {}", mon_cmd.str());
+    monitor_vu_pipe_ = popen2(mon_cmd.str(), "r", monitor_vu_pid_);
+    if (monitor_vu_pid_ > 0 && monitor_vu_pipe_) {
+        monitoring_vu_ = true;
+        idle_vu_thread_ = std::thread(std::bind(&CinePISound::idleVuThread, this));
+    }
+}
+
+void CinePISound::idleVuThread()
+{
+    if (!monitor_vu_pipe_)
+        return;
+
+    char buffer[256];
+    while (!abortThread_ && monitor_vu_pipe_ && fgets(buffer, sizeof(buffer), monitor_vu_pipe_) != NULL) {
+        std::string line(buffer);
+        if (line.find("<VU:") == std::string::npos)
+            continue;
+        if (parseVuLine(line, vu_meter))
+            publishRecorderVuMeter();
+    }
+
+    if (monitor_vu_pipe_) {
+        pclose2(monitor_vu_pipe_, monitor_vu_pid_);
+        monitor_vu_pipe_ = nullptr;
+    }
+    monitor_vu_pid_ = -1;
+    monitoring_vu_ = false;
+
+    if (!recording_ && !record_) {
+        vu_meter.fill(0);
+        clearRecorderVuMeter();
     }
 }
 
@@ -933,8 +1039,8 @@ void CinePISound::soundThread() {
                 while (std::getline(ss, line)) {
                     if (line.empty()) continue;
                     if (line.find("<VU:") != std::string::npos) {
-                        sscanf(line.c_str(), "<VU:%d|%d|%d|%d>", &vu_meter[0], &vu_meter[1], &vu_meter[2], &vu_meter[3]);
-                        publishRecorderVuMeter();
+                        if (parseVuLine(line, vu_meter))
+                            publishRecorderVuMeter();
                     } else if (line.find("<TS_START:") != std::string::npos) {
                         ts_start = extractTime(line);
                     } else if (line.find("<TS_FIRST_BUFFER_B:") != std::string::npos) {
@@ -1199,16 +1305,20 @@ void CinePISound::soundThread() {
                 std::string device = udev_device_get_sysname(udev_dev);
                 std::string action = udev_device_get_action(udev_dev);
 
-                if (action == "change" && device.find("card") != std::string::npos) {
+                if ((action == "add" || action == "change") &&
+                    device.find("card") != std::string::npos) {
                     console->critical("Action:{} | Device:{}", action, device);
                     detectRecordingDevices();
-                    if (canRecordAudio) parseHardwareParams();
+                    parseHardwareParams();
                 } else if (action == "remove" && device.find("card") != std::string::npos) {
+                    stopMonitoring();
                     recording_ = false;
                     canRecordAudio = false;
                     audioFormat = "";
+                    defaultDevice.clear();
                     audioSampleRate = 0;
                     audioChannels = 0;
+                    clearRecorderVuMeter();
                     console->critical("Sound card removed!");
                 }
                 udev_device_unref(udev_dev);

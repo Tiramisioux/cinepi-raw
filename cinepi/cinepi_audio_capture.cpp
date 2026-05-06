@@ -35,6 +35,7 @@ struct Options
     std::string output;
     unsigned int channels = 0;
     unsigned int rate = 0;
+    bool discardOutput = false;
 };
 
 struct FormatInfo
@@ -75,6 +76,8 @@ bool parseArgs(int argc, char **argv, Options &options)
             options.rate = static_cast<unsigned int>(std::stoul(requireValue(arg)));
         else if (arg == "--output")
             options.output = requireValue(arg);
+        else if (arg == "--discard-output")
+            options.discardOutput = true;
         else {
             std::cerr << "Unknown argument: " << arg << '\n';
             return false;
@@ -83,7 +86,7 @@ bool parseArgs(int argc, char **argv, Options &options)
 
     return !options.device.empty() &&
            !options.format.empty() &&
-           !options.output.empty() &&
+           (!options.output.empty() || options.discardOutput) &&
            options.channels > 0 &&
            options.rate > 0;
 }
@@ -227,7 +230,7 @@ int main(int argc, char **argv)
     Options options;
     if (!parseArgs(argc, argv, options)) {
         std::cerr << "Usage: cinepi-audio-capture --device <name> --format <S16_LE|S24_3LE>"
-                  << " --channels <n> --rate <hz> --output <wav>\n";
+                  << " --channels <n> --rate <hz> [--output <wav> | --discard-output]\n";
         return 2;
     }
 
@@ -241,11 +244,14 @@ int main(int argc, char **argv)
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
 
-    std::filesystem::path outputPath(options.output);
-    std::fstream output(outputPath, std::ios::binary | std::ios::out | std::ios::trunc);
-    if (!output.is_open()) {
-        std::cerr << "Failed to open output WAV: " << options.output << '\n';
-        return 1;
+    std::fstream output;
+    if (!options.discardOutput) {
+        std::filesystem::path outputPath(options.output);
+        output.open(outputPath, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!output.is_open()) {
+            std::cerr << "Failed to open output WAV: " << options.output << '\n';
+            return 1;
+        }
     }
 
     snd_pcm_t *pcm = nullptr;
@@ -274,7 +280,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    writeWaveHeader(output, options.channels, rate, formatInfo.bitsPerSample, 0);
+    if (!options.discardOutput)
+        writeWaveHeader(output, options.channels, rate, formatInfo.bitsPerSample, 0);
 
     unsigned int periodTimeUs = 10000;
     unsigned int bufferTimeUs = 40000;
@@ -372,11 +379,13 @@ int main(int argc, char **argv)
         }
 
         const size_t bytesRead = static_cast<size_t>(framesRead) * frameBytes;
-        output.write(reinterpret_cast<const char *>(buffer.data()),
-                     static_cast<std::streamsize>(bytesRead));
-        if (!output.good()) {
-            std::cerr << "Failed to write WAV payload\n";
-            break;
+        if (!options.discardOutput) {
+            output.write(reinterpret_cast<const char *>(buffer.data()),
+                         static_cast<std::streamsize>(bytesRead));
+            if (!output.good()) {
+                std::cerr << "Failed to write WAV payload\n";
+                break;
+            }
         }
 
         dataBytes += static_cast<uint64_t>(bytesRead);
@@ -392,12 +401,14 @@ int main(int argc, char **argv)
     std::cout << "<SAMPLES_CAPTURED: " << framesCaptured << ">\n";
     emitTimestamp("TS_CLOSE_FILE", currentClock(CLOCK_MONOTONIC));
 
-    writeWaveHeader(output,
-                    options.channels,
-                    rate,
-                    formatInfo.bitsPerSample,
-                    static_cast<uint32_t>(std::min<uint64_t>(dataBytes, std::numeric_limits<uint32_t>::max())));
-    output.close();
+    if (!options.discardOutput) {
+        writeWaveHeader(output,
+                        options.channels,
+                        rate,
+                        formatInfo.bitsPerSample,
+                        static_cast<uint32_t>(std::min<uint64_t>(dataBytes, std::numeric_limits<uint32_t>::max())));
+        output.close();
+    }
 
     emitTimestamp("TS_END", currentClock(CLOCK_MONOTONIC));
 
