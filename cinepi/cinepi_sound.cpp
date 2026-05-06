@@ -884,8 +884,9 @@ void CinePISound::startMonitoring() {
         return;
     }
 
-    startPlaybackMonitoring();
     startIdleVuMonitoring();
+    if (!monitoring_vu_)
+        startPlaybackMonitoring();
 }
 
 void CinePISound::stopPlaybackMonitoring() {
@@ -947,14 +948,16 @@ void CinePISound::startIdleVuMonitoring()
     }
 
     std::ostringstream mon_cmd;
+    const std::string outputDevice = getPreferredMonitorOutput();
     mon_cmd << shellQuote(helperBinary)
             << " --device " << shellQuote(defaultDevice)
             << " --format " << shellQuote(audioFormat)
             << " --channels " << audioChannels
             << " --rate " << audioSampleRate
+            << " --monitor-output " << shellQuote(outputDevice)
             << " --discard-output"
             << " 2>&1";
-    console->info("Starting idle VU monitor: {}", mon_cmd.str());
+    console->info("Starting idle audio monitor via helper: {}", mon_cmd.str());
     monitor_vu_pipe_ = popen2(mon_cmd.str(), "r", monitor_vu_pid_);
     if (monitor_vu_pid_ > 0 && monitor_vu_pipe_) {
         monitoring_vu_ = true;
