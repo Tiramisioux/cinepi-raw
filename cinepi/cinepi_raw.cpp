@@ -195,13 +195,14 @@ int main(int argc, char *argv[])
 	try
 	{
 		CinePIRecorder app;
-		CinePISound sound(&app);
-		CinePIController controller(&app);
-		
+
 		CinePiOptions *options = app.GetOptions();
 
 		if (options->Parse(argc, argv))
 		{
+			CinePISound sound(&app);
+			CinePIController controller(&app);
+
 			options->mediaDest = "/media/RAW";
 			options->rawCrop[0] = 0;
 			options->rawCrop[1] = 0;
