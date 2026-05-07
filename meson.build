@@ -49,6 +49,7 @@ subdir('output')
 subdir('preview')
 subdir('post_processing_stages')
 subdir('utils')
+subdir('apps')
 
 add_project_arguments(cpp_arguments, language : 'cpp')
 
@@ -68,7 +69,6 @@ install_symlink('libcamera_app.so',
                 pointing_to: 'rpicam_app.so')
 
 subdir('cinepi')
-# subdir('apps')
 
 summary({
             'libav encoder' : enable_libav,
