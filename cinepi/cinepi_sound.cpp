@@ -9,6 +9,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <optional>
 #include <regex>
@@ -20,6 +21,7 @@ constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
 constexpr char RECORDER_VU_REDIS_KEY[] = "audio_vu";
 constexpr char REDIS_DEFAULT_URL[] = "redis://127.0.0.1:6379/0";
 constexpr auto RECORDER_VU_PUBLISH_INTERVAL = std::chrono::milliseconds(33);
+constexpr auto AUDIO_MONITOR_SHUTDOWN_TIMEOUT = std::chrono::milliseconds(250);
 
 // The first audio buffer marker lands after the hardware has already started
 // filling the capture pipeline. Subtract this latency when estimating the
@@ -633,6 +635,7 @@ CinePISound::CinePISound(CinePIRecorder *app) :
     pid(-1),
     recording_(false),
     record_(false),
+    audio_capture_started_(false),
     app_(app),
     options_(app->GetOptions()),
     abortThread_(false),
@@ -768,7 +771,6 @@ void CinePISound::record_start() {
         return;
     }
 
-    stopMonitoring();
     resetTakeMetadata();
 
     if (auto fallbackMetadata =
@@ -824,7 +826,8 @@ void CinePISound::record_start() {
                   << " " << filename << " 2>&1";
     }
 
-    console->info("Executing audio capture command: {}", cmdStream.str());
+    console->info("Queueing audio capture command: {}", cmdStream.str());
+    console->info("Video recording will continue immediately while audio starts asynchronously");
 
     samples_captured = 0;
     capturedAudioSampleRate = 0;
@@ -835,17 +838,49 @@ void CinePISound::record_start() {
     ts_close_file = 0;
     ts_end = 0;
     ts_audio_start_realtime = 0;
+    audio_capture_started_ = false;
     publishRecorderVuMeter(true);
 
-    arec_pipe = popen2(cmdStream.str(), "r", pid);
+    record_ = true;
+    std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
+    pending_audio_capture_ = PendingAudioCapture{cmdStream.str()};
+}
+
+void CinePISound::launchPendingRecordingStart()
+{
+    std::optional<PendingAudioCapture> pending;
+    {
+        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
+        if (!pending_audio_capture_)
+            return;
+
+        pending = pending_audio_capture_;
+        pending_audio_capture_.reset();
+    }
+
+    if (!record_) {
+        console->warn("Audio capture start was canceled before helper launch");
+        return;
+    }
+
+    stopMonitoring();
+
+    if (!record_) {
+        console->warn("Audio capture start was canceled after monitor shutdown");
+        return;
+    }
+
+    console->info("Launching audio capture command asynchronously: {}", pending->command);
+    arec_pipe = popen2(pending->command, "r", pid);
 
     if (!arec_pipe) {
-        console->error("Failed to open pipe to arecord");
-    } else {
-        console->info("arecord process started successfully (pid={})", pid);
-        recording_ = true;
-        record_ = true;
+        pid = -1;
+        console->warn("Failed to launch audio capture helper; continuing take without audio");
+        return;
     }
+
+    console->info("Audio capture helper started successfully (pid={})", pid);
+    recording_ = true;
 }
 
 void CinePISound::record_stop() {
@@ -853,6 +888,10 @@ void CinePISound::record_stop() {
         return;
 
     record_ = false;
+    {
+        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
+        pending_audio_capture_.reset();
+    }
     if(pid > 0){
         kill(-pid, SIGTERM); // Send to full process group
     }
@@ -950,8 +989,18 @@ void CinePISound::stopIdleVuMonitoring()
     if (monitor_vu_pid_ > 0)
         kill(-monitor_vu_pid_, SIGTERM);
 
-    if (idle_vu_thread_.joinable())
-        idle_vu_thread_.join();
+    if (idle_vu_thread_.joinable()) {
+        auto joinFuture = std::async(std::launch::async, [this]() {
+            idle_vu_thread_.join();
+        });
+
+        if (joinFuture.wait_for(AUDIO_MONITOR_SHUTDOWN_TIMEOUT) != std::future_status::ready) {
+            console->warn("Idle audio monitor did not exit after SIGTERM; forcing shutdown");
+            if (monitor_vu_pid_ > 0)
+                kill(-monitor_vu_pid_, SIGKILL);
+            joinFuture.wait();
+        }
+    }
 
     if (monitor_vu_pipe_) {
         pclose2(monitor_vu_pipe_, monitor_vu_pid_);
@@ -1058,45 +1107,81 @@ void CinePISound::soundThread() {
     init_udev();
 
     while (!abortThread_) {
+        if (pid <= 0 && !recording_) {
+            launchPendingRecordingStart();
+        }
+
         // Always drain the arecord pipe until the child exits, even after record_stop()
         // clears the record_ flag. Otherwise the pipe would never be closed and the WAV
         // file would remain incomplete/unwritten, resulting in 0 WAV clips.
         if (pid > 0) {
+            auto handleAudioCaptureLine = [this](std::string line) {
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+
+                if (line.empty())
+                    return;
+
+                if (line.find("<VU:") != std::string::npos) {
+                    if (parseVuLine(line, vu_meter))
+                        publishRecorderVuMeter();
+                } else if (line.find("<TS_START:") != std::string::npos) {
+                    audio_capture_started_ = true;
+                    ts_start = extractTime(line);
+                } else if (line.find("<TS_FIRST_BUFFER_B:") != std::string::npos) {
+                    audio_capture_started_ = true;
+                    ts_first_buffer_b = extractTime(line);
+                } else if (line.find("<TS_FIRST_BUFFER_A:") != std::string::npos) {
+                    audio_capture_started_ = true;
+                    ts_first_buffer_a = extractTime(line);
+                } else if (line.find("<TS_AUDIO_START_REALTIME:") != std::string::npos) {
+                    audio_capture_started_ = true;
+                    ts_audio_start_realtime = extractTime(line);
+                } else if (line.find("<NEGOTIATED_SAMPLE_RATE:") != std::string::npos) {
+                    audio_capture_started_ = true;
+                    sscanf(line.c_str(), "<NEGOTIATED_SAMPLE_RATE: %d>", &capturedAudioSampleRate);
+                } else if (line.find("<SAMPLES_CAPTURED:") != std::string::npos) {
+                    sscanf(line.c_str(), "<SAMPLES_CAPTURED: %d>", &samples_captured);
+                } else if (line.find("<TS_CLOSE_FILE:") != std::string::npos) {
+                    ts_close_file = extractTime(line);
+                } else if (line.find("<TS_END:") != std::string::npos) {
+                    ts_end = extractTime(line);
+                } else {
+                    console->warn("Audio capture helper: {}", line);
+                }
+            };
+
             char buffer[256];
-            std::string result = "";
+            std::string pendingOutput;
             while (fgets(buffer, sizeof(buffer), arec_pipe) != NULL) {
-                result += buffer;
-                std::istringstream ss(result);
-                std::string line;
-                while (std::getline(ss, line)) {
-                    if (line.empty()) continue;
-                    if (line.find("<VU:") != std::string::npos) {
-                        if (parseVuLine(line, vu_meter))
-                            publishRecorderVuMeter();
-                    } else if (line.find("<TS_START:") != std::string::npos) {
-                        ts_start = extractTime(line);
-                    } else if (line.find("<TS_FIRST_BUFFER_B:") != std::string::npos) {
-                        ts_first_buffer_b = extractTime(line);
-                    } else if (line.find("<TS_FIRST_BUFFER_A:") != std::string::npos) {
-                        ts_first_buffer_a = extractTime(line);
-                    } else if (line.find("<TS_AUDIO_START_REALTIME:") != std::string::npos) {
-                        ts_audio_start_realtime = extractTime(line);
-                    } else if (line.find("<NEGOTIATED_SAMPLE_RATE:") != std::string::npos) {
-                        sscanf(line.c_str(), "<NEGOTIATED_SAMPLE_RATE: %d>", &capturedAudioSampleRate);
-                    } else if (line.find("<SAMPLES_CAPTURED:") != std::string::npos) {
-                        sscanf(line.c_str(), "<SAMPLES_CAPTURED: %d>", &samples_captured);
-                    } else if (line.find("<TS_CLOSE_FILE:") != std::string::npos) {
-                        ts_close_file = extractTime(line);
-                    } else if (line.find("<TS_END:") != std::string::npos) {
-                        ts_end = extractTime(line);
-                    }
+                pendingOutput += buffer;
+                size_t newlinePos = std::string::npos;
+                while ((newlinePos = pendingOutput.find('\n')) != std::string::npos) {
+                    std::string line = pendingOutput.substr(0, newlinePos);
+                    pendingOutput.erase(0, newlinePos + 1);
+                    handleAudioCaptureLine(line);
                 }
             }
+            if (!pendingOutput.empty())
+                handleAudioCaptureLine(pendingOutput);
             pclose2(arec_pipe, pid);
             pid = -1;
         }
 
         if (recording_ended()) {
+            auto finishRecordingAttempt = [this]() {
+                audio_capture_started_ = false;
+                vu_meter.fill(0);
+                clearRecorderVuMeter();
+                startMonitoring();
+            };
+
+            if (!audio_capture_started_) {
+                console->warn("Audio capture helper exited before capture actually started; continuing take without WAV");
+                finishRecordingAttempt();
+                continue;
+            }
+
             std::ostringstream fn_oss;
             fn_oss << options_->mediaDest << '/' << options_->folder << '/' << options_->folder << ".wav";
             std::string filename = fn_oss.str();
@@ -1105,6 +1190,7 @@ void CinePISound::soundThread() {
             if (!wavSize) {
                 console->critical("Cannot attach WAV metadata: {} did not become ready after recording stopped",
                                   filename);
+                finishRecordingAttempt();
                 continue;
             }
             console->debug("WAV ready for metadata update: {} bytes", *wavSize);
@@ -1118,6 +1204,7 @@ void CinePISound::soundThread() {
 
             if (frames <= 0 || vts_end < vts_start) {
                 console->critical("Cannot retime WAV: invalid video timestamp range");
+                finishRecordingAttempt();
                 continue;
             }
 
@@ -1291,6 +1378,7 @@ void CinePISound::soundThread() {
                 console->critical("ffmpeg WAV metadata write failed (rc={}): {}",
                                   shellExitCode(ffmpeg_status),
                                   ffmpeg_error.empty() ? "no stderr output" : ffmpeg_error);
+                finishRecordingAttempt();
                 continue;
             }
 
@@ -1298,6 +1386,7 @@ void CinePISound::soundThread() {
             std::filesystem::rename(tmp_oss.str(), filename, rename_ec);
             if (rename_ec) {
                 console->critical("Failed to replace WAV with metadata-updated version: {}", rename_ec.message());
+                finishRecordingAttempt();
                 continue;
             }
 
@@ -1321,8 +1410,8 @@ void CinePISound::soundThread() {
                               audioStartOffsetSamples);
             }
 
-            vu_meter.fill(0);
-            clearRecorderVuMeter();
+            finishRecordingAttempt();
+            continue;
         }
 
         fd_set fds;
@@ -1448,7 +1537,9 @@ std::string CinePISound::getPreferredMonitorOutput() {
         return "plughw:CARD=Headphones,DEV=0"; // This should match your actual card name for jack
     } else {
         console->info("No headphones detected — using HDMI output (vc4hdmi0)");
-        return "hdmi:CARD=vc4hdmi0,DEV=0";
+        // Route through ALSA's default HDMI device so mono monitoring can be
+        // converted to the sink's supported channel layout.
+        return "default:CARD=vc4hdmi0";
     }
 }
 
