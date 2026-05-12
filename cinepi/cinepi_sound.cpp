@@ -14,6 +14,7 @@
 #include <optional>
 #include <regex>
 #include <unordered_set>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
@@ -490,6 +491,8 @@ FILE * popen2(std::string command, std::string type, int & pid)
 
     if (child_pid == 0)
     {
+        const std::string exec_command = "exec " + command;
+
         if (type == "r")
         {
             close(fd[READ]);
@@ -501,8 +504,13 @@ FILE * popen2(std::string command, std::string type, int & pid)
             dup2(fd[READ], 0);
         }
 
+#ifdef PR_SET_PDEATHSIG
+        prctl(PR_SET_PDEATHSIG, SIGHUP);
+        if (getppid() == 1)
+            _exit(1);
+#endif
         setpgid(child_pid, child_pid);
-        execl("/bin/sh", "/bin/sh", "-c", command.c_str(), NULL);
+        execl("/bin/sh", "/bin/sh", "-c", exec_command.c_str(), NULL);
         exit(0);
     }
     else
@@ -654,6 +662,15 @@ CinePISound::CinePISound(CinePIRecorder *app) :
 }
 
 CinePISound::~CinePISound() {
+    record_ = false;
+    {
+        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
+        pending_audio_capture_.reset();
+    }
+    if (pid > 0)
+        kill(-pid, SIGTERM);
+    recording_ = false;
+    audio_capture_started_ = false;
     abortThread_ = true;
     stopMonitoring();
     if (sound_thread_.joinable())
