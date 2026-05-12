@@ -8,10 +8,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <regex>
 #include <sstream>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <mutex>
+#include <optional>
 #include <vector>
 
 #include <thread>
@@ -22,6 +25,7 @@
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <sw/redis++/redis++.h>
 
 #include "cinepi_recorder.hpp"
 #include "raw_options.hpp"
@@ -62,12 +66,23 @@ private:
     bool appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload);
     void resetTakeMetadata();
     void publishMicSelection();
+    void initRedis();
+    void publishRecorderVuMeter(bool force = false);
+    void clearRecorderVuMeter();
     std::vector<std::string> parseArecordAliases();
     void stopMonitoring();
+    void launchPendingRecordingStart();
     void startMonitoring();
+    void startPlaybackMonitoring();
+    void stopPlaybackMonitoring();
+    void startIdleVuMonitoring();
+    void stopIdleVuMonitoring();
+    void idleVuThread();
 
-
-
+    struct PendingAudioCapture
+    {
+        std::string command;
+    };
 
     int samples_captured;
     int capturedAudioSampleRate;
@@ -84,20 +99,30 @@ private:
     int pid;
     bool recording_;
     bool record_;
+    bool audio_capture_started_;
+    std::mutex pending_audio_capture_mutex_;
     std::stringstream cmdStream;
     CinePIRecorder *app_;
     RawOptions *options_;
+    std::unique_ptr<sw::redis::Redis> redis_;
     bool abortThread_;
     std::thread sound_thread_;
+    std::array<int, 4> last_published_vu_{};
+    std::chrono::steady_clock::time_point last_vu_publish_ts_{};
     std::array<uint8_t, 8> takeStartTimeCode_{};
     std::array<uint16_t, 3> takeStartOriginationDate_{};
     double takeStartFramerate_ = 0.0;
+    std::optional<PendingAudioCapture> pending_audio_capture_;
     bool takeStartMetadataValid_ = false;
 
     std::string getPreferredMonitorOutput();
-    int monitor_pid = -1;
-    FILE* monitor_pipe = nullptr;
-    bool monitoring_ = false;
+    int monitor_playback_pid_ = -1;
+    FILE* monitor_playback_pipe_ = nullptr;
+    bool monitoring_playback_ = false;
+    int monitor_vu_pid_ = -1;
+    FILE* monitor_vu_pipe_ = nullptr;
+    bool monitoring_vu_ = false;
+    std::thread idle_vu_thread_;
 
     struct udev *udev;
     struct udev_device *udev_dev;

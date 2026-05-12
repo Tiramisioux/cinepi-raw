@@ -48,7 +48,8 @@ class CinePIController : public CinePIState
         };
         ~CinePIController() {
             abortThread_ = true;
-            main_thread_.join();
+            if (main_thread_.joinable())
+                main_thread_.join();
         };
 
         bool buffer_size_sent_ = false;

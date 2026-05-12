@@ -67,8 +67,8 @@ install_symlink('libcamera_app.so',
                 install_dir: get_option('libdir'),
                 pointing_to: 'rpicam_app.so')
 
+subdir('apps')
 subdir('cinepi')
-# subdir('apps')
 
 summary({
             'libav encoder' : enable_libav,

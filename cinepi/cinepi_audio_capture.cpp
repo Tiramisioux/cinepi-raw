@@ -32,9 +32,11 @@ struct Options
 {
     std::string device;
     std::string format;
+    std::string monitorOutput;
     std::string output;
     unsigned int channels = 0;
     unsigned int rate = 0;
+    bool discardOutput = false;
 };
 
 struct FormatInfo
@@ -73,8 +75,12 @@ bool parseArgs(int argc, char **argv, Options &options)
             options.channels = static_cast<unsigned int>(std::stoul(requireValue(arg)));
         else if (arg == "--rate")
             options.rate = static_cast<unsigned int>(std::stoul(requireValue(arg)));
+        else if (arg == "--monitor-output")
+            options.monitorOutput = requireValue(arg);
         else if (arg == "--output")
             options.output = requireValue(arg);
+        else if (arg == "--discard-output")
+            options.discardOutput = true;
         else {
             std::cerr << "Unknown argument: " << arg << '\n';
             return false;
@@ -83,7 +89,7 @@ bool parseArgs(int argc, char **argv, Options &options)
 
     return !options.device.empty() &&
            !options.format.empty() &&
-           !options.output.empty() &&
+           (!options.output.empty() || options.discardOutput) &&
            options.channels > 0 &&
            options.rate > 0;
 }
@@ -220,6 +226,99 @@ int recoverCaptureError(snd_pcm_t *handle, int err)
 
 } // namespace
 
+bool configurePlaybackPcm(snd_pcm_t *pcm,
+                          snd_pcm_format_t format,
+                          unsigned int channels,
+                          unsigned int rate)
+{
+    snd_pcm_hw_params_t *hw = nullptr;
+    snd_pcm_hw_params_alloca(&hw);
+
+    int err = 0;
+    if ((err = snd_pcm_hw_params_any(pcm, hw)) < 0 ||
+        (err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
+        (err = snd_pcm_hw_params_set_format(pcm, hw, format)) < 0 ||
+        (err = snd_pcm_hw_params_set_channels(pcm, hw, channels)) < 0) {
+        std::cerr << "Failed to configure monitor playback parameters: "
+                  << snd_strerror(err) << '\n';
+        return false;
+    }
+
+    int dir = 0;
+    unsigned int requestedRate = rate;
+    if ((err = snd_pcm_hw_params_set_rate_near(pcm, hw, &requestedRate, &dir)) < 0) {
+        std::cerr << "Failed to set monitor playback rate: " << snd_strerror(err) << '\n';
+        return false;
+    }
+
+    unsigned int periodTimeUs = 10000;
+    unsigned int bufferTimeUs = 40000;
+    snd_pcm_hw_params_set_period_time_near(pcm, hw, &periodTimeUs, &dir);
+    snd_pcm_hw_params_set_buffer_time_near(pcm, hw, &bufferTimeUs, &dir);
+
+    if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
+        std::cerr << "Failed to apply monitor playback parameters: "
+                  << snd_strerror(err) << '\n';
+        return false;
+    }
+
+    if ((err = snd_pcm_prepare(pcm)) < 0) {
+        std::cerr << "snd_pcm_prepare for monitor output failed: "
+                  << snd_strerror(err) << '\n';
+        return false;
+    }
+
+    return true;
+}
+
+void upmixMonoToStereo(const uint8_t *input,
+                       snd_pcm_sframes_t framesRead,
+                       unsigned int bytesPerSample,
+                       std::vector<uint8_t> &output)
+{
+    output.resize(static_cast<size_t>(framesRead) * bytesPerSample * 2);
+    for (snd_pcm_sframes_t frame = 0; frame < framesRead; ++frame) {
+        const uint8_t *src = input + (static_cast<size_t>(frame) * bytesPerSample);
+        uint8_t *dst = output.data() + (static_cast<size_t>(frame) * bytesPerSample * 2);
+        std::memcpy(dst, src, bytesPerSample);
+        std::memcpy(dst + bytesPerSample, src, bytesPerSample);
+    }
+}
+
+bool writeMonitorFrames(snd_pcm_t *pcm,
+                        const uint8_t *buffer,
+                        snd_pcm_sframes_t framesRead,
+                        unsigned int captureChannels,
+                        const FormatInfo &formatInfo,
+                        std::vector<uint8_t> &scratch)
+{
+    const uint8_t *playbackBytes = buffer;
+    unsigned int playbackChannels = captureChannels;
+    if (captureChannels == 1) {
+        upmixMonoToStereo(buffer, framesRead, formatInfo.bytesPerSample, scratch);
+        playbackBytes = scratch.data();
+        playbackChannels = 2;
+    }
+
+    snd_pcm_sframes_t written = 0;
+    while (written < framesRead) {
+        const uint8_t *chunk = playbackBytes +
+            (static_cast<size_t>(written) * playbackChannels * formatInfo.bytesPerSample);
+        snd_pcm_sframes_t rc = snd_pcm_writei(pcm, chunk, framesRead - written);
+        if (rc < 0) {
+            int err = recoverCaptureError(pcm, static_cast<int>(rc));
+            if (err < 0) {
+                std::cerr << "Monitor playback write failed: " << snd_strerror(err) << '\n';
+                return false;
+            }
+            continue;
+        }
+        written += rc;
+    }
+
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -227,7 +326,8 @@ int main(int argc, char **argv)
     Options options;
     if (!parseArgs(argc, argv, options)) {
         std::cerr << "Usage: cinepi-audio-capture --device <name> --format <S16_LE|S24_3LE>"
-                  << " --channels <n> --rate <hz> --output <wav>\n";
+                  << " --channels <n> --rate <hz> [--monitor-output <alsa>] "
+                  << "[--output <wav> | --discard-output]\n";
         return 2;
     }
 
@@ -241,11 +341,14 @@ int main(int argc, char **argv)
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
 
-    std::filesystem::path outputPath(options.output);
-    std::fstream output(outputPath, std::ios::binary | std::ios::out | std::ios::trunc);
-    if (!output.is_open()) {
-        std::cerr << "Failed to open output WAV: " << options.output << '\n';
-        return 1;
+    std::fstream output;
+    if (!options.discardOutput) {
+        std::filesystem::path outputPath(options.output);
+        output.open(outputPath, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!output.is_open()) {
+            std::cerr << "Failed to open output WAV: " << options.output << '\n';
+            return 1;
+        }
     }
 
     snd_pcm_t *pcm = nullptr;
@@ -274,7 +377,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    writeWaveHeader(output, options.channels, rate, formatInfo.bitsPerSample, 0);
+    if (!options.discardOutput)
+        writeWaveHeader(output, options.channels, rate, formatInfo.bitsPerSample, 0);
 
     unsigned int periodTimeUs = 10000;
     unsigned int bufferTimeUs = 40000;
@@ -287,6 +391,26 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    snd_pcm_t *monitorPcm = nullptr;
+    std::vector<uint8_t> playbackScratch;
+    if (!options.monitorOutput.empty()) {
+        err = snd_pcm_open(&monitorPcm, options.monitorOutput.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
+        if (err < 0) {
+            std::cerr << "snd_pcm_open monitor output failed: " << snd_strerror(err)
+                      << " (continuing without live monitor output)\n";
+            monitorPcm = nullptr;
+        }
+
+        if (monitorPcm) {
+            const unsigned int playbackChannels = (options.channels == 1) ? 2 : options.channels;
+            if (!configurePlaybackPcm(monitorPcm, formatInfo.alsaFormat, playbackChannels, rate)) {
+                snd_pcm_close(monitorPcm);
+                monitorPcm = nullptr;
+                std::cerr << "Monitor output setup failed; continuing without live monitor output\n";
+            }
+        }
+    }
+
     snd_pcm_uframes_t periodFrames = 0;
     snd_pcm_hw_params_get_period_size(hw, &periodFrames, &dir);
     if (periodFrames == 0)
@@ -294,12 +418,16 @@ int main(int argc, char **argv)
 
     if ((err = snd_pcm_prepare(pcm)) < 0) {
         std::cerr << "snd_pcm_prepare failed: " << snd_strerror(err) << '\n';
+        if (monitorPcm)
+            snd_pcm_close(monitorPcm);
         snd_pcm_close(pcm);
         return 1;
     }
 
     if ((err = snd_pcm_start(pcm)) < 0) {
         std::cerr << "snd_pcm_start failed: " << snd_strerror(err) << '\n';
+        if (monitorPcm)
+            snd_pcm_close(monitorPcm);
         snd_pcm_close(pcm);
         return 1;
     }
@@ -372,16 +500,31 @@ int main(int argc, char **argv)
         }
 
         const size_t bytesRead = static_cast<size_t>(framesRead) * frameBytes;
-        output.write(reinterpret_cast<const char *>(buffer.data()),
-                     static_cast<std::streamsize>(bytesRead));
-        if (!output.good()) {
-            std::cerr << "Failed to write WAV payload\n";
-            break;
+        if (!options.discardOutput) {
+            output.write(reinterpret_cast<const char *>(buffer.data()),
+                         static_cast<std::streamsize>(bytesRead));
+            if (!output.good()) {
+                std::cerr << "Failed to write WAV payload\n";
+                break;
+            }
         }
 
         dataBytes += static_cast<uint64_t>(bytesRead);
         framesCaptured += static_cast<uint64_t>(framesRead);
         emitVu(buffer.data(), framesRead, options.channels, formatInfo);
+
+        if (monitorPcm &&
+            !writeMonitorFrames(monitorPcm,
+                                buffer.data(),
+                                framesRead,
+                                options.channels,
+                                formatInfo,
+                                playbackScratch)) {
+            snd_pcm_drop(monitorPcm);
+            snd_pcm_close(monitorPcm);
+            monitorPcm = nullptr;
+            std::cerr << "Disabling live monitor output after playback failure; VU capture continues\n";
+        }
 
         if (stopRequested.load() && !draining) {
             draining = true;
@@ -392,14 +535,21 @@ int main(int argc, char **argv)
     std::cout << "<SAMPLES_CAPTURED: " << framesCaptured << ">\n";
     emitTimestamp("TS_CLOSE_FILE", currentClock(CLOCK_MONOTONIC));
 
-    writeWaveHeader(output,
-                    options.channels,
-                    rate,
-                    formatInfo.bitsPerSample,
-                    static_cast<uint32_t>(std::min<uint64_t>(dataBytes, std::numeric_limits<uint32_t>::max())));
-    output.close();
+    if (!options.discardOutput) {
+        writeWaveHeader(output,
+                        options.channels,
+                        rate,
+                        formatInfo.bitsPerSample,
+                        static_cast<uint32_t>(std::min<uint64_t>(dataBytes, std::numeric_limits<uint32_t>::max())));
+        output.close();
+    }
 
     emitTimestamp("TS_END", currentClock(CLOCK_MONOTONIC));
+
+    if (monitorPcm) {
+        snd_pcm_drain(monitorPcm);
+        snd_pcm_close(monitorPcm);
+    }
 
     snd_pcm_drop(pcm);
     snd_pcm_close(pcm);
