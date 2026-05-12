@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <sys/prctl.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -322,6 +323,12 @@ bool writeMonitorFrames(snd_pcm_t *pcm,
 int main(int argc, char **argv)
 {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
+#ifdef PR_SET_PDEATHSIG
+    prctl(PR_SET_PDEATHSIG, SIGHUP);
+    if (getppid() == 1)
+        return 1;
+#endif
 
     Options options;
     if (!parseArgs(argc, argv, options)) {
