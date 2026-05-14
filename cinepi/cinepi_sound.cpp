@@ -818,6 +818,7 @@ void CinePISound::record_start() {
     }
 
     const std::string helperBinary = locateAudioCaptureHelper();
+    const std::string outputDevice = getPreferredMonitorOutput();
 
     cmdStream.str("");
     cmdStream.clear();
@@ -827,6 +828,7 @@ void CinePISound::record_start() {
                   << " --format " << shellQuote(audioFormat)
                   << " --channels " << audioChannels
                   << " --rate " << audioSampleRate
+                  << " --monitor-output " << shellQuote(outputDevice)
                   << " --output " << shellQuote(filename)
                   << " 2>&1";
     } else {
