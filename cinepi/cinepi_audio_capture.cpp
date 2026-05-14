@@ -554,7 +554,10 @@ int main(int argc, char **argv)
     emitTimestamp("TS_END", currentClock(CLOCK_MONOTONIC));
 
     if (monitorPcm) {
-        snd_pcm_drain(monitorPcm);
+        // This playback side is only for live confidence monitoring. On exit
+        // we want to release the device immediately rather than blocking in a
+        // drain, which can leave a stale helper process holding HDMI busy.
+        snd_pcm_drop(monitorPcm);
         snd_pcm_close(monitorPcm);
     }
 
