@@ -936,7 +936,25 @@ void CinePISound::record_stop() {
 
     record_ = false;
     if(pid > 0){
-        kill(-pid, SIGTERM); // Send to full process group
+        const int audioPid = pid;
+        const auto logger = console;
+
+        kill(-audioPid, SIGTERM); // Send to full process group
+        std::thread([audioPid, logger]() {
+            constexpr auto kForceKillGrace = std::chrono::seconds(2);
+            const auto deadline = std::chrono::steady_clock::now() + kForceKillGrace;
+
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (kill(audioPid, 0) != 0)
+                    return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
+            if (kill(audioPid, 0) == 0) {
+                logger->warn("Audio capture helper did not exit after SIGTERM; forcing shutdown");
+                kill(-audioPid, SIGKILL);
+            }
+        }).detach();
     }
     console->info("Sound recording stopped.");
 
