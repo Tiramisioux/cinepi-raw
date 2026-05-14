@@ -648,6 +648,19 @@ void cleanupStaleIdleMonitorProcesses(const std::shared_ptr<spdlog::logger> &con
         const int exitCode = shellExitCode(rc);
         if (exitCode == 0) {
             console->info("Cleaned up {}", description);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+            std::string forceCommand(command);
+            const auto firstSpace = forceCommand.find(' ');
+            if (firstSpace != std::string::npos)
+                forceCommand.replace(0, firstSpace, "pkill -9");
+
+            const int forceRc = std::system(forceCommand.c_str());
+            const int forceExitCode = shellExitCode(forceRc);
+            if (forceExitCode == 0)
+                console->info("Force-cleaned stubborn {}", description);
+            else if (forceExitCode != 1)
+                console->warn("Force-cleanup command failed for {} (rc={})", description, forceExitCode);
         } else if (exitCode != 1) {
             console->warn("Cleanup command failed for {} (rc={})", description, exitCode);
         }
@@ -935,6 +948,7 @@ void CinePISound::record_stop() {
         return;
 
     record_ = false;
+    const bool captureActive = pid > 0;
     if(pid > 0){
         const int audioPid = pid;
         const auto logger = console;
@@ -958,7 +972,7 @@ void CinePISound::record_stop() {
     }
     console->info("Sound recording stopped.");
 
-    if (canRecordAudio) {
+    if (canRecordAudio && !captureActive) {
         startMonitoring();
     }
 }
