@@ -442,6 +442,26 @@ std::optional<ParsedWavMetadata> parseTakeMetadataFromFolder(const std::string &
     return metadata;
 }
 
+void closeExtraneousFileDescriptors(const std::array<int, 3> &preserve)
+{
+    long maxFd = sysconf(_SC_OPEN_MAX);
+    if (maxFd < 0)
+        maxFd = 1024;
+
+    for (int fd = 3; fd < maxFd; ++fd) {
+        bool keep = false;
+        for (int preservedFd : preserve) {
+            if (fd == preservedFd) {
+                keep = true;
+                break;
+            }
+        }
+
+        if (!keep)
+            close(fd);
+    }
+}
+
 } // namespace
 
 // A helper function to convert a double to a rational number
@@ -496,13 +516,22 @@ FILE * popen2(std::string command, std::string type, int & pid)
         if (type == "r")
         {
             close(fd[READ]);
-            dup2(fd[WRITE], 1);
+            if (dup2(fd[WRITE], STDOUT_FILENO) == -1)
+                _exit(127);
+            close(fd[WRITE]);
         }
         else
         {
             close(fd[WRITE]);
-            dup2(fd[READ], 0);
+            if (dup2(fd[READ], STDIN_FILENO) == -1)
+                _exit(127);
+            close(fd[READ]);
         }
+
+        // Prevent helpers from inheriting unrelated listeners such as the
+        // preview socket; stale inherited FDs can keep ports alive after the
+        // recorder exits and block the next take/session.
+        closeExtraneousFileDescriptors({STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO});
 
 #ifdef PR_SET_PDEATHSIG
         prctl(PR_SET_PDEATHSIG, SIGHUP);
@@ -511,7 +540,7 @@ FILE * popen2(std::string command, std::string type, int & pid)
 #endif
         setpgid(child_pid, child_pid);
         execl("/bin/sh", "/bin/sh", "-c", exec_command.c_str(), NULL);
-        exit(0);
+        _exit(127);
     }
     else
     {
