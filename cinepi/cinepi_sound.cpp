@@ -663,10 +663,6 @@ CinePISound::CinePISound(CinePIRecorder *app) :
 
 CinePISound::~CinePISound() {
     record_ = false;
-    {
-        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
-        pending_audio_capture_.reset();
-    }
     if (pid > 0)
         kill(-pid, SIGTERM);
     recording_ = false;
@@ -819,34 +815,36 @@ void CinePISound::record_start() {
 
     const std::string helperBinary = locateAudioCaptureHelper();
     const std::string outputDevice = getPreferredMonitorOutput();
+    std::string command;
 
-    cmdStream.str("");
-    cmdStream.clear();
     if (!helperBinary.empty()) {
-        cmdStream << shellQuote(helperBinary)
-                  << " --device " << shellQuote(defaultDevice)
-                  << " --format " << shellQuote(audioFormat)
-                  << " --channels " << audioChannels
-                  << " --rate " << audioSampleRate
-                  << " --monitor-output " << shellQuote(outputDevice)
-                  << " --output " << shellQuote(filename)
-                  << " 2>&1";
+        std::ostringstream commandStream;
+        commandStream << shellQuote(helperBinary)
+                      << " --device " << shellQuote(defaultDevice)
+                      << " --format " << shellQuote(audioFormat)
+                      << " --channels " << audioChannels
+                      << " --rate " << audioSampleRate
+                      << " --monitor-output " << shellQuote(outputDevice)
+                      << " --output " << shellQuote(filename)
+                      << " 2>&1";
+        command = commandStream.str();
     } else {
         std::string vu_mode = (audioChannels == 2) ? "stereo" : "mono";
         console->warn("cinepi-audio-capture helper not found; falling back to arecord without precise audio-start markers");
-        cmdStream << "arecord"
-                  << " -D " << defaultDevice
-                  << " -f " << audioFormat
-                  << " -c " << audioChannels
-                  << " -r " << audioSampleRate
-                  << " -t wav"
-                  << " --disable-softvol"
-                  << " -V " << vu_mode
-                  << " " << filename << " 2>&1";
+        std::ostringstream commandStream;
+        commandStream << "arecord"
+                      << " -D " << defaultDevice
+                      << " -f " << audioFormat
+                      << " -c " << audioChannels
+                      << " -r " << audioSampleRate
+                      << " -t wav"
+                      << " --disable-softvol"
+                      << " -V " << vu_mode
+                      << " " << filename << " 2>&1";
+        command = commandStream.str();
     }
 
-    console->info("Queueing audio capture command: {}", cmdStream.str());
-    console->info("Video recording will continue immediately while audio starts asynchronously");
+    console->info("Launching audio capture command: {}", command);
 
     samples_captured = 0;
     capturedAudioSampleRate = 0;
@@ -860,41 +858,15 @@ void CinePISound::record_start() {
     audio_capture_started_ = false;
     publishRecorderVuMeter(true);
 
-    record_ = true;
-    std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
-    pending_audio_capture_ = PendingAudioCapture{cmdStream.str()};
-}
-
-void CinePISound::launchPendingRecordingStart()
-{
-    std::optional<PendingAudioCapture> pending;
-    {
-        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
-        if (!pending_audio_capture_)
-            return;
-
-        pending = pending_audio_capture_;
-        pending_audio_capture_.reset();
-    }
-
-    if (!record_) {
-        console->warn("Audio capture start was canceled before helper launch");
-        return;
-    }
-
     stopMonitoring();
-
-    if (!record_) {
-        console->warn("Audio capture start was canceled after monitor shutdown");
-        return;
-    }
-
-    console->info("Launching audio capture command asynchronously: {}", pending->command);
-    arec_pipe = popen2(pending->command, "r", pid);
+    record_ = true;
+    arec_pipe = popen2(command, "r", pid);
 
     if (!arec_pipe) {
         pid = -1;
+        record_ = false;
         console->warn("Failed to launch audio capture helper; continuing take without audio");
+        startMonitoring();
         return;
     }
 
@@ -907,10 +879,6 @@ void CinePISound::record_stop() {
         return;
 
     record_ = false;
-    {
-        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
-        pending_audio_capture_.reset();
-    }
     if(pid > 0){
         kill(-pid, SIGTERM); // Send to full process group
     }
@@ -1126,10 +1094,6 @@ void CinePISound::soundThread() {
     init_udev();
 
     while (!abortThread_) {
-        if (pid <= 0 && !recording_) {
-            launchPendingRecordingStart();
-        }
-
         // Always drain the arecord pipe until the child exits, even after record_stop()
         // clears the record_ flag. Otherwise the pipe would never be closed and the WAV
         // file would remain incomplete/unwritten, resulting in 0 WAV clips.

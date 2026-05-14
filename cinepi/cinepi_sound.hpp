@@ -71,18 +71,12 @@ private:
     void clearRecorderVuMeter();
     std::vector<std::string> parseArecordAliases();
     void stopMonitoring();
-    void launchPendingRecordingStart();
     void startMonitoring();
     void startPlaybackMonitoring();
     void stopPlaybackMonitoring();
     void startIdleVuMonitoring();
     void stopIdleVuMonitoring();
     void idleVuThread();
-
-    struct PendingAudioCapture
-    {
-        std::string command;
-    };
 
     int samples_captured;
     int capturedAudioSampleRate;
@@ -100,8 +94,6 @@ private:
     bool recording_;
     bool record_;
     bool audio_capture_started_;
-    std::mutex pending_audio_capture_mutex_;
-    std::stringstream cmdStream;
     CinePIRecorder *app_;
     RawOptions *options_;
     std::unique_ptr<sw::redis::Redis> redis_;
@@ -112,7 +104,6 @@ private:
     std::array<uint8_t, 8> takeStartTimeCode_{};
     std::array<uint16_t, 3> takeStartOriginationDate_{};
     double takeStartFramerate_ = 0.0;
-    std::optional<PendingAudioCapture> pending_audio_capture_;
     bool takeStartMetadataValid_ = false;
 
     std::string getPreferredMonitorOutput();
