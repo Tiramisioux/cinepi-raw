@@ -29,6 +29,15 @@ void handleSignal(int)
     stopRequested.store(true);
 }
 
+bool installStopHandler(int signalNumber)
+{
+    struct sigaction action {};
+    action.sa_handler = handleSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    return sigaction(signalNumber, &action, nullptr) == 0;
+}
+
 struct Options
 {
     std::string device;
@@ -345,8 +354,12 @@ int main(int argc, char **argv)
     }
     const FormatInfo formatInfo = *formatInfoOpt;
 
-    std::signal(SIGINT, handleSignal);
-    std::signal(SIGTERM, handleSignal);
+    if (!installStopHandler(SIGINT) ||
+        !installStopHandler(SIGTERM) ||
+        !installStopHandler(SIGHUP)) {
+        std::cerr << "Failed to install audio helper signal handlers\n";
+        return 1;
+    }
 
     std::fstream output;
     if (!options.discardOutput) {
