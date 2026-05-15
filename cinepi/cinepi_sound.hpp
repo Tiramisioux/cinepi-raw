@@ -82,6 +82,8 @@ private:
     struct PendingAudioCapture
     {
         std::string command;
+        bool stop_monitoring_before_launch = true;
+        bool emits_helper_markers = true;
     };
 
     int samples_captured;
@@ -100,6 +102,7 @@ private:
     bool recording_;
     bool record_;
     bool audio_capture_started_;
+    bool audio_capture_emits_markers_ = true;
     std::mutex pending_audio_capture_mutex_;
     std::stringstream cmdStream;
     CinePIRecorder *app_;

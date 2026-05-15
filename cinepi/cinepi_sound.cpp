@@ -818,10 +818,11 @@ void CinePISound::record_start() {
     }
 
     const std::string helperBinary = locateAudioCaptureHelper();
+    const bool use_plain_arecord_for_16bit = (defaultDevice == "mic_16bit");
 
     cmdStream.str("");
     cmdStream.clear();
-    if (!helperBinary.empty()) {
+    if (!helperBinary.empty() && !use_plain_arecord_for_16bit) {
         cmdStream << shellQuote(helperBinary)
                   << " --device " << shellQuote(defaultDevice)
                   << " --format " << shellQuote(audioFormat)
@@ -830,17 +831,21 @@ void CinePISound::record_start() {
                   << " --output " << shellQuote(filename)
                   << " 2>&1";
     } else {
-        std::string vu_mode = (audioChannels == 2) ? "stereo" : "mono";
-        console->warn("cinepi-audio-capture helper not found; falling back to arecord without precise audio-start markers");
+        if (use_plain_arecord_for_16bit) {
+            console->info("Using plain arecord for mic_16bit take capture while leaving idle monitoring active");
+        } else {
+            console->warn("cinepi-audio-capture helper not found; falling back to arecord without precise audio-start markers");
+        }
         cmdStream << "arecord"
+                  << " -q"
                   << " -D " << defaultDevice
                   << " -f " << audioFormat
                   << " -c " << audioChannels
                   << " -r " << audioSampleRate
                   << " -t wav"
                   << " --disable-softvol"
-                  << " -V " << vu_mode
-                  << " " << filename << " 2>&1";
+                  << " " << shellQuote(filename)
+                  << " 2>&1";
     }
 
     console->info("Queueing audio capture command: {}", cmdStream.str());
@@ -856,11 +861,16 @@ void CinePISound::record_start() {
     ts_end = 0;
     ts_audio_start_realtime = 0;
     audio_capture_started_ = false;
+    audio_capture_emits_markers_ = true;
     publishRecorderVuMeter(true);
 
     record_ = true;
     std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
-    pending_audio_capture_ = PendingAudioCapture{cmdStream.str()};
+    pending_audio_capture_ = PendingAudioCapture{
+        cmdStream.str(),
+        !use_plain_arecord_for_16bit,
+        !use_plain_arecord_for_16bit && !helperBinary.empty()
+    };
 }
 
 void CinePISound::launchPendingRecordingStart()
@@ -880,11 +890,15 @@ void CinePISound::launchPendingRecordingStart()
         return;
     }
 
-    stopMonitoring();
+    if (pending->stop_monitoring_before_launch) {
+        stopMonitoring();
 
-    if (!record_) {
-        console->warn("Audio capture start was canceled after monitor shutdown");
-        return;
+        if (!record_) {
+            console->warn("Audio capture start was canceled after monitor shutdown");
+            return;
+        }
+    } else {
+        console->info("Leaving idle audio monitor running during take capture");
     }
 
     console->info("Launching audio capture command asynchronously: {}", pending->command);
@@ -895,6 +909,11 @@ void CinePISound::launchPendingRecordingStart()
         console->warn("Failed to launch audio capture helper; continuing take without audio");
         return;
     }
+
+    audio_capture_emits_markers_ = pending->emits_helper_markers;
+    audio_capture_started_ = !audio_capture_emits_markers_;
+    if (!audio_capture_emits_markers_ && capturedAudioSampleRate <= 0)
+        capturedAudioSampleRate = audioSampleRate;
 
     console->info("Audio capture helper started successfully (pid={})", pid);
     recording_ = true;
@@ -929,7 +948,7 @@ bool CinePISound::recording_ended() {
 }
 
 bool CinePISound::isRecording() {
-    return (recording_ && ts_first_buffer_b > 0) || !canRecordAudio;
+    return (recording_ && (ts_first_buffer_b > 0 || !audio_capture_emits_markers_)) || !canRecordAudio;
 }
 
 void CinePISound::detectRecordingDevices() {
@@ -1188,12 +1207,13 @@ void CinePISound::soundThread() {
         if (recording_ended()) {
             auto finishRecordingAttempt = [this]() {
                 audio_capture_started_ = false;
+                audio_capture_emits_markers_ = true;
                 vu_meter.fill(0);
                 clearRecorderVuMeter();
                 startMonitoring();
             };
 
-            if (!audio_capture_started_) {
+            if (!audio_capture_started_ && audio_capture_emits_markers_) {
                 console->warn("Audio capture helper exited before capture actually started; continuing take without WAV");
                 finishRecordingAttempt();
                 continue;
