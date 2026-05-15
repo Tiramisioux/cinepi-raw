@@ -29,15 +29,6 @@ void handleSignal(int)
     stopRequested.store(true);
 }
 
-bool installStopHandler(int signalNumber)
-{
-    struct sigaction action {};
-    action.sa_handler = handleSignal;
-    sigemptyset(&action.sa_mask);
-    action.sa_flags = 0;
-    return sigaction(signalNumber, &action, nullptr) == 0;
-}
-
 struct Options
 {
     std::string device;
@@ -354,12 +345,8 @@ int main(int argc, char **argv)
     }
     const FormatInfo formatInfo = *formatInfoOpt;
 
-    if (!installStopHandler(SIGINT) ||
-        !installStopHandler(SIGTERM) ||
-        !installStopHandler(SIGHUP)) {
-        std::cerr << "Failed to install audio helper signal handlers\n";
-        return 1;
-    }
+    std::signal(SIGINT, handleSignal);
+    std::signal(SIGTERM, handleSignal);
 
     std::fstream output;
     if (!options.discardOutput) {
@@ -567,10 +554,7 @@ int main(int argc, char **argv)
     emitTimestamp("TS_END", currentClock(CLOCK_MONOTONIC));
 
     if (monitorPcm) {
-        // This playback side is only for live confidence monitoring. On exit
-        // we want to release the device immediately rather than blocking in a
-        // drain, which can leave a stale helper process holding HDMI busy.
-        snd_pcm_drop(monitorPcm);
+        snd_pcm_drain(monitorPcm);
         snd_pcm_close(monitorPcm);
     }
 

@@ -4,7 +4,6 @@
 #include <boost/property_tree/xml_parser.hpp>
 #include <boost/rational.hpp>
 #include <boost/numeric/conversion/cast.hpp>
-#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -73,18 +72,6 @@ std::string formatSeconds(double value)
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(6) << std::max(0.0, value);
     return oss.str();
-}
-
-bool parseTruthyValue(const std::optional<std::string> &value)
-{
-    if (!value)
-        return false;
-
-    std::string normalized = *value;
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return normalized == "1" || normalized == "true" ||
-           normalized == "yes" || normalized == "on";
 }
 
 std::optional<double> probeDurationSeconds(const std::string &filename)
@@ -455,26 +442,6 @@ std::optional<ParsedWavMetadata> parseTakeMetadataFromFolder(const std::string &
     return metadata;
 }
 
-void closeExtraneousFileDescriptors(const std::array<int, 3> &preserve)
-{
-    long maxFd = sysconf(_SC_OPEN_MAX);
-    if (maxFd < 0)
-        maxFd = 1024;
-
-    for (int fd = 3; fd < maxFd; ++fd) {
-        bool keep = false;
-        for (int preservedFd : preserve) {
-            if (fd == preservedFd) {
-                keep = true;
-                break;
-            }
-        }
-
-        if (!keep)
-            close(fd);
-    }
-}
-
 } // namespace
 
 // A helper function to convert a double to a rational number
@@ -529,22 +496,13 @@ FILE * popen2(std::string command, std::string type, int & pid)
         if (type == "r")
         {
             close(fd[READ]);
-            if (dup2(fd[WRITE], STDOUT_FILENO) == -1)
-                _exit(127);
-            close(fd[WRITE]);
+            dup2(fd[WRITE], 1);
         }
         else
         {
             close(fd[WRITE]);
-            if (dup2(fd[READ], STDIN_FILENO) == -1)
-                _exit(127);
-            close(fd[READ]);
+            dup2(fd[READ], 0);
         }
-
-        // Prevent helpers from inheriting unrelated listeners such as the
-        // preview socket; stale inherited FDs can keep ports alive after the
-        // recorder exits and block the next take/session.
-        closeExtraneousFileDescriptors({STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO});
 
 #ifdef PR_SET_PDEATHSIG
         prctl(PR_SET_PDEATHSIG, SIGHUP);
@@ -553,7 +511,7 @@ FILE * popen2(std::string command, std::string type, int & pid)
 #endif
         setpgid(child_pid, child_pid);
         execl("/bin/sh", "/bin/sh", "-c", exec_command.c_str(), NULL);
-        _exit(127);
+        exit(0);
     }
     else
     {
@@ -648,19 +606,6 @@ void cleanupStaleIdleMonitorProcesses(const std::shared_ptr<spdlog::logger> &con
         const int exitCode = shellExitCode(rc);
         if (exitCode == 0) {
             console->info("Cleaned up {}", description);
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-            std::string forceCommand(command);
-            const auto firstSpace = forceCommand.find(' ');
-            if (firstSpace != std::string::npos)
-                forceCommand.replace(0, firstSpace, "pkill -9");
-
-            const int forceRc = std::system(forceCommand.c_str());
-            const int forceExitCode = shellExitCode(forceRc);
-            if (forceExitCode == 0)
-                console->info("Force-cleaned stubborn {}", description);
-            else if (forceExitCode != 1)
-                console->warn("Force-cleanup command failed for {} (rc={})", description, forceExitCode);
         } else if (exitCode != 1) {
             console->warn("Cleanup command failed for {} (rc={})", description, exitCode);
         }
@@ -718,6 +663,10 @@ CinePISound::CinePISound(CinePIRecorder *app) :
 
 CinePISound::~CinePISound() {
     record_ = false;
+    {
+        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
+        pending_audio_capture_.reset();
+    }
     if (pid > 0)
         kill(-pid, SIGTERM);
     recording_ = false;
@@ -839,20 +788,6 @@ void CinePISound::record_start() {
         return;
     }
 
-    bool storagePrerollActive = false;
-    if (redis_) {
-        try {
-            storagePrerollActive = parseTruthyValue(redis_->get("storage_preroll_active"));
-        } catch (const std::exception &exc) {
-            console->debug("Failed to read storage pre-roll state from Redis: {}", exc.what());
-        }
-    }
-
-    if (storagePrerollActive) {
-        console->info("Skipping audio capture during storage pre-roll take");
-        return;
-    }
-
     resetTakeMetadata();
 
     if (auto fallbackMetadata =
@@ -883,37 +818,38 @@ void CinePISound::record_start() {
     }
 
     const std::string helperBinary = locateAudioCaptureHelper();
-    const std::string outputDevice = getPreferredMonitorOutput();
-    std::string command;
+    const bool use_plain_arecord_for_16bit = (defaultDevice == "mic_16bit");
 
-    if (!helperBinary.empty()) {
-        std::ostringstream commandStream;
-        commandStream << shellQuote(helperBinary)
-                      << " --device " << shellQuote(defaultDevice)
-                      << " --format " << shellQuote(audioFormat)
-                      << " --channels " << audioChannels
-                      << " --rate " << audioSampleRate
-                      << " --monitor-output " << shellQuote(outputDevice)
-                      << " --output " << shellQuote(filename)
-                      << " 2>&1";
-        command = commandStream.str();
+    cmdStream.str("");
+    cmdStream.clear();
+    if (!helperBinary.empty() && !use_plain_arecord_for_16bit) {
+        cmdStream << shellQuote(helperBinary)
+                  << " --device " << shellQuote(defaultDevice)
+                  << " --format " << shellQuote(audioFormat)
+                  << " --channels " << audioChannels
+                  << " --rate " << audioSampleRate
+                  << " --output " << shellQuote(filename)
+                  << " 2>&1";
     } else {
-        std::string vu_mode = (audioChannels == 2) ? "stereo" : "mono";
-        console->warn("cinepi-audio-capture helper not found; falling back to arecord without precise audio-start markers");
-        std::ostringstream commandStream;
-        commandStream << "arecord"
-                      << " -D " << defaultDevice
-                      << " -f " << audioFormat
-                      << " -c " << audioChannels
-                      << " -r " << audioSampleRate
-                      << " -t wav"
-                      << " --disable-softvol"
-                      << " -V " << vu_mode
-                      << " " << filename << " 2>&1";
-        command = commandStream.str();
+        if (use_plain_arecord_for_16bit) {
+            console->info("Using plain arecord for mic_16bit take capture while leaving idle monitoring active");
+        } else {
+            console->warn("cinepi-audio-capture helper not found; falling back to arecord without precise audio-start markers");
+        }
+        cmdStream << "arecord"
+                  << " -q"
+                  << " -D " << defaultDevice
+                  << " -f " << audioFormat
+                  << " -c " << audioChannels
+                  << " -r " << audioSampleRate
+                  << " -t wav"
+                  << " --disable-softvol"
+                  << " " << shellQuote(filename)
+                  << " 2>&1";
     }
 
-    console->info("Launching audio capture command: {}", command);
+    console->info("Queueing audio capture command: {}", cmdStream.str());
+    console->info("Video recording will continue immediately while audio starts asynchronously");
 
     samples_captured = 0;
     capturedAudioSampleRate = 0;
@@ -925,19 +861,59 @@ void CinePISound::record_start() {
     ts_end = 0;
     ts_audio_start_realtime = 0;
     audio_capture_started_ = false;
+    audio_capture_emits_markers_ = true;
     publishRecorderVuMeter(true);
 
-    stopMonitoring();
     record_ = true;
-    arec_pipe = popen2(command, "r", pid);
+    std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
+    pending_audio_capture_ = PendingAudioCapture{
+        cmdStream.str(),
+        !use_plain_arecord_for_16bit,
+        !use_plain_arecord_for_16bit && !helperBinary.empty()
+    };
+}
+
+void CinePISound::launchPendingRecordingStart()
+{
+    std::optional<PendingAudioCapture> pending;
+    {
+        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
+        if (!pending_audio_capture_)
+            return;
+
+        pending = pending_audio_capture_;
+        pending_audio_capture_.reset();
+    }
+
+    if (!record_) {
+        console->warn("Audio capture start was canceled before helper launch");
+        return;
+    }
+
+    if (pending->stop_monitoring_before_launch) {
+        stopMonitoring();
+
+        if (!record_) {
+            console->warn("Audio capture start was canceled after monitor shutdown");
+            return;
+        }
+    } else {
+        console->info("Leaving idle audio monitor running during take capture");
+    }
+
+    console->info("Launching audio capture command asynchronously: {}", pending->command);
+    arec_pipe = popen2(pending->command, "r", pid);
 
     if (!arec_pipe) {
         pid = -1;
-        record_ = false;
         console->warn("Failed to launch audio capture helper; continuing take without audio");
-        startMonitoring();
         return;
     }
+
+    audio_capture_emits_markers_ = pending->emits_helper_markers;
+    audio_capture_started_ = !audio_capture_emits_markers_;
+    if (!audio_capture_emits_markers_ && capturedAudioSampleRate <= 0)
+        capturedAudioSampleRate = audioSampleRate;
 
     console->info("Audio capture helper started successfully (pid={})", pid);
     recording_ = true;
@@ -948,31 +924,16 @@ void CinePISound::record_stop() {
         return;
 
     record_ = false;
-    const bool captureActive = pid > 0;
+    {
+        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
+        pending_audio_capture_.reset();
+    }
     if(pid > 0){
-        const int audioPid = pid;
-        const auto logger = console;
-
-        kill(-audioPid, SIGTERM); // Send to full process group
-        std::thread([audioPid, logger]() {
-            constexpr auto kForceKillGrace = std::chrono::seconds(2);
-            const auto deadline = std::chrono::steady_clock::now() + kForceKillGrace;
-
-            while (std::chrono::steady_clock::now() < deadline) {
-                if (kill(audioPid, 0) != 0)
-                    return;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-
-            if (kill(audioPid, 0) == 0) {
-                logger->warn("Audio capture helper did not exit after SIGTERM; forcing shutdown");
-                kill(-audioPid, SIGKILL);
-            }
-        }).detach();
+        kill(-pid, SIGTERM); // Send to full process group
     }
     console->info("Sound recording stopped.");
 
-    if (canRecordAudio && !captureActive) {
+    if (canRecordAudio) {
         startMonitoring();
     }
 }
@@ -987,7 +948,7 @@ bool CinePISound::recording_ended() {
 }
 
 bool CinePISound::isRecording() {
-    return (recording_ && ts_first_buffer_b > 0) || !canRecordAudio;
+    return (recording_ && (ts_first_buffer_b > 0 || !audio_capture_emits_markers_)) || !canRecordAudio;
 }
 
 void CinePISound::detectRecordingDevices() {
@@ -1182,6 +1143,10 @@ void CinePISound::soundThread() {
     init_udev();
 
     while (!abortThread_) {
+        if (pid <= 0 && !recording_) {
+            launchPendingRecordingStart();
+        }
+
         // Always drain the arecord pipe until the child exits, even after record_stop()
         // clears the record_ flag. Otherwise the pipe would never be closed and the WAV
         // file would remain incomplete/unwritten, resulting in 0 WAV clips.
@@ -1242,12 +1207,13 @@ void CinePISound::soundThread() {
         if (recording_ended()) {
             auto finishRecordingAttempt = [this]() {
                 audio_capture_started_ = false;
+                audio_capture_emits_markers_ = true;
                 vu_meter.fill(0);
                 clearRecorderVuMeter();
                 startMonitoring();
             };
 
-            if (!audio_capture_started_) {
+            if (!audio_capture_started_ && audio_capture_emits_markers_) {
                 console->warn("Audio capture helper exited before capture actually started; continuing take without WAV");
                 finishRecordingAttempt();
                 continue;
