@@ -1,6 +1,7 @@
 #include "cinepi_controller.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <iomanip>
 #include <sstream>
 
@@ -200,7 +201,7 @@ void CinePIController::sync(){
     options_->denoise = "off";
     // options_->lores_width = options_->width >> 3;
     // options_->lores_height = options_->height >> 3;
-    options_->mode_string = "0:0:0:0";
+    options_->mode_string = options_->mode.ToString();
 
 }
 
@@ -406,12 +407,52 @@ void CinePIController::mainThread(){
             if(r) {
                 width_ = (uint16_t)(stoi(*r));
                 options_->width = width_;
+                options_->mode.width = width_;
             }
         }},
         { CONTROL_KEY_HEIGHT, [this](const std::optional<std::string>& r) {
             if(r) {
                 height_ = (uint16_t)(stoi(*r));
                 options_->height = height_;
+                options_->mode.height = height_;
+            }
+        }},
+        { CONTROL_KEY_BIT_DEPTH, [this](const std::optional<std::string>& r) {
+            if(r) {
+                auto bitDepth = static_cast<unsigned int>(stoi(*r));
+                if (bitDepth > 0)
+                    options_->mode.bit_depth = bitDepth;
+            }
+        }},
+        { CONTROL_KEY_PACKING, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                char packing = static_cast<char>(std::toupper((*r)[0]));
+                if (packing == 'P')
+                    options_->mode.packed = true;
+                else if (packing == 'U')
+                    options_->mode.packed = false;
+            }
+        }},
+        { CONTROL_KEY_MODE, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                options_->mode_string = *r;
+                options_->mode = Mode(*r);
+                options_->width = options_->mode.width;
+                options_->height = options_->mode.height;
+                width_ = static_cast<uint16_t>(options_->mode.width);
+                height_ = static_cast<uint16_t>(options_->mode.height);
+                cameraInit_ = true;
+                buffer_size_sent_ = false;
+            }
+        }},
+        { CONTROL_KEY_LORES_WIDTH, [this](const std::optional<std::string>& r) {
+            if(r) {
+                options_->lores_width = static_cast<unsigned int>(stoi(*r));
+            }
+        }},
+        { CONTROL_KEY_LORES_HEIGHT, [this](const std::optional<std::string>& r) {
+            if(r) {
+                options_->lores_height = static_cast<unsigned int>(stoi(*r));
             }
         }},
         { CONTROL_KEY_COMPRESSION, [this](const std::optional<std::string>& r) {
@@ -466,6 +507,7 @@ void CinePIController::mainThread(){
         }},
         { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
             cameraInit_ = true;
+            buffer_size_sent_ = false;
         }},
         { CONTROL_KEY_THUMBNAIL, [this](const std::optional<std::string>& r) {
             if(r) {
