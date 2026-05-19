@@ -103,6 +103,7 @@ private:
     std::condition_variable ram_cv_;
 
     bool raw_packed_in_ = false;   /* true if DMA already delivers packed rows */
+    bool raw_compressed_in_ = false;
 
     bool write12bit_{false};
 
