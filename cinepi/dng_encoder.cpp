@@ -715,9 +715,8 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.thumbPhotometric     = PHOTOMETRIC_MINISBLACK;   /* = 1 */
 
     /* ──  Buffer sizing  ──────────────────────────────────────── */
-    const uint32_t frame  = (cfg.size.width * cfg.size.height * dng_info.bits) / 8;
-    const uint32_t thumb  = lo_cfg.stride * lo_cfg.size.height;
-    dng_info.buffer_size  = align_up(frame + thumb + 20 * 1024, ONE_MB);
+    const uint32_t frame = ((cfg.size.width * dng_info.bits + 7) / 8) * cfg.size.height;
+    dng_info.buffer_size = align_up(frame + 64 * 1024, ONE_MB);
 
     /* ──  Static strings & misc  ──────────────────────────────── */
     dng_info.make       = "Raspberry Pi";
@@ -765,6 +764,7 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     console->info("Encoder configured – {}×{} {}-bit, buffer {} MB",
                   cfg.size.width, cfg.size.height,
                   dng_info.bits, dng_info.buffer_size / ONE_MB);
+    console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
     if (raw_compressed_in_)
         console->info("PiSP COMP1 raw input detected; decoding to {}-bit DNG rows", dng_info.bits);
 }
@@ -776,9 +776,9 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                             const uint8_t                      *mem_buf,
                             const uint8_t                      *raw,
                             const StreamInfo                   &info,
-                            const uint8_t                      *lomem,
-                            const StreamInfo                   &loinfo,
-                            size_t                              losize,
+                            [[maybe_unused]] const uint8_t     *lomem,
+                            [[maybe_unused]] const StreamInfo  &loinfo,
+                            [[maybe_unused]] size_t             losize,
                             const libcamera::ControlList       &metadata,
                             int64_t                             timestamp_us,
                             uint64_t                            fn)
@@ -797,14 +797,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     write_uint16(buf, 42);              /* TIFF magic    */
     write_uint32(buf, 0);               /* IFD-0 offset (patched later) */
 
-    /* ──  1.  Thumbnail copy (mono 8-bit)  ────────────────────── */
-    const uint32_t thumbOff   = buf.offset;
-    const uint32_t thumbBytes = dng_info.thumbWidth;          /* 1 byte / px */
-    for (uint32_t y = 0; y < dng_info.thumbHeight; ++y)
-        write_pod(buf, lomem + y * loinfo.stride, thumbBytes);
-    const uint32_t thumbSize = thumbBytes * dng_info.thumbHeight;
-
-    /* 2. Raw image copy (packing if 12-bit) ----------------------- */
+    /* ── 1. Raw image copy (packing if 12-bit) ─────────────────── */
     const uint32_t rawOff = buf.offset;
 
     if (bayer_format.compressed)
@@ -892,35 +885,10 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     int32_t matrixXY[18]; encode_rational_array(dng_info.CAM_XYZ, 9, matrixXY);
     int32_t neutral[6];   encode_rational_array(dng_info.NEUTRAL, 3, neutral);
 
-    /* ──  5.  Build thumbnail IFD (SubIFD[0])  ───────────────── */
-    IFDBuilder sub(dng_info.thumbWidth, dng_info.thumbHeight);
-    sub.baseOffset = buf.usedSize;
-
-    uint32_t subType = 1;                 /* reduced-res */
+    /* ──  5.  Build main IFD-0  ──────────────────────────────── */
     uint16_t planar  = 1;
     uint16_t sampFmt = SAMPLEFORMAT_UINT;
     static const uint8_t v[4] = {1, 4, 0, 0};
-
-    sub.addEntry(254,  TIFF_LONG , 1, &subType);
-    sub.addEntry(256,  TIFF_SHORT, 1, &dng_info.thumbWidth);
-    sub.addEntry(257,  TIFF_SHORT, 1, &dng_info.thumbHeight);
-    sub.addEntry(258,  TIFF_SHORT, 1, &dng_info.thumbBitsPerSample);
-    sub.addEntry(259,  TIFF_SHORT, 1, &dng_info.compression);
-    sub.addEntry(262,  TIFF_SHORT, 1, &dng_info.thumbPhotometric);
-    sub.addEntry(273,  TIFF_LONG , 1, &thumbOff);
-    sub.addEntry(278,  TIFF_SHORT, 1, &dng_info.thumbHeight);
-    sub.addEntry(279,  TIFF_LONG , 1, &thumbSize);
-    sub.addEntry(277,  TIFF_SHORT, 1, &dng_info.thumbSamplesPerPixel);
-    sub.addEntry(284,  TIFF_SHORT, 1, &planar);
-    sub.addEntry(339,  TIFF_SHORT, 1, &sampFmt);
-    sub.addEntry(0xC612, TIFF_BYTE, 4, v);
-    sub.addEntry(0xC613, TIFF_BYTE, 4, v);
-    sub.addEntry(0xC614, TIFF_ASCII, ucm_tag_.size(), ucm_tag_.data());
-
-    sub.sortEntries(); sub.build(buf);
-    const uint32_t subIFDoff = sub.baseOffset;
-
-    /* ──  6.  Build main IFD-0  ──────────────────────────────── */
     IFDBuilder ifd(info.width, info.height);
     ifd.baseOffset = buf.usedSize;
 
@@ -942,7 +910,6 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(277 , TIFF_SHORT, 1, &dng_info.samples_per_pixel);
     ifd.addEntry(284 , TIFF_SHORT, 1, &planar);
     ifd.addEntry(339 , TIFF_SHORT, 1, &sampFmt);
-    ifd.addEntry(0x014A, TIFF_LONG, 1, &subIFDoff);
     ifd.addEntry(0xC612, TIFF_BYTE, 4, v);
     ifd.addEntry(0xC613, TIFF_BYTE, 4, v);
 
@@ -1126,8 +1093,8 @@ void DngEncoder::encodeThread(int num)
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        console->info("Thread[{}] {} Time taken for the encode: {} ms, disk queue:{}  Size:{}",
-                      num, encode_item.index, duration, disk_buffer_.size(), tiff_size);
+        console->debug("Thread[{}] {} Time taken for the encode: {} ms, disk queue:{}  Size:{}",
+                       num, encode_item.index, duration, disk_buffer_.size(), tiff_size);
 
         /* mark the camera buffer as reusable */
         input_done_callback_(nullptr);
@@ -1205,7 +1172,7 @@ void DngEncoder::diskThread(int num)
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        console->info("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
+        console->debug("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
     }
 }
 
