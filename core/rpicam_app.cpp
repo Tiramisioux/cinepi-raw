@@ -692,6 +692,21 @@ void RPiCamApp::ConfigureVideo(unsigned int flags, uint8_t thumbnailFactor)
 	else if (have_lores_stream)
 		streams_["lores"] = configuration_->at(lores_index).stream();
 
+	auto log_stream = [](const char *name, Stream *stream)
+	{
+		if (!stream)
+			return;
+		const StreamConfiguration &stream_cfg = stream->configuration();
+		LOG(1, "Configured " << name << " stream: "
+			<< stream_cfg.size.toString()
+			<< " stride " << stream_cfg.stride
+			<< " format " << stream_cfg.pixelFormat.toString());
+	};
+	log_stream("video", VideoStream());
+	log_stream("raw", RawStream());
+	if (have_lores_stream)
+		log_stream("lores", LoresStream());
+
 	post_processor_.Configure();
 
 	LOG(2, "Video setup complete");
