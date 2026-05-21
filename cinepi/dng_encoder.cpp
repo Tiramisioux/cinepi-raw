@@ -15,8 +15,9 @@
  #include <stdexcept>
  #include <iomanip>
  
- #include <sstream>                 
+#include <sstream>
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <regex>
 #include <utility>
@@ -214,6 +215,168 @@ static inline void pack_row_16_to_12bit(const uint16_t *src,
         dst[1] = (p0 << 4) | (p1 >> 8);
         dst[2] = p1;
         dst += 3;
+    }
+}
+
+/*
+ * PiSP COMP1 compressed Bayer decode.
+ *
+ * Pi 5's PiSP frontend may turn requested CSI2 packed raw into PISP_COMP1.
+ * The compressed stream stores one 8-pixel block in 8 bytes. Decode back to
+ * PiSP's 16-bit working domain, then the regular DNG row packer can emit the
+ * same 12-bit DNG payload used for unpacked 16-bit raw. The constants match
+ * the Raspberry Pi PiSP pipeline configuration used by Will Whang's IMX585
+ * libcamera fork. Decoder logic adapted from Apertar-Core's MIT-licensed
+ * CdngEncoder (Copyright (c) 2026 Apertar Studio).
+ */
+constexpr uint16_t PISP_COMP1_OFFSET = 2048;
+constexpr size_t PISP_DEQUANT_LUT_SIZE = 1024;
+
+static inline uint32_t read_le32(const uint8_t *src)
+{
+    return static_cast<uint32_t>(src[0]) |
+           (static_cast<uint32_t>(src[1]) << 8) |
+           (static_cast<uint32_t>(src[2]) << 16) |
+           (static_cast<uint32_t>(src[3]) << 24);
+}
+
+static uint16_t pisp_dequantize_scalar(uint16_t q, int qmode)
+{
+    switch (qmode)
+    {
+    case 0:
+        return static_cast<uint16_t>((q < 320) ? (16 * q) : (32 * (q - 160)));
+    case 1:
+        return static_cast<uint16_t>(std::min<uint32_t>(65535u, 64u * q));
+    case 2:
+        return static_cast<uint16_t>(std::min<uint32_t>(65535u, 128u * q));
+    default:
+        return static_cast<uint16_t>((q < 94) ? (256 * q) : std::min<uint32_t>(65535u, 512u * (q - 47)));
+    }
+}
+
+static std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> build_pisp_dequant_lut(int qmode)
+{
+    std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> lut {};
+    for (size_t i = 0; i < lut.size(); ++i)
+        lut[i] = pisp_dequantize_scalar(static_cast<uint16_t>(i), qmode);
+    return lut;
+}
+
+static const std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> PISP_DEQUANT_MODE0 = build_pisp_dequant_lut(0);
+static const std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> PISP_DEQUANT_MODE1 = build_pisp_dequant_lut(1);
+static const std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> PISP_DEQUANT_MODE2 = build_pisp_dequant_lut(2);
+static const std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> PISP_DEQUANT_MODE3 = build_pisp_dequant_lut(3);
+
+static inline uint16_t pisp_dequantize_fast(int q, int qmode)
+{
+    const size_t idx = static_cast<size_t>(std::clamp(q, 0, static_cast<int>(PISP_DEQUANT_LUT_SIZE - 1)));
+    switch (qmode)
+    {
+    case 0:
+        return PISP_DEQUANT_MODE0[idx];
+    case 1:
+        return PISP_DEQUANT_MODE1[idx];
+    case 2:
+        return PISP_DEQUANT_MODE2[idx];
+    default:
+        return PISP_DEQUANT_MODE3[idx];
+    }
+}
+
+static inline uint16_t add_pisp_comp1_offset(uint16_t value)
+{
+    return static_cast<uint16_t>(std::min<uint32_t>(65535u, static_cast<uint32_t>(value) + PISP_COMP1_OFFSET));
+}
+
+static void pisp_comp1_subblock(uint16_t *dst, uint32_t word)
+{
+    int q[4] {};
+    const int qmode = word & 3;
+    if (qmode < 3)
+    {
+        const int field0 = (word >> 2) & 511;
+        const int field1 = (word >> 11) & 127;
+        const int field2 = (word >> 18) & 127;
+        const int field3 = (word >> 25) & 127;
+        if (qmode == 2 && field0 >= 384)
+        {
+            q[1] = field0;
+            q[2] = field1 + 384;
+        }
+        else
+        {
+            q[1] = (field1 >= 64) ? field0 : field0 + 64 - field1;
+            q[2] = (field1 >= 64) ? field0 + field1 - 64 : field0;
+        }
+        int p1 = std::max(0, q[1] - 64);
+        if (qmode == 2)
+            p1 = std::min(384, p1);
+        int p2 = std::max(0, q[2] - 64);
+        if (qmode == 2)
+            p2 = std::min(384, p2);
+        q[0] = p1 + field2;
+        q[3] = p2 + field3;
+    }
+    else
+    {
+        const int pack0 = (word >> 2) & 32767;
+        const int pack1 = (word >> 17) & 32767;
+        q[0] = (pack0 & 15) + 16 * ((pack0 >> 8) / 11);
+        q[1] = (pack0 >> 4) % 176;
+        q[2] = (pack1 & 15) + 16 * ((pack1 >> 8) / 11);
+        q[3] = (pack1 >> 4) % 176;
+    }
+
+    dst[0] = pisp_dequantize_fast(q[0], qmode);
+    dst[2] = pisp_dequantize_fast(q[1], qmode);
+    dst[4] = pisp_dequantize_fast(q[2], qmode);
+    dst[6] = pisp_dequantize_fast(q[3], qmode);
+}
+
+static void decode_pisp_comp1_block(const uint8_t *src, uint16_t *dst)
+{
+    pisp_comp1_subblock(dst, read_le32(src));
+    pisp_comp1_subblock(dst + 1, read_le32(src + 4));
+    for (int i = 0; i < 8; ++i)
+        dst[i] = add_pisp_comp1_offset(dst[i]);
+}
+
+static void unpack_pisp_comp1_row_to_16(const uint8_t *src, uint16_t *dst, uint32_t width)
+{
+    const uint32_t full_blocks = width / 8u;
+    uint32_t x = 0;
+    for (uint32_t block = 0; block < full_blocks; ++block, x += 8u, src += 8u)
+        decode_pisp_comp1_block(src, dst + x);
+
+    const uint32_t remaining = width - x;
+    if (remaining > 0)
+    {
+        uint16_t working[8] {};
+        decode_pisp_comp1_block(src, working);
+        std::copy(working, working + remaining, dst + x);
+    }
+}
+
+static void unpack_pisp_comp1_row_to_packed12(const uint8_t *src, uint8_t *dst, uint32_t width)
+{
+    const uint32_t full_blocks = width / 8u;
+    uint32_t x = 0;
+    for (uint32_t block = 0; block < full_blocks; ++block, x += 8u, src += 8u)
+    {
+        uint16_t working[8];
+        decode_pisp_comp1_block(src, working);
+        pack_row_16_to_12bit(working, dst + (static_cast<size_t>(x) / 2u) * 3u, 8u);
+    }
+
+    const uint32_t remaining = width - x;
+    if (remaining > 0)
+    {
+        uint16_t working[8] {};
+        uint8_t packed[12] {};
+        decode_pisp_comp1_block(src, working);
+        pack_row_16_to_12bit(working, packed, remaining);
+        std::memcpy(dst + (static_cast<size_t>(x) / 2u) * 3u, packed, (remaining * 12u + 7u) / 8u);
     }
 }
 
@@ -479,6 +642,8 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
         throw std::runtime_error("Unsupported Bayer format " + cfg.pixelFormat.toString());
 
     const BayerFormat &bf          = it->second;
+    raw_packed_in_                 = bf.packed;
+    raw_compressed_in_             = bf.compressed;
     dng_info.bits                  = bf.bits;
     dng_info.white                 = (1u << bf.bits) - 1u;
     dng_info.photometric           = PHOTOMETRIC_CFA;
@@ -550,9 +715,8 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.thumbPhotometric     = PHOTOMETRIC_MINISBLACK;   /* = 1 */
 
     /* ──  Buffer sizing  ──────────────────────────────────────── */
-    const uint32_t frame  = (cfg.size.width * cfg.size.height * dng_info.bits) / 8;
-    const uint32_t thumb  = lo_cfg.stride * lo_cfg.size.height;
-    dng_info.buffer_size  = align_up(frame + thumb + 20 * 1024, ONE_MB);
+    const uint32_t frame = ((cfg.size.width * dng_info.bits + 7) / 8) * cfg.size.height;
+    dng_info.buffer_size = align_up(frame + 64 * 1024, ONE_MB);
 
     /* ──  Static strings & misc  ──────────────────────────────── */
     dng_info.make       = "Raspberry Pi";
@@ -600,6 +764,9 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     console->info("Encoder configured – {}×{} {}-bit, buffer {} MB",
                   cfg.size.width, cfg.size.height,
                   dng_info.bits, dng_info.buffer_size / ONE_MB);
+    console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
+    if (raw_compressed_in_)
+        console->info("PiSP COMP1 raw input detected; decoding to {}-bit DNG rows", dng_info.bits);
 }
 
 /* ────────────────────────────────────────────────────────────── */
@@ -609,14 +776,19 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                             const uint8_t                      *mem_buf,
                             const uint8_t                      *raw,
                             const StreamInfo                   &info,
-                            const uint8_t                      *lomem,
-                            const StreamInfo                   &loinfo,
-                            size_t                              losize,
+                            [[maybe_unused]] const uint8_t     *lomem,
+                            [[maybe_unused]] const StreamInfo  &loinfo,
+                            [[maybe_unused]] size_t             losize,
                             const libcamera::ControlList       &metadata,
                             int64_t                             timestamp_us,
                             uint64_t                            fn)
 {
     thread_local std::vector<uint8_t> rowBuf;
+    thread_local std::vector<uint16_t> row16Buf;
+    const auto format_it = bayer_formats.find(info.pixel_format);
+    if (format_it == bayer_formats.end())
+        throw std::runtime_error("Unsupported Bayer format " + info.pixel_format.toString());
+    const BayerFormat &bayer_format = format_it->second;
 
     /* ──  Memory writer / TIFF header  ────────────────────────── */
     MemoryBuffer buf{const_cast<uint8_t*>(mem_buf), 0, 0,
@@ -625,17 +797,35 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     write_uint16(buf, 42);              /* TIFF magic    */
     write_uint32(buf, 0);               /* IFD-0 offset (patched later) */
 
-    /* ──  1.  Thumbnail copy (mono 8-bit)  ────────────────────── */
-    const uint32_t thumbOff   = buf.offset;
-    const uint32_t thumbBytes = dng_info.thumbWidth;          /* 1 byte / px */
-    for (uint32_t y = 0; y < dng_info.thumbHeight; ++y)
-        write_pod(buf, lomem + y * loinfo.stride, thumbBytes);
-    const uint32_t thumbSize = thumbBytes * dng_info.thumbHeight;
-
-    /* 2. Raw image copy (packing if 12-bit) ----------------------- */
+    /* ── 1. Raw image copy (packing if 12-bit) ─────────────────── */
     const uint32_t rawOff = buf.offset;
 
-    if (write12bit_)          /* source 16-bit, we emit packed 12-bit */
+    if (bayer_format.compressed)
+    {
+        if (write12bit_)
+        {
+            const uint32_t rowPacked = (info.width * 12 + 7) / 8;
+            rowBuf.resize(rowPacked);
+
+            for (uint32_t y = 0; y < info.height; ++y)
+            {
+                unpack_pisp_comp1_row_to_packed12(raw + y * info.stride, rowBuf.data(), info.width);
+                write_pod(buf, rowBuf.data(), rowPacked);
+            }
+        }
+        else
+        {
+            const uint32_t rowBytes = info.width * sizeof(uint16_t);
+            row16Buf.resize(info.width);
+
+            for (uint32_t y = 0; y < info.height; ++y)
+            {
+                unpack_pisp_comp1_row_to_16(raw + y * info.stride, row16Buf.data(), info.width);
+                write_pod(buf, row16Buf.data(), rowBytes);
+            }
+        }
+    }
+    else if (write12bit_)          /* source 16-bit, we emit packed 12-bit */
     {
         const uint32_t rowPacked = (info.width * 12 + 7) / 8;
         rowBuf.resize(rowPacked);
@@ -675,7 +865,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
     /* ──  3.  Per-channel black-level  ────────────────────────── */
     uint16_t black[4] {};
-    auto ord = bayer_formats.find(info.pixel_format)->second.order;
+    auto ord = bayer_format.order;
     if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
     {
         for (int i = 0; i < 4; ++i)
@@ -695,35 +885,10 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     int32_t matrixXY[18]; encode_rational_array(dng_info.CAM_XYZ, 9, matrixXY);
     int32_t neutral[6];   encode_rational_array(dng_info.NEUTRAL, 3, neutral);
 
-    /* ──  5.  Build thumbnail IFD (SubIFD[0])  ───────────────── */
-    IFDBuilder sub(dng_info.thumbWidth, dng_info.thumbHeight);
-    sub.baseOffset = buf.usedSize;
-
-    uint32_t subType = 1;                 /* reduced-res */
+    /* ──  5.  Build main IFD-0  ──────────────────────────────── */
     uint16_t planar  = 1;
     uint16_t sampFmt = SAMPLEFORMAT_UINT;
     static const uint8_t v[4] = {1, 4, 0, 0};
-
-    sub.addEntry(254,  TIFF_LONG , 1, &subType);
-    sub.addEntry(256,  TIFF_SHORT, 1, &dng_info.thumbWidth);
-    sub.addEntry(257,  TIFF_SHORT, 1, &dng_info.thumbHeight);
-    sub.addEntry(258,  TIFF_SHORT, 1, &dng_info.thumbBitsPerSample);
-    sub.addEntry(259,  TIFF_SHORT, 1, &dng_info.compression);
-    sub.addEntry(262,  TIFF_SHORT, 1, &dng_info.thumbPhotometric);
-    sub.addEntry(273,  TIFF_LONG , 1, &thumbOff);
-    sub.addEntry(278,  TIFF_SHORT, 1, &dng_info.thumbHeight);
-    sub.addEntry(279,  TIFF_LONG , 1, &thumbSize);
-    sub.addEntry(277,  TIFF_SHORT, 1, &dng_info.thumbSamplesPerPixel);
-    sub.addEntry(284,  TIFF_SHORT, 1, &planar);
-    sub.addEntry(339,  TIFF_SHORT, 1, &sampFmt);
-    sub.addEntry(0xC612, TIFF_BYTE, 4, v);
-    sub.addEntry(0xC613, TIFF_BYTE, 4, v);
-    sub.addEntry(0xC614, TIFF_ASCII, ucm_tag_.size(), ucm_tag_.data());
-
-    sub.sortEntries(); sub.build(buf);
-    const uint32_t subIFDoff = sub.baseOffset;
-
-    /* ──  6.  Build main IFD-0  ──────────────────────────────── */
     IFDBuilder ifd(info.width, info.height);
     ifd.baseOffset = buf.usedSize;
 
@@ -745,7 +910,6 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(277 , TIFF_SHORT, 1, &dng_info.samples_per_pixel);
     ifd.addEntry(284 , TIFF_SHORT, 1, &planar);
     ifd.addEntry(339 , TIFF_SHORT, 1, &sampFmt);
-    ifd.addEntry(0x014A, TIFF_LONG, 1, &subIFDoff);
     ifd.addEntry(0xC612, TIFF_BYTE, 4, v);
     ifd.addEntry(0xC613, TIFF_BYTE, 4, v);
 
@@ -929,8 +1093,8 @@ void DngEncoder::encodeThread(int num)
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        console->info("Thread[{}] {} Time taken for the encode: {} ms, disk queue:{}  Size:{}",
-                      num, encode_item.index, duration, disk_buffer_.size(), tiff_size);
+        console->debug("Thread[{}] {} Time taken for the encode: {} ms, disk queue:{}  Size:{}",
+                       num, encode_item.index, duration, disk_buffer_.size(), tiff_size);
 
         /* mark the camera buffer as reusable */
         input_done_callback_(nullptr);
@@ -1008,7 +1172,7 @@ void DngEncoder::diskThread(int num)
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        console->info("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
+        console->debug("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
     }
 }
 
