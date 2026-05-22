@@ -4,6 +4,7 @@
 #include <boost/property_tree/xml_parser.hpp>
 #include <boost/rational.hpp>
 #include <boost/numeric/conversion/cast.hpp>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -72,6 +73,18 @@ std::string formatSeconds(double value)
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(6) << std::max(0.0, value);
     return oss.str();
+}
+
+bool parseTruthyValue(const std::optional<std::string> &value)
+{
+    if (!value)
+        return false;
+
+    std::string normalized = *value;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return normalized == "1" || normalized == "true" ||
+           normalized == "yes" || normalized == "on";
 }
 
 std::optional<double> probeDurationSeconds(const std::string &filename)
@@ -785,6 +798,20 @@ void CinePISound::record_start() {
 
     if (!canRecordAudio) {
         console->warn("Audio recording not allowed (canRecordAudio = false)");
+        return;
+    }
+
+    bool storagePrerollActive = false;
+    if (redis_) {
+        try {
+            storagePrerollActive = parseTruthyValue(redis_->get("storage_preroll_active"));
+        } catch (const std::exception &exc) {
+            console->debug("Failed to read storage pre-roll state from Redis: {}", exc.what());
+        }
+    }
+
+    if (storagePrerollActive) {
+        console->info("Skipping audio capture during storage pre-roll take");
         return;
     }
 
