@@ -819,10 +819,16 @@ void CinePISound::record_start() {
 
     const std::string helperBinary = locateAudioCaptureHelper();
     const bool use_plain_arecord_for_16bit = (defaultDevice == "mic_16bit");
+    const std::string capturePath =
+        use_plain_arecord_for_16bit
+            ? "plain-arecord-mic16"
+            : (!helperBinary.empty() ? "cinepi-audio-capture" : "plain-arecord-helper-missing");
+    const bool captureEmitsMarkers = !use_plain_arecord_for_16bit && !helperBinary.empty();
+    const bool stopMonitorBeforeLaunch = !use_plain_arecord_for_16bit;
 
     cmdStream.str("");
     cmdStream.clear();
-    if (!helperBinary.empty() && !use_plain_arecord_for_16bit) {
+    if (captureEmitsMarkers) {
         cmdStream << shellQuote(helperBinary)
                   << " --device " << shellQuote(defaultDevice)
                   << " --format " << shellQuote(audioFormat)
@@ -848,6 +854,14 @@ void CinePISound::record_start() {
                   << " 2>&1";
     }
 
+    console->info("Audio capture path selected: {} (device {}, format {}, channels {}, rate {}, emits_start_markers {}, stop_idle_monitor_before_launch {})",
+                  capturePath,
+                  defaultDevice,
+                  audioFormat,
+                  audioChannels,
+                  audioSampleRate,
+                  captureEmitsMarkers ? "yes" : "no",
+                  stopMonitorBeforeLaunch ? "yes" : "no");
     console->info("Queueing audio capture command: {}", cmdStream.str());
     console->info("Video recording will continue immediately while audio starts asynchronously");
 
@@ -861,15 +875,17 @@ void CinePISound::record_start() {
     ts_end = 0;
     ts_audio_start_realtime = 0;
     audio_capture_started_ = false;
-    audio_capture_emits_markers_ = true;
+    audio_capture_emits_markers_ = captureEmitsMarkers;
+    audio_capture_path_ = capturePath;
     publishRecorderVuMeter(true);
 
     record_ = true;
     std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
     pending_audio_capture_ = PendingAudioCapture{
         cmdStream.str(),
-        !use_plain_arecord_for_16bit,
-        !use_plain_arecord_for_16bit && !helperBinary.empty()
+        capturePath,
+        stopMonitorBeforeLaunch,
+        captureEmitsMarkers
     };
 }
 
@@ -911,10 +927,15 @@ void CinePISound::launchPendingRecordingStart()
     }
 
     audio_capture_emits_markers_ = pending->emits_helper_markers;
+    audio_capture_path_ = pending->capture_path;
     audio_capture_started_ = !audio_capture_emits_markers_;
     if (!audio_capture_emits_markers_ && capturedAudioSampleRate <= 0)
         capturedAudioSampleRate = audioSampleRate;
 
+    console->info("Audio capture path active: {} (emits_start_markers {}, stop_idle_monitor_before_launch {})",
+                  audio_capture_path_,
+                  audio_capture_emits_markers_ ? "yes" : "no",
+                  pending->stop_monitoring_before_launch ? "yes" : "no");
     console->info("Audio capture helper started successfully (pid={})", pid);
     recording_ = true;
 }
@@ -1208,6 +1229,7 @@ void CinePISound::soundThread() {
             auto finishRecordingAttempt = [this]() {
                 audio_capture_started_ = false;
                 audio_capture_emits_markers_ = true;
+                audio_capture_path_ = "unknown";
                 vu_meter.fill(0);
                 clearRecorderVuMeter();
                 startMonitoring();
@@ -1262,6 +1284,14 @@ void CinePISound::soundThread() {
                 ts_start);
             const bool have_audio_start_marker = audio_marker_ns != 0;
             const bool have_precise_audio_start_marker = ts_audio_start_realtime != 0;
+            const std::string audioCapturePath =
+                audio_capture_path_.empty() ? "unknown" : audio_capture_path_;
+            const std::string audioStartMarkerStatus =
+                have_precise_audio_start_marker
+                    ? "precise-realtime"
+                    : (have_audio_start_marker
+                           ? "estimated-buffer"
+                           : (audio_capture_emits_markers_ ? "missing-expected" : "not-emitted"));
             const int inputSampleRate =
                 capturedAudioSampleRate > 0 ? capturedAudioSampleRate : audioSampleRate;
 
@@ -1370,11 +1400,14 @@ void CinePISound::soundThread() {
                 metadataDate = takeStartOriginationDate_;
                 if (takeStartFramerate_ > 0.0)
                     output_framerate = takeStartFramerate_;
-                metadataSource = "take-start-fallback";
+                metadataSource =
+                    audio_capture_emits_markers_ ? "take-start-fallback" : "plain-arecord-fallback";
             }
 
             if (!have_audio_start_marker) {
-                console->warn("No audio start marker received; writing WAV metadata from {} without touching PCM",
+                console->warn("No audio start marker received on capture path {} (marker status {}); writing WAV metadata from {} without touching PCM",
+                              audioCapturePath,
+                              audioStartMarkerStatus,
                               metadataSource);
             }
 
@@ -1431,6 +1464,8 @@ void CinePISound::soundThread() {
                 generateIXML(metadataTimecode,
                              output_framerate,
                              metadataSource,
+                             audioCapturePath,
+                             audioStartMarkerStatus,
                              have_audio_start_marker,
                              start_delta_seconds,
                              audioStartOffsetFrames,
@@ -1438,10 +1473,12 @@ void CinePISound::soundThread() {
             if (!appendIXMLChunk(filename, ixml)) {
                 console->critical("Failed to append iXML chunk to WAV");
             } else {
-                console->info("Attached WAV metadata without altering PCM: timecode {}, rate {}, source {}, audio start offset {:+.6f}s ({} frames, {} samples), BEXT + iXML",
+                console->info("Attached WAV metadata without altering PCM: timecode {}, rate {}, source {}, capture path {}, marker status {}, audio start offset {:+.6f}s ({} frames, {} samples), BEXT + iXML",
                               timecode_tag,
                               output_framerate,
                               metadataSource,
+                              audioCapturePath,
+                              audioStartMarkerStatus,
                               start_delta_seconds,
                               audioStartOffsetFrames,
                               audioStartOffsetSamples);
@@ -1497,6 +1534,8 @@ void CinePISound::resetTakeMetadata()
 std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
                                       double framerate,
                                       const std::string &timecodeSource,
+                                      const std::string &audioCapturePath,
+                                      const std::string &audioStartMarkerStatus,
                                       bool haveAudioStartOffset,
                                       double audioStartOffsetSeconds,
                                       int audioStartOffsetFrames,
@@ -1518,6 +1557,8 @@ std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
     tree.put("BWFXML.SPEED.TIMECODE_RATE", tfps);
     tree.put("BWFXML.SPEED.TIMECODE_FLAG", "NDF");
     tree.put("BWFXML.CINEPI_TIMECODE_SOURCE", timecodeSource);
+    tree.put("BWFXML.CINEPI_AUDIO_CAPTURE_PATH", audioCapturePath);
+    tree.put("BWFXML.CINEPI_AUDIO_START_MARKER_STATUS", audioStartMarkerStatus);
     if (haveAudioStartOffset) {
         std::ostringstream offsetSeconds;
         offsetSeconds << std::showpos << std::fixed << std::setprecision(6) << audioStartOffsetSeconds;

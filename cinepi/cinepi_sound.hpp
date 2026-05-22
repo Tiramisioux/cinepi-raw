@@ -59,6 +59,8 @@ private:
     std::string generateIXML(const std::array<uint8_t, 8>& timecode,
                              double framerate,
                              const std::string& timecodeSource,
+                             const std::string& audioCapturePath,
+                             const std::string& audioStartMarkerStatus,
                              bool haveAudioStartOffset,
                              double audioStartOffsetSeconds,
                              int audioStartOffsetFrames,
@@ -82,6 +84,7 @@ private:
     struct PendingAudioCapture
     {
         std::string command;
+        std::string capture_path;
         bool stop_monitoring_before_launch = true;
         bool emits_helper_markers = true;
     };
@@ -103,6 +106,7 @@ private:
     bool record_;
     bool audio_capture_started_;
     bool audio_capture_emits_markers_ = true;
+    std::string audio_capture_path_ = "unknown";
     std::mutex pending_audio_capture_mutex_;
     std::stringstream cmdStream;
     CinePIRecorder *app_;
