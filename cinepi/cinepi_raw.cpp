@@ -54,6 +54,16 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 	{
 		// if we change the sensor mode, restart the camera. 
 		if(controller.configChanged()){
+			bool resumeRecording = controller.isRecording();
+			if (resumeRecording)
+			{
+				console->warn("Resolution reconfigure requested while recording; splitting current recording before camera restart.");
+				controller.setRecording(false);
+				controller.folderOpen = false;
+				sound.record_stop();
+				controller.advanceClipNumber();
+			}
+
 			if(controller.cameraRunning){
 				app.StopCamera();
 				app.Teardown();
@@ -117,6 +127,23 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 			app.GetEncoder()->reset_encoder();
 			controller.process_stream_info(cfg);
+
+			if (resumeRecording)
+			{
+				controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
+				if (controller.folderOpen)
+				{
+					sound.record_start();
+					app.GetEncoder()->resetFrameCount();
+					app.GetEncoder()->reset_encoder();
+					controller.setRecording(true);
+					console->warn("Recording resumed after resolution reconfigure in clip folder: {}", app.GetOptions()->folder);
+				}
+				else
+				{
+					console->error("Failed to create clip folder after recording-time resolution reconfigure; recording remains stopped.");
+				}
+			}
 		}
 
 		CinePIRecorder::Msg msg = app.Wait();

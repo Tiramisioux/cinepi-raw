@@ -63,6 +63,10 @@ class CinePIState
             return clip_number_;
         }
 
+        void advanceClipNumber(){
+            clip_number_++;
+        }
+
     protected:
         float framerate_;
         bool is_recording_;

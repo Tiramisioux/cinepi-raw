@@ -435,10 +435,6 @@ void CinePIController::mainThread(){
         }},
         { CONTROL_KEY_MODE, [this](const std::optional<std::string>& r) {
             if(r && !r->empty()) {
-                if (is_recording_) {
-                    console->warn("Ignoring sensor mode change while recording.");
-                    return;
-                }
                 options_->mode_string = *r;
                 options_->mode = Mode(*r);
                 options_->width = options_->mode.width;
@@ -508,10 +504,6 @@ void CinePIController::mainThread(){
             }
         }},
         { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
-            if (is_recording_) {
-                console->warn("Ignoring camera reconfigure while recording.");
-                return;
-            }
             cameraInit_ = true;
             buffer_size_sent_ = false;
         }},

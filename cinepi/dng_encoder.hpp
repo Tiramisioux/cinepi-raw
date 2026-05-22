@@ -216,6 +216,7 @@ private:
 		CompletedRequest::ControlList met;
 		int64_t timestamp_us;
 		uint64_t index;
+		std::string folder;
 	};
 	std::queue<EncodeItem> encode_queue_;
 	std::mutex encode_mutex_;
@@ -229,6 +230,7 @@ private:
                 CompletedRequest::ControlList met;
                 int64_t timestamp_us;
                 uint64_t index;
+                std::string folder;
         };
         std::queue<DiskItem> disk_buffer_;
         std::mutex disk_mutex_;
