@@ -3,6 +3,8 @@
 #include <vector>
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
+#include <memory>
 
 #include <libcamera/stream.h>
 
@@ -42,7 +44,7 @@ private:
     int port_;
     bool running_ = true;
 
-    MJPEGStreamer streamer_;
+    std::unique_ptr<MJPEGStreamer> streamer_;
 
     void compressToJPEG(libcamera::Span<uint8_t> &inputBuffer, std::vector<uint8_t> &outputBuffer);
 
@@ -136,38 +138,63 @@ void mjpegStreamStage::Read(boost::property_tree::ptree const &params)
     port_ = params.get<int>("port", port_);
 }
 
-mjpegStreamStage::mjpegStreamStage(RPiCamApp *app) : PostProcessingStage(app)
+mjpegStreamStage::mjpegStreamStage(RPiCamApp *app)
+    : PostProcessingStage(app), stream_(nullptr), port_(8000)
 {
-    // Constructor initialization if needed.
-    console = spdlog::stdout_color_mt(NAME);
+    console = spdlog::get(NAME);
+    if (!console)
+        console = spdlog::stdout_color_mt(NAME);
 }
 
 mjpegStreamStage::~mjpegStreamStage() 
 {
 }
 
-void mjpegStreamStage::Teardown(){
-    streamer_.stop();
+void mjpegStreamStage::Teardown()
+{
+    if (streamer_) {
+        streamer_->stop();
+        streamer_.reset();
+    }
+    stream_ = nullptr;
 }
 
 
 void mjpegStreamStage::Configure()
 {
+    if (streamer_) {
+        streamer_->stop();
+        streamer_.reset();
+    }
+
     stream_ = app_->GetMainStream();
+    if (!stream_) {
+        console->warn("No stream available for {}", NAME);
+        return;
+    }
+
     info_ = app_->GetStreamInfo(stream_);
     console->info("networkPreviewStage: {}x{} {}", info_.width, info_.height, info_.stride);
     console->info("Setting up NetworkPreview on port: {}", port_);
-    streamer_.start(port_, 8);
+    streamer_ = std::make_unique<MJPEGStreamer>();
+    streamer_->start(port_, 8);
 }
 
 #include <chrono>
 
 bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
 {
+    if (!stream_ || !streamer_ || !streamer_->isRunning())
+        return false;
+
+    auto buffer_it = completed_request->buffers.find(stream_);
+    if (buffer_it == completed_request->buffers.end() || !buffer_it->second)
+        return false;
+
     auto startOverall = std::chrono::high_resolution_clock::now();
 
     auto startWriteSync = std::chrono::high_resolution_clock::now();
-    BufferReadSync r(app_, completed_request->buffers[stream_]);
+    BufferReadSync r(app_, buffer_it->second);
     auto endWriteSync = std::chrono::high_resolution_clock::now();
     libcamera::Span<uint8_t> buffer = r.Get()[0];
 
@@ -180,10 +207,7 @@ bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
     console->trace("Sending JPEG buffer size: {}", jpegBuffer.size());
 
     auto startPublish = std::chrono::high_resolution_clock::now();
-    if(streamer_.isRunning()){
-        // Publish the JPEG buffer to the streamer
-        streamer_.publish("/stream", std::string(jpegBuffer.begin(), jpegBuffer.end()));
-    }
+    streamer_->publish("/stream", std::string(jpegBuffer.begin(), jpegBuffer.end()));
     auto endPublish = std::chrono::high_resolution_clock::now();
 
     auto endOverall = std::chrono::high_resolution_clock::now();

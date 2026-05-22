@@ -3,6 +3,8 @@
 #include <vector>
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
+#include <new>
 
 #include <libcamera/stream.h>
 
@@ -80,6 +82,9 @@ public:
 private:
     std::shared_ptr<spdlog::logger> console;
 
+    void attachSharedMemory();
+    void detachSharedMemory(bool remove_segment);
+    void resetSharedData();
     void parseMetaData(libcamera::ControlList &ctrls);
 
     int segment_id;
@@ -101,60 +106,104 @@ void sharedContextStage::Read(boost::property_tree::ptree const &params)
 
 }
 
-sharedContextStage::sharedContextStage(RPiCamApp *app) : PostProcessingStage(app), shared_data(nullptr) 
+sharedContextStage::sharedContextStage(RPiCamApp *app)
+    : PostProcessingStage(app), segment_id(-1), shared_data(nullptr), segment_key(-1)
 {
-    // Constructor initialization if needed.
-    console = spdlog::stdout_color_mt("sharedContextStage");
+    console = spdlog::get("sharedContextStage");
+    if (!console)
+        console = spdlog::stdout_color_mt("sharedContextStage");
 
-    const int size = sizeof(SharedMemoryBuffer);
-    
-    // Generate a unique key for the shared memory segment
     segment_key = ftok("/tmp", PROJECT_ID);
+    attachSharedMemory();
+}
 
-    // Try to obtain an existing segment or create a new one
-    segment_id = shmget(segment_key, size, IPC_CREAT | S_IRUSR | S_IWUSR);
-    if (segment_id == -1) {
-        // Handle error
+sharedContextStage::~sharedContextStage()
+{
+    detachSharedMemory(true);
+}
+
+void sharedContextStage::attachSharedMemory()
+{
+    if (shared_data)
+        return;
+
+    if (segment_key == static_cast<key_t>(-1)) {
+        console->error("Failed to create shared memory key for {}", NAME);
+        return;
     }
 
-    // Attach the shared memory segment
+    segment_id = shmget(segment_key, sizeof(SharedMemoryBuffer), IPC_CREAT | S_IRUSR | S_IWUSR);
+    if (segment_id == -1) {
+        console->error("Failed to create shared memory segment for {}", NAME);
+        return;
+    }
+
     shared_data = (SharedMemoryBuffer*)shmat(segment_id, NULL, 0);
     if (shared_data == (void*) -1) {
-        // Handle error
+        console->error("Failed to attach shared memory segment for {}", NAME);
+        shared_data = nullptr;
+        return;
     }
 
-    if(shared_data->frame == -1){
-        shared_data->frame = 0;
-        shared_data->procid = getpid();
-        shared_data->ts = getTs();
-    }else{
-        shared_data->fd_raw = -1;
-        shared_data->fd_isp = -1;
-        shared_data->fd_lores = -1;
-        shared_data->frame = 0;
-        shared_data->procid = getpid();
-        shared_data->ts = getTs();
-    }
-
-    
+    new (shared_data) SharedMemoryBuffer();
+    resetSharedData();
 }
 
-sharedContextStage::~sharedContextStage() 
+void sharedContextStage::detachSharedMemory(bool remove_segment)
 {
-    shmdt(shared_data);
-    shmctl(segment_id, IPC_RMID, NULL);
+    if (shared_data) {
+        if (remove_segment)
+            shared_data->~SharedMemoryBuffer();
+        if (shmdt(shared_data) == -1)
+            console->warn("Failed to detach shared memory segment for {}", NAME);
+        shared_data = nullptr;
+    }
+
+    if (remove_segment && segment_id != -1) {
+        if (shmctl(segment_id, IPC_RMID, NULL) == -1)
+            console->warn("Failed to remove shared memory segment for {}", NAME);
+        segment_id = -1;
+    }
 }
 
-void sharedContextStage::Teardown(){
-    shmdt(shared_data);
-    shmctl(segment_id, IPC_RMID, NULL);
+void sharedContextStage::resetSharedData()
+{
+    if (!shared_data)
+        return;
+
+    shared_data->fd_raw = -1;
+    shared_data->fd_isp = -1;
+    shared_data->fd_lores = -1;
+    shared_data->raw = StreamInfo();
+    shared_data->isp = StreamInfo();
+    shared_data->lores = StreamInfo();
+    shared_data->raw_length = 0;
+    shared_data->isp_length = 0;
+    shared_data->lores_length = 0;
+    shared_data->procid = getpid();
+    shared_data->frame = 0;
+    shared_data->ts = getTs();
+    shared_data->metadata = SharedMetadata();
+    shared_data->sequence = 0;
+    shared_data->framerate = 0;
+    std::memset(shared_data->stats, 0, sizeof(shared_data->stats));
 }
 
+void sharedContextStage::Teardown()
+{
+    detachSharedMemory(false);
+}
 
 void sharedContextStage::Configure()
 {
-    shared_data->raw = app_->GetStreamInfo(app_->RawStream());
-    shared_data->isp = app_->GetStreamInfo(app_->GetMainStream());
+    attachSharedMemory();
+    if (!shared_data)
+        return;
+
+    if (app_->RawStream())
+        shared_data->raw = app_->GetStreamInfo(app_->RawStream());
+    if (app_->GetMainStream())
+        shared_data->isp = app_->GetStreamInfo(app_->GetMainStream());
     // shared_data->lores = app_->GetStreamInfo(app_->LoresStream());
 }
 
@@ -162,19 +211,33 @@ void sharedContextStage::Configure()
 
 bool sharedContextStage::Process(CompletedRequestPtr &completed_request)
 {
+    if (!shared_data)
+        return false;
+
+    auto raw_stream = app_->RawStream();
+    auto isp_stream = app_->GetMainStream();
+    if (!raw_stream || !isp_stream)
+        return false;
+
+    auto raw_buffer = completed_request->buffers.find(raw_stream);
+    auto isp_buffer = completed_request->buffers.find(isp_stream);
+    if (raw_buffer == completed_request->buffers.end() || isp_buffer == completed_request->buffers.end())
+        return false;
+
     shared_data->ts = getTs();
 
     auto stats = completed_request->metadata.get(libcamera::controls::rpi::PispStatsOutput);
     if(stats.has_value()){
         libcamera::Span<const uint8_t> statsSpan = stats.value();
-        std::memcpy(shared_data->stats, statsSpan.data(), statsSpan.size());
+        const size_t stats_size = std::min<size_t>(statsSpan.size(), sizeof(shared_data->stats));
+        std::memcpy(shared_data->stats, statsSpan.data(), stats_size);
     };
 
     {
-        shared_data->fd_raw = completed_request->buffers[app_->RawStream()]->planes()[0].fd.get();
-        shared_data->fd_isp = completed_request->buffers[app_->GetMainStream()]->planes()[0].fd.get();
-        shared_data->raw_length = completed_request->buffers[app_->RawStream()]->planes()[0].length;
-        shared_data->isp_length = completed_request->buffers[app_->GetMainStream()]->planes()[0].length;
+        shared_data->fd_raw = raw_buffer->second->planes()[0].fd.get();
+        shared_data->fd_isp = isp_buffer->second->planes()[0].fd.get();
+        shared_data->raw_length = raw_buffer->second->planes()[0].length;
+        shared_data->isp_length = isp_buffer->second->planes()[0].length;
         // shared_data->fd_lores = completed_request->buffers[app_->LoresStream()]->planes()[0].fd.get();
         // shared_data->fdSize[shared_data->active_buffer] = completed_request->buffers[stream_]->planes()[0].length;
         shared_data->framerate = completed_request->framerate;

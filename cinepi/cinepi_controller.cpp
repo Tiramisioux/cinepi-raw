@@ -445,8 +445,6 @@ void CinePIController::mainThread(){
                 options_->height = options_->mode.height;
                 width_ = static_cast<uint16_t>(options_->mode.width);
                 height_ = static_cast<uint16_t>(options_->mode.height);
-                cameraInit_ = true;
-                buffer_size_sent_ = false;
             }
         }},
         { CONTROL_KEY_LORES_WIDTH, [this](const std::optional<std::string>& r) {

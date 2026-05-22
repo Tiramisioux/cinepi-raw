@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <thread>
 #include <chrono>
+#include <atomic>
 
 //external dependancies
 #include <sw/redis++/redis++.h>
@@ -103,9 +104,7 @@ class CinePIController : public CinePIState
         bool cameraRunning;
 
         bool configChanged(){
-            bool c = cameraInit_;
-            cameraInit_ = false;
-            return c;
+            return cameraInit_.exchange(false);
         }
 
     int triggerRec()
@@ -227,7 +226,7 @@ class CinePIController : public CinePIState
 
         int trigger_;
 
-        bool cameraInit_;
+        std::atomic_bool cameraInit_;
 
         CinePIRecorder *app_;
 
