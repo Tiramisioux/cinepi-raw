@@ -1,3 +1,5 @@
+#include <chrono>
+#include <exception>
 #include <thread>
 #include <mutex>
 #include <vector>
@@ -148,25 +150,22 @@ mjpegStreamStage::mjpegStreamStage(RPiCamApp *app)
 
 mjpegStreamStage::~mjpegStreamStage() 
 {
-}
-
-void mjpegStreamStage::Teardown()
-{
     if (streamer_) {
         streamer_->stop();
         streamer_.reset();
     }
+}
+
+void mjpegStreamStage::Teardown()
+{
+    // Keep the MJPEG HTTP listener alive across camera reconfigures so the
+    // next Configure() can reuse port 8000 instead of racing the socket close.
     stream_ = nullptr;
 }
 
 
 void mjpegStreamStage::Configure()
 {
-    if (streamer_) {
-        streamer_->stop();
-        streamer_.reset();
-    }
-
     stream_ = app_->GetMainStream();
     if (!stream_) {
         console->warn("No stream available for {}", NAME);
@@ -175,12 +174,33 @@ void mjpegStreamStage::Configure()
 
     info_ = app_->GetStreamInfo(stream_);
     console->info("networkPreviewStage: {}x{} {}", info_.width, info_.height, info_.stride);
-    console->info("Setting up NetworkPreview on port: {}", port_);
-    streamer_ = std::make_unique<MJPEGStreamer>();
-    streamer_->start(port_, 8);
-}
+    if (streamer_ && streamer_->isRunning()) {
+        console->info("Reusing NetworkPreview on port: {}", port_);
+        return;
+    }
 
-#include <chrono>
+    console->info("Setting up NetworkPreview on port: {}", port_);
+    constexpr int max_attempts = 10;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        streamer_ = std::make_unique<MJPEGStreamer>();
+        try {
+            streamer_->start(port_, 8);
+            return;
+        } catch (std::exception const &e) {
+            streamer_.reset();
+            if (attempt == max_attempts) {
+                throw;
+            }
+            console->warn(
+                "NetworkPreview bind failed on port {} (attempt {}/{}): {}; retrying",
+                port_,
+                attempt,
+                max_attempts,
+                e.what());
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+}
 
 bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
 {
