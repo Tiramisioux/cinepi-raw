@@ -9,6 +9,7 @@
 
 #include <sys/mman.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <iostream>
 #include <memory>
@@ -142,6 +143,7 @@ public:
 	void StopCamera();
 
 	Msg Wait();
+	Msg WaitFor(std::chrono::milliseconds timeout);
 	void PostMessage(MsgType &t, MsgPayload &p);
 
 	Stream *GetStream(std::string const &name, StreamInfo *info = nullptr) const;
@@ -200,6 +202,15 @@ private:
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
 			cond_.wait(lock, [this] { return !queue_.empty(); });
+			T msg = std::move(queue_.front());
+			queue_.pop();
+			return msg;
+		}
+		T WaitFor(std::chrono::milliseconds timeout, T timeout_msg)
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			if (!cond_.wait_for(lock, timeout, [this] { return !queue_.empty(); }))
+				return timeout_msg;
 			T msg = std::move(queue_.front());
 			queue_.pop();
 			return msg;
