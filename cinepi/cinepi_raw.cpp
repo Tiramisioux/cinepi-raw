@@ -146,7 +146,7 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			}
 		}
 
-		CinePIRecorder::Msg msg = app.Wait();
+		CinePIRecorder::Msg msg = app.WaitFor(std::chrono::milliseconds(3000));
 
 		//controller.setShutterAngle(180.0);
 
@@ -155,7 +155,7 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 		if (msg.type == RPiCamApp::MsgType::Timeout)
 		{
-			console->error("Device timeout detected, attempting a restart!!!");
+			console->error("No camera frames received for 3s, attempting a camera restart!!!");
 			app.StopCamera();
 			app.StartCamera();
 			continue;

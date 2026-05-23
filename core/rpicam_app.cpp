@@ -948,6 +948,11 @@ RPiCamApp::Msg RPiCamApp::Wait()
 	return msg_queue_.Wait();
 }
 
+RPiCamApp::Msg RPiCamApp::WaitFor(std::chrono::milliseconds timeout)
+{
+	return msg_queue_.WaitFor(timeout, Msg(MsgType::Timeout));
+}
+
 void RPiCamApp::queueRequest(CompletedRequest *completed_request)
 {
 	BufferMap buffers(std::move(completed_request->buffers));
