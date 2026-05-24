@@ -297,6 +297,46 @@ struct ParsedWavMetadata
     double framerate = 0.0;
 };
 
+std::optional<long long> metadataFrameDelta(const ParsedWavMetadata &from,
+                                            const ParsedWavMetadata &to)
+{
+    const double timecodeFramerate = nominalTimecodeFramerate(
+        to.framerate > 0.0 ? to.framerate : from.framerate);
+    if (timecodeFramerate <= 0.0)
+        return std::nullopt;
+
+    const int fps = static_cast<int>(std::llround(timecodeFramerate));
+    if (fps <= 0)
+        return std::nullopt;
+
+    auto metadataSeconds = [](const ParsedWavMetadata &metadata) -> std::optional<time_t> {
+        std::tm localTime{};
+        localTime.tm_year = static_cast<int>(metadata.originationDate[0]) - 1900;
+        localTime.tm_mon = static_cast<int>(metadata.originationDate[1]) - 1;
+        localTime.tm_mday = static_cast<int>(metadata.originationDate[2]);
+        localTime.tm_hour = bcdToInt(metadata.timecode[3]);
+        localTime.tm_min = bcdToInt(metadata.timecode[2]);
+        localTime.tm_sec = bcdToInt(metadata.timecode[1]);
+        localTime.tm_isdst = -1;
+
+        time_t seconds = std::mktime(&localTime);
+        if (seconds == static_cast<time_t>(-1))
+            return std::nullopt;
+        return seconds;
+    };
+
+    const auto fromSeconds = metadataSeconds(from);
+    const auto toSeconds = metadataSeconds(to);
+    if (!fromSeconds || !toSeconds)
+        return std::nullopt;
+
+    const long long secondDelta =
+        static_cast<long long>(std::difftime(*toSeconds, *fromSeconds));
+    const int fromFrame = bcdToInt(from.timecode[0]);
+    const int toFrame = bcdToInt(to.timecode[0]);
+    return secondDelta * fps + (toFrame - fromFrame);
+}
+
 std::optional<ParsedWavMetadata> offsetMetadataFrames(const ParsedWavMetadata &metadata,
                                                       int frameOffset)
 {
@@ -646,6 +686,7 @@ CinePISound::CinePISound(CinePIRecorder *app) :
     ts_close_file(0),
     ts_end(0),
     ts_audio_start_realtime(0),
+    ts_audio_available_realtime(0),
     audioFormat("S16_LE"),
     audioChannels(1),
     audioSampleRate(FIXED_AUDIO_SAMPLE_RATE),
@@ -901,6 +942,7 @@ void CinePISound::record_start() {
     ts_close_file = 0;
     ts_end = 0;
     ts_audio_start_realtime = 0;
+    ts_audio_available_realtime = 0;
     audio_capture_started_ = false;
     audio_capture_emits_markers_ = captureEmitsMarkers;
     audio_capture_path_ = capturePath;
@@ -1221,6 +1263,9 @@ void CinePISound::soundThread() {
                 } else if (line.find("<TS_AUDIO_START_REALTIME:") != std::string::npos) {
                     audio_capture_started_ = true;
                     ts_audio_start_realtime = extractTime(line);
+                } else if (line.find("<TS_AUDIO_AVAILABLE_REALTIME:") != std::string::npos) {
+                    audio_capture_started_ = true;
+                    ts_audio_available_realtime = extractTime(line);
                 } else if (line.find("<NEGOTIATED_SAMPLE_RATE:") != std::string::npos) {
                     audio_capture_started_ = true;
                     sscanf(line.c_str(), "<NEGOTIATED_SAMPLE_RATE: %d>", &capturedAudioSampleRate);
@@ -1311,6 +1356,8 @@ void CinePISound::soundThread() {
                 ts_start);
             const bool have_audio_start_marker = audio_marker_ns != 0;
             const bool have_precise_audio_start_marker = ts_audio_start_realtime != 0;
+            const bool have_audio_available_diagnostic_marker =
+                ts_audio_available_realtime != 0;
             const std::string audioCapturePath =
                 audio_capture_path_.empty() ? "unknown" : audio_capture_path_;
             const std::string audioStartMarkerStatus =
@@ -1455,6 +1502,55 @@ void CinePISound::soundThread() {
             const uint64_t time_reference =
                 computeTimeReferenceSamples(metadataTimecode, outputSampleRate, output_framerate);
 
+            bool haveAudioAvailableDiagnostic = false;
+            std::string audioAvailableTimecode;
+            long long audioAvailableDeltaFrames = 0;
+            double audioAvailableDeltaSeconds = 0.0;
+            if (have_audio_available_diagnostic_marker) {
+                if (auto audioAvailableMetadata =
+                        buildMetadataFromWallclockNs(
+                            static_cast<int64_t>(ts_audio_available_realtime),
+                            output_framerate)) {
+                    ParsedWavMetadata appliedMetadata;
+                    appliedMetadata.timecode = metadataTimecode;
+                    appliedMetadata.originationDate = metadataDate;
+                    appliedMetadata.framerate = output_framerate;
+                    if (auto deltaFrames =
+                            metadataFrameDelta(appliedMetadata, *audioAvailableMetadata)) {
+                        haveAudioAvailableDiagnostic = true;
+                        audioAvailableTimecode =
+                            buildTimecodeString(audioAvailableMetadata->timecode);
+                        audioAvailableDeltaFrames = *deltaFrames;
+                        const double diagnosticFramerate =
+                            nominalTimecodeFramerate(output_framerate);
+                        if (diagnosticFramerate > 0.0) {
+                            audioAvailableDeltaSeconds =
+                                static_cast<double>(audioAvailableDeltaFrames) /
+                                diagnosticFramerate;
+                        }
+                        console->info(
+                            "Audio marker diagnostic only: applied timecode {} from {}; first-buffer candidate {} would shift metadata by {:+d} frames ({:+.6f}s); capture path {}, marker status {}",
+                            timecode_tag,
+                            metadataSource,
+                            audioAvailableTimecode,
+                            static_cast<int>(audioAvailableDeltaFrames),
+                            audioAvailableDeltaSeconds,
+                            audioCapturePath,
+                            audioStartMarkerStatus);
+                    } else {
+                        console->warn(
+                            "Audio marker diagnostic only: first-buffer realtime marker was present but could not be compared to applied timecode");
+                    }
+                } else {
+                    console->warn(
+                        "Audio marker diagnostic only: first-buffer realtime marker was present but could not be converted to timecode");
+                }
+            } else {
+                console->info(
+                    "Audio marker diagnostic only: no first-buffer realtime marker emitted for capture path {}; applied metadata unchanged",
+                    audioCapturePath);
+            }
+
             ffmpeg_oss << "ffmpeg -hide_banner -loglevel error -y -i " << shellQuote(filename);
             ffmpeg_oss
                        << " -map 0:a:0"
@@ -1496,7 +1592,11 @@ void CinePISound::soundThread() {
                              have_audio_start_marker,
                              start_delta_seconds,
                              audioStartOffsetFrames,
-                             audioStartOffsetSamples);
+                             audioStartOffsetSamples,
+                             haveAudioAvailableDiagnostic,
+                             audioAvailableTimecode,
+                             audioAvailableDeltaFrames,
+                             audioAvailableDeltaSeconds);
             if (!appendIXMLChunk(filename, ixml)) {
                 console->critical("Failed to append iXML chunk to WAV");
             } else {
@@ -1566,7 +1666,11 @@ std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
                                       bool haveAudioStartOffset,
                                       double audioStartOffsetSeconds,
                                       int audioStartOffsetFrames,
-                                      long long audioStartOffsetSamples) const {
+                                      long long audioStartOffsetSamples,
+                                      bool haveAudioAvailableDiagnostic,
+                                      const std::string &audioAvailableTimecode,
+                                      long long audioAvailableDeltaFrames,
+                                      double audioAvailableDeltaSeconds) const {
     boost::property_tree::ptree tree;
 
     tree.put("BWFXML.IXML_VERSION", "1.5");
@@ -1586,6 +1690,17 @@ std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
     tree.put("BWFXML.CINEPI_TIMECODE_SOURCE", timecodeSource);
     tree.put("BWFXML.CINEPI_AUDIO_CAPTURE_PATH", audioCapturePath);
     tree.put("BWFXML.CINEPI_AUDIO_START_MARKER_STATUS", audioStartMarkerStatus);
+    if (haveAudioAvailableDiagnostic) {
+        std::ostringstream diagnosticSeconds;
+        diagnosticSeconds << std::showpos << std::fixed << std::setprecision(6)
+                          << audioAvailableDeltaSeconds;
+        tree.put("BWFXML.CINEPI_DIAGNOSTIC_AUDIO_AVAILABLE_TIMECODE", audioAvailableTimecode);
+        tree.put("BWFXML.CINEPI_DIAGNOSTIC_AUDIO_AVAILABLE_DELTA_FRAMES",
+                 std::to_string(audioAvailableDeltaFrames));
+        tree.put("BWFXML.CINEPI_DIAGNOSTIC_AUDIO_AVAILABLE_DELTA_SECONDS",
+                 diagnosticSeconds.str());
+        tree.put("BWFXML.CINEPI_DIAGNOSTIC_AUDIO_AVAILABLE_APPLIED", "false");
+    }
     if (haveAudioStartOffset) {
         std::ostringstream offsetSeconds;
         offsetSeconds << std::showpos << std::fixed << std::setprecision(6) << audioStartOffsetSeconds;

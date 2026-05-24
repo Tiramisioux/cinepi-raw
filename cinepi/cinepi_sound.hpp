@@ -64,7 +64,11 @@ private:
                              bool haveAudioStartOffset,
                              double audioStartOffsetSeconds,
                              int audioStartOffsetFrames,
-                             long long audioStartOffsetSamples) const;
+                             long long audioStartOffsetSamples,
+                             bool haveAudioAvailableDiagnostic,
+                             const std::string& audioAvailableTimecode,
+                             long long audioAvailableDeltaFrames,
+                             double audioAvailableDeltaSeconds) const;
     bool appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload);
     void resetTakeMetadata();
     void publishMicSelection();
@@ -93,6 +97,7 @@ private:
     int capturedAudioSampleRate;
     uint64_t ts_start, ts_first_buffer_b, ts_first_buffer_a, ts_close_file, ts_end;
     uint64_t ts_audio_start_realtime;
+    uint64_t ts_audio_available_realtime;
     std::string audioFormat;
     int audioChannels;
     int audioSampleRate;
