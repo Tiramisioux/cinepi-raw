@@ -123,10 +123,13 @@ uint64_t chooseAudioStartTimestamp(uint64_t first_buffer_before,
                                    uint64_t first_buffer_after,
                                    uint64_t process_start)
 {
-    uint64_t chosen = first_buffer_after;
-
-    if (chosen == 0)
-        chosen = first_buffer_before;
+    uint64_t chosen = 0;
+    for (uint64_t candidate : { first_buffer_before, first_buffer_after }) {
+        if (candidate == 0)
+            continue;
+        if (chosen == 0 || candidate < chosen)
+            chosen = candidate;
+    }
 
     if (chosen == 0)
         chosen = process_start;
@@ -643,7 +646,6 @@ CinePISound::CinePISound(CinePIRecorder *app) :
     ts_close_file(0),
     ts_end(0),
     ts_audio_start_realtime(0),
-    ts_audio_available_realtime(0),
     audioFormat("S16_LE"),
     audioChannels(1),
     audioSampleRate(FIXED_AUDIO_SAMPLE_RATE),
@@ -844,31 +846,16 @@ void CinePISound::record_start() {
 
     const std::string helperBinary = locateAudioCaptureHelper();
     const bool use_plain_arecord_for_16bit = (defaultDevice == "mic_16bit");
-    const bool use_delegated_arecord_marker =
-        use_plain_arecord_for_16bit && !helperBinary.empty();
     const std::string capturePath =
-        use_delegated_arecord_marker
-            ? "plain-arecord-mic16-marker"
-            : (use_plain_arecord_for_16bit
-                   ? "plain-arecord-mic16"
-                   : (!helperBinary.empty() ? "cinepi-audio-capture" : "plain-arecord-helper-missing"));
-    const bool captureEmitsMarkers =
-        use_delegated_arecord_marker || (!use_plain_arecord_for_16bit && !helperBinary.empty());
+        use_plain_arecord_for_16bit
+            ? "plain-arecord-mic16"
+            : (!helperBinary.empty() ? "cinepi-audio-capture" : "plain-arecord-helper-missing");
+    const bool captureEmitsMarkers = !use_plain_arecord_for_16bit && !helperBinary.empty();
     const bool stopMonitorBeforeLaunch = !use_plain_arecord_for_16bit;
 
     cmdStream.str("");
     cmdStream.clear();
-    if (use_delegated_arecord_marker) {
-        console->info("Using marker-only delegated arecord for mic_16bit take capture while leaving idle monitoring active");
-        cmdStream << shellQuote(helperBinary)
-                  << " --delegate-arecord"
-                  << " --device " << shellQuote(defaultDevice)
-                  << " --format " << shellQuote(audioFormat)
-                  << " --channels " << audioChannels
-                  << " --rate " << audioSampleRate
-                  << " --output " << shellQuote(filename)
-                  << " 2>&1";
-    } else if (captureEmitsMarkers) {
+    if (captureEmitsMarkers) {
         cmdStream << shellQuote(helperBinary)
                   << " --device " << shellQuote(defaultDevice)
                   << " --format " << shellQuote(audioFormat)
@@ -914,10 +901,8 @@ void CinePISound::record_start() {
     ts_close_file = 0;
     ts_end = 0;
     ts_audio_start_realtime = 0;
-    ts_audio_available_realtime = 0;
     audio_capture_started_ = false;
     audio_capture_emits_markers_ = captureEmitsMarkers;
-    audio_marker_is_file_payload_ = false;
     audio_capture_path_ = capturePath;
     publishRecorderVuMeter(true);
 
@@ -1236,14 +1221,6 @@ void CinePISound::soundThread() {
                 } else if (line.find("<TS_AUDIO_START_REALTIME:") != std::string::npos) {
                     audio_capture_started_ = true;
                     ts_audio_start_realtime = extractTime(line);
-                } else if (line.find("<TS_AUDIO_AVAILABLE_REALTIME:") != std::string::npos) {
-                    audio_capture_started_ = true;
-                    audio_marker_is_file_payload_ = false;
-                    ts_audio_available_realtime = extractTime(line);
-                } else if (line.find("<TS_ARECORD_PAYLOAD_REALTIME:") != std::string::npos) {
-                    audio_capture_started_ = true;
-                    audio_marker_is_file_payload_ = true;
-                    ts_audio_available_realtime = extractTime(line);
                 } else if (line.find("<NEGOTIATED_SAMPLE_RATE:") != std::string::npos) {
                     audio_capture_started_ = true;
                     sscanf(line.c_str(), "<NEGOTIATED_SAMPLE_RATE: %d>", &capturedAudioSampleRate);
@@ -1279,7 +1256,6 @@ void CinePISound::soundThread() {
             auto finishRecordingAttempt = [this]() {
                 audio_capture_started_ = false;
                 audio_capture_emits_markers_ = true;
-                audio_marker_is_file_payload_ = false;
                 audio_capture_path_ = "unknown";
                 vu_meter.fill(0);
                 clearRecorderVuMeter();
@@ -1334,22 +1310,15 @@ void CinePISound::soundThread() {
                 ts_first_buffer_a,
                 ts_start);
             const bool have_audio_start_marker = audio_marker_ns != 0;
-            const uint64_t realtime_audio_marker_ns =
-                ts_audio_available_realtime != 0 ? ts_audio_available_realtime : ts_audio_start_realtime;
-            const bool have_realtime_audio_marker = realtime_audio_marker_ns != 0;
-            const bool have_audio_available_marker = ts_audio_available_realtime != 0;
-            const bool have_file_payload_marker =
-                have_audio_available_marker && audio_marker_is_file_payload_;
+            const bool have_precise_audio_start_marker = ts_audio_start_realtime != 0;
             const std::string audioCapturePath =
                 audio_capture_path_.empty() ? "unknown" : audio_capture_path_;
             const std::string audioStartMarkerStatus =
-                have_audio_available_marker
-                    ? (have_file_payload_marker ? "file-payload-realtime" : "first-buffer-realtime")
-                    : (ts_audio_start_realtime != 0
-                           ? "capture-start-realtime"
-                           : (have_audio_start_marker
-                                  ? "estimated-buffer"
-                                  : (audio_capture_emits_markers_ ? "missing-expected" : "not-emitted")));
+                have_precise_audio_start_marker
+                    ? "precise-realtime"
+                    : (have_audio_start_marker
+                           ? "estimated-buffer"
+                           : (audio_capture_emits_markers_ ? "missing-expected" : "not-emitted"));
             const int inputSampleRate =
                 capturedAudioSampleRate > 0 ? capturedAudioSampleRate : audioSampleRate;
 
@@ -1359,7 +1328,7 @@ void CinePISound::soundThread() {
 
             if (have_audio_start_marker) {
                 const double latency_bias_seconds =
-                    have_realtime_audio_marker ? 0.0 : (AUDIO_CAPTURE_LATENCY_MS / 1000.0);
+                    have_precise_audio_start_marker ? 0.0 : (AUDIO_CAPTURE_LATENCY_MS / 1000.0);
                 audio_content_start_seconds =
                     static_cast<double>(audio_marker_ns) / 1e9 - latency_bias_seconds;
                 const double video_start_seconds =
@@ -1370,23 +1339,9 @@ void CinePISound::soundThread() {
                 input_duration_seconds = probed_input_duration.value_or(
                     fallbackDurationFromSamples(samples_captured, inputSampleRate));
 
-                if (have_file_payload_marker) {
+                if (have_precise_audio_start_marker) {
                     console->info(
-                        "Using delegated arecord file-payload marker for honest WAV timecode: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, capture rate {} Hz; leaving PCM untouched",
-                        video_duration_seconds,
-                        input_duration_seconds,
-                        start_delta_seconds,
-                        inputSampleRate);
-                } else if (have_audio_available_marker) {
-                    console->info(
-                        "Using first audio buffer marker for honest WAV timecode: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, capture rate {} Hz; leaving PCM untouched",
-                        video_duration_seconds,
-                        input_duration_seconds,
-                        start_delta_seconds,
-                        inputSampleRate);
-                } else if (have_realtime_audio_marker) {
-                    console->info(
-                        "Using capture-start realtime marker for honest WAV timecode: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, capture rate {} Hz; leaving PCM untouched",
+                        "Using precise audio-start marker for honest WAV timecode: video {:.6f}s, input {:.6f}s, start delta {:+.6f}s, capture rate {} Hz; leaving PCM untouched",
                         video_duration_seconds,
                         input_duration_seconds,
                         start_delta_seconds,
@@ -1416,17 +1371,14 @@ void CinePISound::soundThread() {
             std::array<uint16_t, 3> metadataDate = encoderDate;
             std::string metadataSource = "encoder";
 
-            if (have_realtime_audio_marker) {
+            if (have_precise_audio_start_marker) {
                 if (auto audioStartMetadata =
-                        buildMetadataFromWallclockNs(static_cast<int64_t>(realtime_audio_marker_ns),
+                        buildMetadataFromWallclockNs(static_cast<int64_t>(ts_audio_start_realtime),
                                                      output_framerate)) {
                     metadataTimecode = audioStartMetadata->timecode;
                     metadataDate = audioStartMetadata->originationDate;
                     output_framerate = audioStartMetadata->framerate;
-                    metadataSource =
-                        have_file_payload_marker
-                            ? "plain-arecord-file-payload"
-                            : (have_audio_available_marker ? "audio-first-buffer" : "audio-start");
+                    metadataSource = "audio-start";
                 } else if (takeStartMetadataValid_) {
                     ParsedWavMetadata takeStartMetadata;
                     takeStartMetadata.timecode = takeStartTimeCode_;
@@ -1440,14 +1392,14 @@ void CinePISound::soundThread() {
                         output_framerate = estimatedAudioStartMetadata->framerate;
                         metadataSource = "audio-start-estimate";
                         console->warn(
-                            "Failed to derive realtime audio marker metadata; estimated honest WAV timecode from take start instead");
+                            "Failed to derive realtime audio-start metadata; estimated honest WAV timecode from take start instead");
                     } else {
                         metadataTimecode = takeStartMetadata.timecode;
                         metadataDate = takeStartMetadata.originationDate;
                         output_framerate = takeStartMetadata.framerate;
                         metadataSource = "video-start-fallback";
                         console->warn(
-                            "Failed to derive realtime audio marker metadata and could not offset take-start metadata; falling back to take start");
+                            "Failed to derive realtime audio-start metadata and could not offset take-start metadata; falling back to take start");
                     }
                 }
             } else if (have_audio_start_marker && takeStartMetadataValid_) {
