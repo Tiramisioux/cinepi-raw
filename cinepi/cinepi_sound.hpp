@@ -93,6 +93,7 @@ private:
     int capturedAudioSampleRate;
     uint64_t ts_start, ts_first_buffer_b, ts_first_buffer_a, ts_close_file, ts_end;
     uint64_t ts_audio_start_realtime;
+    uint64_t ts_audio_available_realtime;
     std::string audioFormat;
     int audioChannels;
     int audioSampleRate;
@@ -106,6 +107,7 @@ private:
     bool record_;
     bool audio_capture_started_;
     bool audio_capture_emits_markers_ = true;
+    bool audio_marker_is_file_payload_ = false;
     std::string audio_capture_path_ = "unknown";
     std::mutex pending_audio_capture_mutex_;
     std::stringstream cmdStream;

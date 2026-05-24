@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -15,9 +16,11 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <sys/wait.h>
 #include <sys/prctl.h>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -38,6 +41,7 @@ struct Options
     unsigned int channels = 0;
     unsigned int rate = 0;
     bool discardOutput = false;
+    bool delegateArecord = false;
 };
 
 struct FormatInfo
@@ -82,10 +86,17 @@ bool parseArgs(int argc, char **argv, Options &options)
             options.output = requireValue(arg);
         else if (arg == "--discard-output")
             options.discardOutput = true;
+        else if (arg == "--delegate-arecord")
+            options.delegateArecord = true;
         else {
             std::cerr << "Unknown argument: " << arg << '\n';
             return false;
         }
+    }
+
+    if (options.delegateArecord && (options.output.empty() || options.discardOutput)) {
+        std::cerr << "--delegate-arecord requires --output and cannot use --discard-output\n";
+        return false;
     }
 
     return !options.device.empty() &&
@@ -106,6 +117,116 @@ void emitTimestamp(const char *tag, const timespec &ts)
 {
     std::cout << '<' << tag << ':' << ts.tv_sec << '.'
               << std::setw(9) << std::setfill('0') << ts.tv_nsec << ">\n";
+}
+
+std::optional<uintmax_t> fileSize(const std::string &path)
+{
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec)
+        return std::nullopt;
+    return size;
+}
+
+int exitStatusCode(int status)
+{
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return status;
+}
+
+int runDelegatedArecord(const Options &options)
+{
+    const timespec launchMono = currentClock(CLOCK_MONOTONIC);
+
+    pid_t child = fork();
+    if (child < 0) {
+        std::cerr << "fork for delegated arecord failed\n";
+        return 1;
+    }
+
+    if (child == 0) {
+        const std::string channels = std::to_string(options.channels);
+        const std::string rate = std::to_string(options.rate);
+        execlp("arecord",
+               "arecord",
+               "-q",
+               "-D", options.device.c_str(),
+               "-f", options.format.c_str(),
+               "-c", channels.c_str(),
+               "-r", rate.c_str(),
+               "-t", "wav",
+               "--disable-softvol",
+               options.output.c_str(),
+               static_cast<char *>(nullptr));
+        _exit(127);
+    }
+
+    std::cout << "<NEGOTIATED_SAMPLE_RATE: " << options.rate << ">\n";
+    emitTimestamp("TS_START", launchMono);
+
+    bool emittedPayloadMarker = false;
+    bool sentStop = false;
+    int status = 0;
+
+    while (true) {
+        const pid_t rc = waitpid(child, &status, WNOHANG);
+        if (rc == child)
+            break;
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            std::cerr << "waitpid for delegated arecord failed\n";
+            return 1;
+        }
+
+        if (!emittedPayloadMarker) {
+            const auto size = fileSize(options.output);
+            if (size && *size > 44) {
+                const timespec payloadMono = currentClock(CLOCK_MONOTONIC);
+                const timespec payloadReal = currentClock(CLOCK_REALTIME);
+                emitTimestamp("TS_FIRST_BUFFER_B", payloadMono);
+                emitTimestamp("TS_ARECORD_PAYLOAD_REALTIME", payloadReal);
+                emitTimestamp("TS_FIRST_BUFFER_A", payloadMono);
+                emittedPayloadMarker = true;
+            }
+        }
+
+        if (stopRequested.load() && !sentStop) {
+            kill(child, SIGTERM);
+            sentStop = true;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    if (!emittedPayloadMarker) {
+        const auto size = fileSize(options.output);
+        if (size && *size > 44) {
+            const timespec payloadMono = currentClock(CLOCK_MONOTONIC);
+            const timespec payloadReal = currentClock(CLOCK_REALTIME);
+            emitTimestamp("TS_FIRST_BUFFER_B", payloadMono);
+            emitTimestamp("TS_ARECORD_PAYLOAD_REALTIME", payloadReal);
+            emitTimestamp("TS_FIRST_BUFFER_A", payloadMono);
+            emittedPayloadMarker = true;
+        }
+    }
+
+    const auto finalSize = fileSize(options.output).value_or(0);
+    const unsigned int bytesPerFrame =
+        options.channels * (options.format == "S24_3LE" ? 3u : 2u);
+    const uint64_t payloadBytes =
+        finalSize > 44 ? static_cast<uint64_t>(finalSize - 44) : 0;
+    const uint64_t framesCaptured =
+        bytesPerFrame > 0 ? payloadBytes / bytesPerFrame : 0;
+
+    std::cout << "<SAMPLES_CAPTURED: " << framesCaptured << ">\n";
+    emitTimestamp("TS_CLOSE_FILE", currentClock(CLOCK_MONOTONIC));
+    emitTimestamp("TS_END", currentClock(CLOCK_MONOTONIC));
+
+    return exitStatusCode(status);
 }
 
 void writeLe16(std::ostream &stream, uint16_t value)
@@ -334,7 +455,7 @@ int main(int argc, char **argv)
     if (!parseArgs(argc, argv, options)) {
         std::cerr << "Usage: cinepi-audio-capture --device <name> --format <S16_LE|S24_3LE>"
                   << " --channels <n> --rate <hz> [--monitor-output <alsa>] "
-                  << "[--output <wav> | --discard-output]\n";
+                  << "[--delegate-arecord] [--output <wav> | --discard-output]\n";
         return 2;
     }
 
@@ -347,6 +468,9 @@ int main(int argc, char **argv)
 
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
+
+    if (options.delegateArecord)
+        return runDelegatedArecord(options);
 
     std::fstream output;
     if (!options.discardOutput) {
@@ -502,7 +626,10 @@ int main(int argc, char **argv)
         }
 
         if (!emittedFirstBufferAfter) {
-            emitTimestamp("TS_FIRST_BUFFER_A", currentClock(CLOCK_MONOTONIC));
+            const timespec firstBufferMono = currentClock(CLOCK_MONOTONIC);
+            const timespec firstBufferReal = currentClock(CLOCK_REALTIME);
+            emitTimestamp("TS_FIRST_BUFFER_A", firstBufferMono);
+            emitTimestamp("TS_AUDIO_AVAILABLE_REALTIME", firstBufferReal);
             emittedFirstBufferAfter = true;
         }
 
