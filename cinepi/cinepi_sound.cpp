@@ -1370,6 +1370,9 @@ void CinePISound::soundThread() {
             std::array<uint8_t, 8> metadataTimecode = encoderTimecode;
             std::array<uint16_t, 3> metadataDate = encoderDate;
             std::string metadataSource = "encoder";
+            bool havePlainArecordTimecodeOffset = false;
+            bool plainArecordTimecodeOffsetApplied = false;
+            int plainArecordTimecodeOffsetFrames = 0;
 
             if (have_precise_audio_start_marker) {
                 if (auto audioStartMetadata =
@@ -1429,6 +1432,35 @@ void CinePISound::soundThread() {
                     output_framerate = takeStartFramerate_;
                 metadataSource =
                     audio_capture_emits_markers_ ? "take-start-fallback" : "plain-arecord-fallback";
+
+                const int configuredPlainArecordOffset =
+                    options_ ? options_->plain_arecord_timecode_offset_frames : 0;
+                if (audioCapturePath == "plain-arecord-mic16" &&
+                    configuredPlainArecordOffset != 0) {
+                    havePlainArecordTimecodeOffset = true;
+                    plainArecordTimecodeOffsetFrames = configuredPlainArecordOffset;
+
+                    ParsedWavMetadata plainArecordMetadata;
+                    plainArecordMetadata.timecode = metadataTimecode;
+                    plainArecordMetadata.originationDate = metadataDate;
+                    plainArecordMetadata.framerate = output_framerate;
+
+                    if (auto correctedMetadata =
+                            offsetMetadataFrames(plainArecordMetadata,
+                                                 configuredPlainArecordOffset)) {
+                        metadataTimecode = correctedMetadata->timecode;
+                        metadataDate = correctedMetadata->originationDate;
+                        output_framerate = correctedMetadata->framerate;
+                        plainArecordTimecodeOffsetApplied = true;
+                        console->info(
+                            "Applied plain arecord mic16 WAV metadata correction: {:+d} frames; PCM untouched",
+                            configuredPlainArecordOffset);
+                    } else {
+                        console->warn(
+                            "Could not apply plain arecord mic16 WAV metadata correction ({:+d} frames); using uncorrected take-start metadata",
+                            configuredPlainArecordOffset);
+                    }
+                }
             }
 
             if (!have_audio_start_marker) {
@@ -1496,7 +1528,10 @@ void CinePISound::soundThread() {
                              have_audio_start_marker,
                              start_delta_seconds,
                              audioStartOffsetFrames,
-                             audioStartOffsetSamples);
+                             audioStartOffsetSamples,
+                             havePlainArecordTimecodeOffset,
+                             plainArecordTimecodeOffsetFrames,
+                             plainArecordTimecodeOffsetApplied);
             if (!appendIXMLChunk(filename, ixml)) {
                 console->critical("Failed to append iXML chunk to WAV");
             } else {
@@ -1566,7 +1601,10 @@ std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
                                       bool haveAudioStartOffset,
                                       double audioStartOffsetSeconds,
                                       int audioStartOffsetFrames,
-                                      long long audioStartOffsetSamples) const {
+                                      long long audioStartOffsetSamples,
+                                      bool havePlainArecordTimecodeOffset,
+                                      int plainArecordTimecodeOffsetFrames,
+                                      bool plainArecordTimecodeOffsetApplied) const {
     boost::property_tree::ptree tree;
 
     tree.put("BWFXML.IXML_VERSION", "1.5");
@@ -1592,6 +1630,12 @@ std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
         tree.put("BWFXML.CINEPI_AUDIO_START_OFFSET_SECONDS", offsetSeconds.str());
         tree.put("BWFXML.CINEPI_AUDIO_START_OFFSET_FRAMES", std::to_string(audioStartOffsetFrames));
         tree.put("BWFXML.CINEPI_AUDIO_START_OFFSET_SAMPLES", std::to_string(audioStartOffsetSamples));
+    }
+    if (havePlainArecordTimecodeOffset) {
+        tree.put("BWFXML.CINEPI_PLAIN_ARECORD_TIMECODE_OFFSET_FRAMES",
+                 std::to_string(plainArecordTimecodeOffsetFrames));
+        tree.put("BWFXML.CINEPI_PLAIN_ARECORD_TIMECODE_OFFSET_APPLIED",
+                 plainArecordTimecodeOffsetApplied ? "true" : "false");
     }
 
     boost::property_tree::xml_writer_settings<std::string> settings('\t', 1);

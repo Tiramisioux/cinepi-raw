@@ -64,7 +64,10 @@ private:
                              bool haveAudioStartOffset,
                              double audioStartOffsetSeconds,
                              int audioStartOffsetFrames,
-                             long long audioStartOffsetSamples) const;
+                             long long audioStartOffsetSamples,
+                             bool havePlainArecordTimecodeOffset,
+                             int plainArecordTimecodeOffsetFrames,
+                             bool plainArecordTimecodeOffsetApplied) const;
     bool appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload);
     void resetTakeMetadata();
     void publishMicSelection();
