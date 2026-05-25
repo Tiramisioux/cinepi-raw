@@ -591,7 +591,18 @@ void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const 
             return;
 
         std::lock_guard<std::mutex> lock(encode_mutex_);
-        EncodeItem item = { mem, size, info, lomem, losize, loinfo, metadata, timestamp_us, index_++ };
+        EncodeItem item = {
+            mem,
+            size,
+            info,
+            lomem,
+            losize,
+            loinfo,
+            metadata,
+            timestamp_us,
+            index_++,
+            options_ ? options_->folder : std::string()
+        };
         encode_queue_.push(item);
         encode_cond_var_.notify_one();
     }
@@ -1083,7 +1094,8 @@ void DngEncoder::encodeThread(int num)
                 encode_item.info,
                 encode_item.met,
                 encode_item.timestamp_us,
-                encode_item.index
+                encode_item.index,
+                encode_item.folder
             };
 
             std::lock_guard<std::mutex> lock(disk_mutex_);
@@ -1128,9 +1140,11 @@ void DngEncoder::diskThread(int num)
         }
 
         std::ostringstream oss;
+        const std::string folder = disk_item.folder.empty() ? options_->folder : disk_item.folder;
+
         oss << options_->mediaDest << '/'
-            << options_->folder << '/'
-            << options_->folder << '_'
+            << folder << '/'
+            << folder << '_'
             << std::setw(9) << std::setfill('0') << disk_item.index 
             << ".dng";
 

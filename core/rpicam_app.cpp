@@ -948,6 +948,11 @@ RPiCamApp::Msg RPiCamApp::Wait()
 	return msg_queue_.Wait();
 }
 
+RPiCamApp::Msg RPiCamApp::WaitFor(std::chrono::milliseconds timeout)
+{
+	return msg_queue_.WaitFor(timeout, Msg(MsgType::Timeout));
+}
+
 void RPiCamApp::queueRequest(CompletedRequest *completed_request)
 {
 	BufferMap buffers(std::move(completed_request->buffers));
@@ -1280,36 +1285,53 @@ void RPiCamApp::previewThread()
 				preview_cond_var_.wait(lock);
 		}
 
-		if (item.stream->configuration().pixelFormat != libcamera::formats::YUV420)
-			throw std::runtime_error("Preview windows only support YUV420");
-
-		StreamInfo info = GetStreamInfo(item.stream);
-		FrameBuffer *buffer = item.completed_request->buffers[item.stream];
-		BufferReadSync r(this, buffer);
-		libcamera::Span span = r.Get()[0];
-
-		// Fill the frame info with the ControlList items and ancillary bits.
-		FrameInfo frame_info(item.completed_request->metadata);
-		frame_info.fps = item.completed_request->framerate;
-		frame_info.sequence = item.completed_request->sequence;
-
-		int fd = buffer->planes()[0].fd.get();
+		try
 		{
+			if (item.stream->configuration().pixelFormat != libcamera::formats::YUV420)
+				throw std::runtime_error("Preview windows only support YUV420");
+
+			StreamInfo info = GetStreamInfo(item.stream);
+			FrameBuffer *buffer = item.completed_request->buffers[item.stream];
+			BufferReadSync r(this, buffer);
+			libcamera::Span span = r.Get()[0];
+
+			// Fill the frame info with the ControlList items and ancillary bits.
+			FrameInfo frame_info(item.completed_request->metadata);
+			frame_info.fps = item.completed_request->framerate;
+			frame_info.sequence = item.completed_request->sequence;
+
+			int fd = buffer->planes()[0].fd.get();
+			if (preview_->Quit())
+			{
+				LOG(2, "Preview window has quit");
+				msg_queue_.Post(Msg(MsgType::Quit));
+			}
+			preview_->Show(fd, span, info);
+			{
+				std::lock_guard<std::mutex> lock(preview_mutex_);
+				preview_completed_requests_[fd] = std::move(item.completed_request);
+			}
+			preview_frames_displayed_++;
+			if (!options_->info_text.empty())
+			{
+				std::string s = frame_info.ToString(options_->info_text);
+				preview_->SetInfoText(s);
+			}
+		}
+		catch (std::exception const &e)
+		{
+			preview_frames_dropped_++;
+			LOG(1, "Preview frame failed: " << e.what() << " - resetting preview and continuing");
+			try
+			{
+				preview_->Reset();
+			}
+			catch (std::exception const &reset_error)
+			{
+				LOG(1, "Preview reset failed: " << reset_error.what());
+			}
 			std::lock_guard<std::mutex> lock(preview_mutex_);
-			// the reference to the shared_ptr moves to the map here
-			preview_completed_requests_[fd] = std::move(item.completed_request);
-		}
-		if (preview_->Quit())
-		{
-			LOG(2, "Preview window has quit");
-			msg_queue_.Post(Msg(MsgType::Quit));
-		}
-		preview_frames_displayed_++;
-		preview_->Show(fd, span, info);
-		if (!options_->info_text.empty())
-		{
-			std::string s = frame_info.ToString(options_->info_text);
-			preview_->SetInfoText(s);
+			preview_completed_requests_.clear();
 		}
 	}
 }
