@@ -76,6 +76,9 @@ private:
     void clearRecorderVuMeter();
     std::vector<std::string> parseArecordAliases();
     void stopMonitoring();
+    void clearAudioConfig();
+    void markAudioConfigDirty(const std::string& action, const std::string& device);
+    bool refreshAudioConfigIfSettled(bool force, const std::string& reason);
     void launchPendingRecordingStart();
     void startMonitoring();
     void startPlaybackMonitoring();
@@ -110,6 +113,9 @@ private:
     bool audio_capture_started_;
     bool audio_capture_emits_markers_ = true;
     std::string audio_capture_path_ = "unknown";
+    bool audio_config_dirty_ = false;
+    std::chrono::steady_clock::time_point audio_config_dirty_at_{};
+    std::mutex audio_config_mutex_;
     std::mutex pending_audio_capture_mutex_;
     std::stringstream cmdStream;
     CinePIRecorder *app_;

@@ -24,6 +24,7 @@ constexpr char RECORDER_VU_REDIS_KEY[] = "audio_vu";
 constexpr char REDIS_DEFAULT_URL[] = "redis://127.0.0.1:6379/0";
 constexpr auto RECORDER_VU_PUBLISH_INTERVAL = std::chrono::milliseconds(33);
 constexpr auto AUDIO_MONITOR_SHUTDOWN_TIMEOUT = std::chrono::milliseconds(250);
+constexpr auto AUDIO_DEVICE_SETTLE_TIME = std::chrono::milliseconds(1200);
 
 // The first audio buffer marker lands after the hardware has already started
 // filling the capture pipeline. Subtract this latency when estimating the
@@ -746,6 +747,69 @@ void CinePISound::clearRecorderVuMeter()
     last_vu_publish_ts_ = std::chrono::steady_clock::time_point{};
 }
 
+void CinePISound::clearAudioConfig()
+{
+    audioFormat.clear();
+    defaultDevice.clear();
+    audioSampleRate = 0;
+    audioChannels = 0;
+    canRecordAudio = false;
+}
+
+void CinePISound::markAudioConfigDirty(const std::string& action, const std::string& device)
+{
+    {
+        std::lock_guard<std::mutex> lock(audio_config_mutex_);
+        audio_config_dirty_ = true;
+        audio_config_dirty_at_ = std::chrono::steady_clock::now();
+        clearAudioConfig();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
+        pending_audio_capture_.reset();
+    }
+
+    stopMonitoring();
+    cleanupStaleIdleMonitorProcesses(console);
+    vu_meter.fill(0);
+    clearRecorderVuMeter();
+    console->warn("Audio device {} for {}; clearing cached capture config and waiting for ALSA to settle",
+                  action,
+                  device);
+}
+
+bool CinePISound::refreshAudioConfigIfSettled(bool force, const std::string& reason)
+{
+    std::unique_lock<std::mutex> lock(audio_config_mutex_);
+    if (!audio_config_dirty_)
+        return canRecordAudio;
+
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = now - audio_config_dirty_at_;
+        if (elapsed >= AUDIO_DEVICE_SETTLE_TIME)
+            break;
+
+        if (!force)
+            return false;
+
+        const auto waitFor = AUDIO_DEVICE_SETTLE_TIME - elapsed;
+        lock.unlock();
+        std::this_thread::sleep_for(waitFor);
+        lock.lock();
+
+        if (!audio_config_dirty_)
+            return canRecordAudio;
+    }
+
+    console->info("Refreshing audio capture config after device change ({})", reason);
+    detectRecordingDevices();
+    parseHardwareParams();
+    audio_config_dirty_ = false;
+    return canRecordAudio;
+}
+
 void CinePISound::start() {
     cleanupStaleIdleMonitorProcesses(console);
     detectRecordingDevices();
@@ -796,7 +860,23 @@ bool CinePISound::tryAudioConfig(const std::string& device, const std::string& f
 void CinePISound::record_start() {
     console->info("record_start() called");
 
-    if (!canRecordAudio) {
+    refreshAudioConfigIfSettled(true, "record_start");
+
+    std::string selectedDevice;
+    std::string selectedFormat;
+    int selectedChannels = 0;
+    int selectedSampleRate = 0;
+    bool selectedCanRecordAudio = false;
+    {
+        std::lock_guard<std::mutex> lock(audio_config_mutex_);
+        selectedDevice = defaultDevice;
+        selectedFormat = audioFormat;
+        selectedChannels = audioChannels;
+        selectedSampleRate = audioSampleRate;
+        selectedCanRecordAudio = canRecordAudio;
+    }
+
+    if (!selectedCanRecordAudio) {
         console->warn("Audio recording not allowed (canRecordAudio = false)");
         return;
     }
@@ -839,13 +919,13 @@ void CinePISound::record_start() {
     std::string filename = oss.str();
     std::filesystem::create_directories(options_->mediaDest + "/" + options_->folder);
 
-    if (defaultDevice.empty() || audioFormat.empty() || audioChannels == 0) {
+    if (selectedDevice.empty() || selectedFormat.empty() || selectedChannels == 0 || selectedSampleRate <= 0) {
         console->error("record_start(): Missing audio configuration — cannot start recording");
         return;
     }
 
     const std::string helperBinary = locateAudioCaptureHelper();
-    const bool use_plain_arecord_for_16bit = (defaultDevice == "mic_16bit");
+    const bool use_plain_arecord_for_16bit = (selectedDevice == "mic_16bit");
     const std::string capturePath =
         use_plain_arecord_for_16bit
             ? "plain-arecord-mic16"
@@ -857,10 +937,10 @@ void CinePISound::record_start() {
     cmdStream.clear();
     if (captureEmitsMarkers) {
         cmdStream << shellQuote(helperBinary)
-                  << " --device " << shellQuote(defaultDevice)
-                  << " --format " << shellQuote(audioFormat)
-                  << " --channels " << audioChannels
-                  << " --rate " << audioSampleRate
+                  << " --device " << shellQuote(selectedDevice)
+                  << " --format " << shellQuote(selectedFormat)
+                  << " --channels " << selectedChannels
+                  << " --rate " << selectedSampleRate
                   << " --output " << shellQuote(filename)
                   << " 2>&1";
     } else {
@@ -871,10 +951,10 @@ void CinePISound::record_start() {
         }
         cmdStream << "arecord"
                   << " -q"
-                  << " -D " << defaultDevice
-                  << " -f " << audioFormat
-                  << " -c " << audioChannels
-                  << " -r " << audioSampleRate
+                  << " -D " << selectedDevice
+                  << " -f " << selectedFormat
+                  << " -c " << selectedChannels
+                  << " -r " << selectedSampleRate
                   << " -t wav"
                   << " --disable-softvol"
                   << " " << shellQuote(filename)
@@ -883,10 +963,10 @@ void CinePISound::record_start() {
 
     console->info("Audio capture path selected: {} (device {}, format {}, channels {}, rate {}, emits_start_markers {}, stop_idle_monitor_before_launch {})",
                   capturePath,
-                  defaultDevice,
-                  audioFormat,
-                  audioChannels,
-                  audioSampleRate,
+                  selectedDevice,
+                  selectedFormat,
+                  selectedChannels,
+                  selectedSampleRate,
                   captureEmitsMarkers ? "yes" : "no",
                   stopMonitorBeforeLaunch ? "yes" : "no");
     console->info("Queueing audio capture command: {}", cmdStream.str());
@@ -914,6 +994,9 @@ void CinePISound::record_start() {
         stopMonitorBeforeLaunch,
         captureEmitsMarkers
     };
+
+    if (!captureEmitsMarkers && capturedAudioSampleRate <= 0)
+        capturedAudioSampleRate = selectedSampleRate;
 }
 
 void CinePISound::launchPendingRecordingStart()
@@ -968,9 +1051,6 @@ void CinePISound::launchPendingRecordingStart()
 }
 
 void CinePISound::record_stop() {
-    if(!canRecordAudio)
-        return;
-
     record_ = false;
     {
         std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
@@ -981,7 +1061,13 @@ void CinePISound::record_stop() {
     }
     console->info("Sound recording stopped.");
 
-    if (canRecordAudio) {
+    bool shouldRestartMonitoring = false;
+    {
+        std::lock_guard<std::mutex> lock(audio_config_mutex_);
+        shouldRestartMonitoring = canRecordAudio && !audio_config_dirty_;
+    }
+
+    if (shouldRestartMonitoring) {
         startMonitoring();
     }
 }
@@ -1191,6 +1277,8 @@ void CinePISound::soundThread() {
     init_udev();
 
     while (!abortThread_) {
+        refreshAudioConfigIfSettled(false, "udev settle");
+
         if (pid <= 0 && !recording_) {
             launchPendingRecordingStart();
         }
@@ -1262,15 +1350,21 @@ void CinePISound::soundThread() {
                 startMonitoring();
             };
 
-            if (!audio_capture_started_ && audio_capture_emits_markers_) {
-                console->warn("Audio capture helper exited before capture actually started; continuing take without WAV");
-                finishRecordingAttempt();
-                continue;
-            }
-
             std::ostringstream fn_oss;
             fn_oss << options_->mediaDest << '/' << options_->folder << '/' << options_->folder << ".wav";
             std::string filename = fn_oss.str();
+
+            if (!audio_capture_started_ && audio_capture_emits_markers_) {
+                console->warn("Audio capture helper exited before capture actually started; continuing take without WAV");
+                std::error_code remove_ec;
+                if (std::filesystem::remove(filename, remove_ec))
+                    console->warn("Removed incomplete WAV after failed audio capture start: {}", filename);
+                else if (remove_ec)
+                    console->warn("Failed to remove incomplete WAV after failed audio capture start: {}",
+                                  remove_ec.message());
+                finishRecordingAttempt();
+                continue;
+            }
 
             const auto wavSize = waitForStableFile(filename);
             if (!wavSize) {
@@ -1565,17 +1659,10 @@ void CinePISound::soundThread() {
                 if ((action == "add" || action == "change") &&
                     device.find("card") != std::string::npos) {
                     console->critical("Action:{} | Device:{}", action, device);
-                    detectRecordingDevices();
-                    parseHardwareParams();
+                    markAudioConfigDirty(action, device);
                 } else if (action == "remove" && device.find("card") != std::string::npos) {
-                    stopMonitoring();
                     recording_ = false;
-                    canRecordAudio = false;
-                    audioFormat = "";
-                    defaultDevice.clear();
-                    audioSampleRate = 0;
-                    audioChannels = 0;
-                    clearRecorderVuMeter();
+                    markAudioConfigDirty(action, device);
                     console->critical("Sound card removed!");
                 }
                 udev_device_unref(udev_dev);
