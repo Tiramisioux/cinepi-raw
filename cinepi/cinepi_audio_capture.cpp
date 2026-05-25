@@ -502,10 +502,7 @@ int main(int argc, char **argv)
         }
 
         if (!emittedFirstBufferAfter) {
-            const timespec firstBufferMono = currentClock(CLOCK_MONOTONIC);
-            const timespec firstBufferReal = currentClock(CLOCK_REALTIME);
-            emitTimestamp("TS_FIRST_BUFFER_A", firstBufferMono);
-            emitTimestamp("TS_AUDIO_AVAILABLE_REALTIME", firstBufferReal);
+            emitTimestamp("TS_FIRST_BUFFER_A", currentClock(CLOCK_MONOTONIC));
             emittedFirstBufferAfter = true;
         }
 
