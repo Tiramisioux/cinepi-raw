@@ -981,12 +981,43 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
     struct tm *lt = localtime(&tv.tv_sec);
     int fps = fpsRat[0] / fpsRat[1];
-    int frame = static_cast<int>((tv.tv_usec * fps) / 1'000'000);
+    int fps_int = (fps > 0) ? fps : 24;
+
+    /* ------------------------------------------------------------------
+     *  Timecode: capture wall-clock HH:MM:SS once at the first frame of
+     *  each clip (tc_origin_set_ is cleared by resetFrameCount()).
+     *  All subsequent frames derive H/M/S/F from the monotonic frame
+     *  index fn, offset by that origin.  This eliminates jitter from
+     *  sub-second wall-clock wobble at frame boundaries.
+     * ------------------------------------------------------------------ */
+    if (!tc_origin_set_)
+    {
+        tc_start_hh_   = lt->tm_hour;
+        tc_start_mm_   = lt->tm_min;
+        tc_start_ss_   = lt->tm_sec;
+        tc_fps_        = fps_int;
+        tc_origin_set_ = true;
+    }
+
+    /* Convert absolute frame index to HH:MM:SS:FF, then add origin */
+    int64_t total = static_cast<int64_t>(fn);
+    int ff  =  static_cast<int>(total % tc_fps_);
+    int ss  =  static_cast<int>((total / tc_fps_) % 60);
+    int mm  =  static_cast<int>((total / tc_fps_ / 60) % 60);
+    int hh  =  static_cast<int>((total / tc_fps_ / 3600) % 24);
+
+    /* Add wall-clock origin, propagating carries */
+    ss += tc_start_ss_;
+    if (ss >= 60) { ss -= 60; mm += 1; }
+    mm += tc_start_mm_;
+    if (mm >= 60) { mm -= 60; hh += 1; }
+    hh = (hh + tc_start_hh_) % 24;
+
     uint8_t tc[8] = {
-        static_cast<uint8_t>(((frame     /10)<<4)|(frame     %10)),
-        static_cast<uint8_t>(((lt->tm_sec/10)<<4)|(lt->tm_sec%10)),
-        static_cast<uint8_t>(((lt->tm_min/10)<<4)|(lt->tm_min%10)),
-        static_cast<uint8_t>(((lt->tm_hour/10)<<4)|(lt->tm_hour%10)),
+        static_cast<uint8_t>(((ff/10)<<4)|(ff%10)),
+        static_cast<uint8_t>(((ss/10)<<4)|(ss%10)),
+        static_cast<uint8_t>(((mm/10)<<4)|(mm%10)),
+        static_cast<uint8_t>(((hh/10)<<4)|(hh%10)),
         0,0,0,0
     };
 
