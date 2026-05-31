@@ -11,7 +11,8 @@
  #include <iostream>                // debugging, std::cerr
  #include <libcamera/control_ids.h> // metadata.get(controls::...)
  #include <libcamera/formats.h>     // libcamera::formats::
- #include <cstring>
+ #include <cmath>
+#include <cstring>
  #include <stdexcept>
  #include <iomanip>
  
@@ -981,12 +982,59 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
     struct tm *lt = localtime(&tv.tv_sec);
     int fps = fpsRat[0] / fpsRat[1];
-    int frame = static_cast<int>((tv.tv_usec * fps) / 1'000'000);
+    int fps_int = (fps > 0) ? fps : 24;
+
+    /* ------------------------------------------------------------------
+     *  Timecode: capture wall-clock HH:MM:SS once at the first frame of
+     *  each clip (tc_origin_set_ cleared by resetFrameCount()).
+     *  Subsequent frames advance tc_frame_count_ by rounding the
+     *  inter-frame µs delta to the nearest frame period, so:
+     *    - jitter within ±½ frame always steps by 1 → no duplicates
+     *    - a gap ≥ 1.5× frame period rounds up → natural TC hole for
+     *      each dropped frame
+     * ------------------------------------------------------------------ */
+    if (!tc_origin_set_)
+    {
+        tc_last_ts_us_ = ts_us;
+        tc_frame_count_ = 0;
+        tc_start_hh_   = lt->tm_hour;
+        tc_start_mm_   = lt->tm_min;
+        tc_start_ss_   = lt->tm_sec;
+        tc_fps_        = fps_int;
+        tc_origin_set_ = true;
+    }
+    else
+    {
+        /* Round inter-frame delta to nearest frame count.
+         * Jitter within ±½ frame snaps to 1 (no duplicates).
+         * A gap ≥ 1.5× frame period rounds up, producing a TC hole
+         * for each dropped frame. */
+        uint64_t delta_us = ts_us - tc_last_ts_us_;
+        int64_t frames_elapsed = std::max(INT64_C(1),
+            static_cast<int64_t>(std::llround(
+                static_cast<double>(delta_us) * tc_fps_ / 1'000'000.0)));
+        tc_frame_count_ += frames_elapsed;
+        tc_last_ts_us_  = ts_us;
+    }
+
+    int ff  = static_cast<int>(tc_frame_count_ % tc_fps_);
+    int64_t total_s = tc_frame_count_ / tc_fps_;
+    int ss  = static_cast<int>(total_s % 60);
+    int mm  = static_cast<int>((total_s / 60) % 60);
+    int hh  = static_cast<int>((total_s / 3600) % 24);
+
+    /* Add wall-clock origin, propagating carries */
+    ss += tc_start_ss_;
+    if (ss >= 60) { ss -= 60; mm += 1; }
+    mm += tc_start_mm_;
+    if (mm >= 60) { mm -= 60; hh += 1; }
+    hh = (hh + tc_start_hh_) % 24;
+
     uint8_t tc[8] = {
-        static_cast<uint8_t>(((frame     /10)<<4)|(frame     %10)),
-        static_cast<uint8_t>(((lt->tm_sec/10)<<4)|(lt->tm_sec%10)),
-        static_cast<uint8_t>(((lt->tm_min/10)<<4)|(lt->tm_min%10)),
-        static_cast<uint8_t>(((lt->tm_hour/10)<<4)|(lt->tm_hour%10)),
+        static_cast<uint8_t>(((ff/10)<<4)|(ff%10)),
+        static_cast<uint8_t>(((ss/10)<<4)|(ss%10)),
+        static_cast<uint8_t>(((mm/10)<<4)|(mm%10)),
+        static_cast<uint8_t>(((hh/10)<<4)|(hh%10)),
         0,0,0,0
     };
 

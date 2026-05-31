@@ -38,6 +38,7 @@ public:
 		originationTimeCode.fill(0);
 		originationDate.fill(0);
 		index_ = 0;
+		tc_origin_set_ = false;   // force re-capture of wall-clock origin on next frame
 	}
 
 	size_t dng_save(int thread_num,
@@ -95,6 +96,15 @@ public:
 private:
     /* NEW – cached wall-clock timestamp (0 = not set yet) */
     uint64_t wallclock_ts_us_ { 0 };
+
+    /* Timecode: wall-clock origin captured at the first frame of each clip */
+    bool     tc_origin_set_  { false };
+    uint64_t tc_last_ts_us_  { 0 };    // ts_us of the previous frame, for delta-based counting
+    int64_t  tc_frame_count_ { 0 };    // monotonic frame counter; gaps = dropped frames
+    int      tc_start_hh_    { 0 };
+    int      tc_start_mm_    { 0 };
+    int      tc_start_ss_    { 0 };
+    int      tc_fps_         { 24 };
 
     /* ──  NEW: in-RAM buffer accounting  ─────────────────────── */
     std::atomic<size_t>   ram_buffers_{0};   /* # TIFF blocks living in RAM   */
