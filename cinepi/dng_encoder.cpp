@@ -984,14 +984,15 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     int fps_int = (fps > 0) ? fps : 24;
 
     /* ------------------------------------------------------------------
-     *  Timecode: capture wall-clock HH:MM:SS once at the first frame of
-     *  each clip (tc_origin_set_ is cleared by resetFrameCount()).
-     *  All subsequent frames derive H/M/S/F from the monotonic frame
-     *  index fn, offset by that origin.  This eliminates jitter from
-     *  sub-second wall-clock wobble at frame boundaries.
+     *  Timecode: capture wall-clock HH:MM:SS and ts_us once at the
+     *  first frame of each clip (tc_origin_set_ cleared by
+     *  resetFrameCount()).  All subsequent frames derive TC from elapsed
+     *  µs since that origin, so dropped frames produce natural holes
+     *  and wall-clock wobble cannot cause duplicates.
      * ------------------------------------------------------------------ */
     if (!tc_origin_set_)
     {
+        tc_origin_us_  = ts_us;
         tc_start_hh_   = lt->tm_hour;
         tc_start_mm_   = lt->tm_min;
         tc_start_ss_   = lt->tm_sec;
@@ -999,12 +1000,17 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         tc_origin_set_ = true;
     }
 
-    /* Convert absolute frame index to HH:MM:SS:FF, then add origin */
-    int64_t total = static_cast<int64_t>(fn);
-    int ff  =  static_cast<int>(total % tc_fps_);
-    int ss  =  static_cast<int>((total / tc_fps_) % 60);
-    int mm  =  static_cast<int>((total / tc_fps_ / 60) % 60);
-    int hh  =  static_cast<int>((total / tc_fps_ / 3600) % 24);
+    /* Derive TC from elapsed µs since clip start so dropped frames
+     * produce natural holes while wall-clock wobble cannot cause
+     * duplicates or out-of-order values. */
+    uint64_t elapsed_us  = ts_us - tc_origin_us_;
+    int64_t  total_frames = static_cast<int64_t>(
+        (elapsed_us * static_cast<uint64_t>(tc_fps_)) / 1'000'000ULL);
+    int ff  = static_cast<int>(total_frames % tc_fps_);
+    int64_t total_s = static_cast<int64_t>(elapsed_us / 1'000'000);
+    int ss  = static_cast<int>(total_s % 60);
+    int mm  = static_cast<int>((total_s / 60) % 60);
+    int hh  = static_cast<int>((total_s / 3600) % 24);
 
     /* Add wall-clock origin, propagating carries */
     ss += tc_start_ss_;

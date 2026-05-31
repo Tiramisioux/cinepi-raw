@@ -99,6 +99,7 @@ private:
 
     /* Timecode: wall-clock origin captured at the first frame of each clip */
     bool     tc_origin_set_  { false };
+    uint64_t tc_origin_us_   { 0 };    // ts_us of first frame, for elapsed-time TC
     int      tc_start_hh_    { 0 };
     int      tc_start_mm_    { 0 };
     int      tc_start_ss_    { 0 };
