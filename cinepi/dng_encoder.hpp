@@ -39,6 +39,7 @@ public:
 		originationDate.fill(0);
 		index_ = 0;
 		tc_origin_set_ = false;   // force re-capture of wall-clock origin on next frame
+		buffer_hwm_.store(0, std::memory_order_relaxed);  // reset disk-backlog high-water mark
 	}
 
 	size_t dng_save(int thread_num,
@@ -54,6 +55,18 @@ public:
 
 	int bufferSize(){
 		return disk_buffer_.size();
+	}
+	// Peak disk-write backlog observed since the previous call, then reset to 0.
+	// The encode thread records the depth as it queues frames (independent of
+	// frame delivery), so the GUI can surface transient buffer pressure that
+	// instantaneous sampling — only published when a frame is delivered — misses.
+	int bufferSizeMaxAndReset(){
+		return buffer_hwm_.exchange(0, std::memory_order_relaxed);
+	}
+	void noteBufferDepth(int depth){
+		int prev = buffer_hwm_.load(std::memory_order_relaxed);
+		while (depth > prev &&
+		       !buffer_hwm_.compare_exchange_weak(prev, depth, std::memory_order_relaxed)) {}
 	}
 	uint64_t getFrameCount(){
 		return frames_;
@@ -111,6 +124,7 @@ private:
     int      tc_fps_         { 24 };
 
     /* ──  NEW: in-RAM buffer accounting  ─────────────────────── */
+    std::atomic<int>      buffer_hwm_{0};    /* peak disk_buffer_ depth since last publish */
     std::atomic<size_t>   ram_buffers_{0};   /* # TIFF blocks living in RAM   */
     size_t                max_ram_buffers_;  /* hard cap calculated at setup  */
     std::mutex            ram_mtx_;

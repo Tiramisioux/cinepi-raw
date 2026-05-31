@@ -261,7 +261,8 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     data["focus"]      = info.focus;
     data["frameCount"]   = app_->GetEncoder()->getFrameCount();
     data["tcFrameCount"] = static_cast<Json::Int64>(app_->GetEncoder()->getTcFrameCount());
-    data["bufferSize"]   = app_->GetEncoder()->bufferSize();
+    data["bufferSize"]    = app_->GetEncoder()->bufferSize();
+    data["bufferSizeMax"] = app_->GetEncoder()->bufferSizeMaxAndReset();
     data["timestamp"]  = static_cast<Json::Int64>(epoch_ns);   // ← TOD ns
     redis_->publish(CHANNEL_STATS, data.toStyledString());
 

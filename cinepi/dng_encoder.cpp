@@ -1148,6 +1148,7 @@ void DngEncoder::encodeThread(int num)
 
             std::lock_guard<std::mutex> lock(disk_mutex_);
             disk_buffer_.push(std::move(item));
+            noteBufferDepth(static_cast<int>(disk_buffer_.size()));
             disk_cond_var_.notify_one();
         }
 
