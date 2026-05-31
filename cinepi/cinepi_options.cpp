@@ -211,7 +211,7 @@ CinePiOptions::CinePiOptions()
                     "Nice level (-20..19) for disk workers")
                 ("plain-arecord-timecode-offset-frames",
                     value<int>()->default_value(0),
-                    "Accepted for launcher compatibility; ignored by 3.3 audio capture mechanics");
+                    "Frame offset to add to plain arecord WAV metadata timecode; PCM is unchanged");
         options_.add(cinepi_group);
 }
 
@@ -505,7 +505,7 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                 }
 
                 if (arg.rfind("--plain-arecord-timecode-offset-frames=", 0) == 0) {
-                        (void)parseFrameOffset(
+                        RawOptions::plain_arecord_timecode_offset_frames = parseFrameOffset(
                                 "--plain-arecord-timecode-offset-frames",
                                 arg.substr(sizeof("--plain-arecord-timecode-offset-frames=") - 1));
                         continue;
@@ -513,7 +513,8 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                 if (arg == "--plain-arecord-timecode-offset-frames") {
                         if (i + 1 >= argc)
                                 throw std::runtime_error("--plain-arecord-timecode-offset-frames requires a value");
-                        (void)parseFrameOffset("--plain-arecord-timecode-offset-frames", argv[++i]);
+                        RawOptions::plain_arecord_timecode_offset_frames =
+                                parseFrameOffset("--plain-arecord-timecode-offset-frames", argv[++i]);
                         continue;
                 }
 

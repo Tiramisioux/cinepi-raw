@@ -353,6 +353,13 @@ std::optional<ParsedWavMetadata> offsetMetadataSeconds(const ParsedWavMetadata &
     return offsetMetadataFrames(metadata, frameOffset);
 }
 
+std::string formatDecibels(double value)
+{
+    std::ostringstream oss;
+    oss << std::showpos << std::fixed << std::setprecision(3) << value;
+    return oss.str();
+}
+
 std::optional<ParsedWavMetadata> buildMetadataFromWallclockNs(int64_t timestampNs,
                                                               double framerate)
 {
@@ -862,6 +869,23 @@ void CinePISound::record_start() {
     ts_audio_start_realtime = 0;
     audio_capture_started_ = false;
     audio_capture_emits_markers_ = true;
+    audio_capture_plain_arecord_16bit_ = use_plain_arecord_for_16bit;
+    audio_capture_gain_db_ = 0.0;
+    if (audio_capture_plain_arecord_16bit_ && redis_) {
+        try {
+            auto gainValue = redis_->get("audio_capture_gain_db");
+            if (gainValue && !gainValue->empty()) {
+                audio_capture_gain_db_ = std::stod(*gainValue);
+            }
+        } catch (const std::exception &exc) {
+            console->warn("Invalid audio_capture_gain_db for mic_16bit plain arecord path: {}", exc.what());
+            audio_capture_gain_db_ = 0.0;
+        }
+    }
+    if (audio_capture_plain_arecord_16bit_ && std::abs(audio_capture_gain_db_) > 1e-6) {
+        console->info("Queued mic_16bit software gain from settings: {} dB",
+                      formatDecibels(audio_capture_gain_db_));
+    }
     publishRecorderVuMeter(true);
 
     record_ = true;
@@ -1208,6 +1232,8 @@ void CinePISound::soundThread() {
             auto finishRecordingAttempt = [this]() {
                 audio_capture_started_ = false;
                 audio_capture_emits_markers_ = true;
+                audio_capture_plain_arecord_16bit_ = false;
+                audio_capture_gain_db_ = 0.0;
                 vu_meter.fill(0);
                 clearRecorderVuMeter();
                 startMonitoring();
@@ -1231,6 +1257,49 @@ void CinePISound::soundThread() {
                 continue;
             }
             console->debug("WAV ready for metadata update: {} bytes", *wavSize);
+
+            if (audio_capture_plain_arecord_16bit_ && std::abs(audio_capture_gain_db_) > 1e-6) {
+                std::ostringstream gainFilter;
+                gainFilter << "volume=" << std::fixed << std::setprecision(3)
+                           << audio_capture_gain_db_ << "dB";
+
+                std::ostringstream gainTmpOss;
+                gainTmpOss << options_->mediaDest << '/' << options_->folder << "/gain.wav";
+                const std::string gainTmp = gainTmpOss.str();
+
+                std::ostringstream gainCmd;
+                gainCmd << "ffmpeg -hide_banner -loglevel error -y"
+                        << " -i " << shellQuote(filename)
+                        << " -map 0:a:0"
+                        << " -af " << shellQuote(gainFilter.str())
+                        << " -c:a pcm_s16le"
+                        << " -ar " << audioSampleRate
+                        << " -ac " << audioChannels
+                        << ' ' << shellQuote(gainTmp);
+
+                std::string gainError;
+                const int gainStatus = run_with_stderr_capture(gainCmd.str(), gainError);
+                if (shellExitCode(gainStatus) != 0) {
+                    console->warn("Failed to apply mic_16bit software gain {} dB (rc={}): {}; keeping original WAV",
+                                  formatDecibels(audio_capture_gain_db_),
+                                  shellExitCode(gainStatus),
+                                  gainError.empty() ? "no stderr output" : gainError);
+                    std::error_code removeGainTmpEc;
+                    std::filesystem::remove(gainTmp, removeGainTmpEc);
+                } else {
+                    std::error_code renameGainEc;
+                    std::filesystem::rename(gainTmp, filename, renameGainEc);
+                    if (renameGainEc) {
+                        console->warn("Failed to replace WAV after mic_16bit software gain: {}; keeping original WAV",
+                                      renameGainEc.message());
+                        std::error_code removeGainTmpEc;
+                        std::filesystem::remove(gainTmp, removeGainTmpEc);
+                    } else {
+                        console->info("Applied mic_16bit software gain {} dB from settings before WAV metadata",
+                                      formatDecibels(audio_capture_gain_db_));
+                    }
+                }
+            }
 
             int64_t vts_start = 0, vts_end = 0;
             int64_t frames = app_->GetEncoder()->timestamps.size();
@@ -1371,6 +1440,28 @@ void CinePISound::soundThread() {
                 if (takeStartFramerate_ > 0.0)
                     output_framerate = takeStartFramerate_;
                 metadataSource = "take-start-fallback";
+            }
+
+            const int configuredPlainArecordOffset =
+                options_ ? options_->plain_arecord_timecode_offset_frames : 0;
+            if (audio_capture_plain_arecord_16bit_ && configuredPlainArecordOffset != 0) {
+                ParsedWavMetadata plainArecordMetadata;
+                plainArecordMetadata.timecode = metadataTimecode;
+                plainArecordMetadata.originationDate = metadataDate;
+                plainArecordMetadata.framerate = output_framerate;
+
+                if (auto correctedMetadata =
+                        offsetMetadataFrames(plainArecordMetadata, configuredPlainArecordOffset)) {
+                    metadataTimecode = correctedMetadata->timecode;
+                    metadataDate = correctedMetadata->originationDate;
+                    output_framerate = correctedMetadata->framerate;
+                    metadataSource += "+plain-arecord-offset";
+                    console->info("Applied mic_16bit WAV metadata offset: {:+d} frames; PCM timing unchanged",
+                                  configuredPlainArecordOffset);
+                } else {
+                    console->warn("Could not apply mic_16bit WAV metadata offset ({:+d} frames); using uncorrected metadata",
+                                  configuredPlainArecordOffset);
+                }
             }
 
             if (!have_audio_start_marker) {

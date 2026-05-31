@@ -103,6 +103,8 @@ private:
     bool record_;
     bool audio_capture_started_;
     bool audio_capture_emits_markers_ = true;
+    bool audio_capture_plain_arecord_16bit_ = false;
+    double audio_capture_gain_db_ = 0.0;
     std::mutex pending_audio_capture_mutex_;
     std::stringstream cmdStream;
     CinePIRecorder *app_;
