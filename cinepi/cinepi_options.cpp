@@ -208,7 +208,10 @@ CinePiOptions::CinePiOptions()
                     "Nice level (-20..19) for encode workers")
                 ("disk-nice",
                     value<int>(),
-                    "Nice level (-20..19) for disk workers");
+                    "Nice level (-20..19) for disk workers")
+                ("plain-arecord-timecode-offset-frames",
+                    value<int>()->default_value(0),
+                    "Accepted for launcher compatibility; ignored by 3.3 audio capture mechanics");
         options_.add(cinepi_group);
 }
 
@@ -273,6 +276,26 @@ static int parseNiceValue(const std::string &flag, const std::string &value)
         catch (const std::invalid_argument &)
         {
                 throw std::runtime_error(flag + " requires an integer value");
+        }
+        catch (const std::out_of_range &)
+        {
+                throw std::runtime_error(flag + " is out of range");
+        }
+}
+
+static int parseFrameOffset(const std::string &flag, const std::string &value)
+{
+        try
+        {
+                size_t pos = 0;
+                int parsed = std::stoi(value, &pos, 10);
+                if (pos != value.size())
+                        throw std::runtime_error(flag + " contains trailing characters: " + value.substr(pos));
+                return parsed;
+        }
+        catch (const std::invalid_argument &)
+        {
+                throw std::runtime_error(flag + " requires an integer frame offset");
         }
         catch (const std::out_of_range &)
         {
@@ -478,6 +501,19 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                         if (i + 1 >= argc)
                                 throw std::runtime_error("--disk-nice requires a value");
                         RawOptions::disk_nice = parseNiceValue("--disk-nice", argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--plain-arecord-timecode-offset-frames=", 0) == 0) {
+                        (void)parseFrameOffset(
+                                "--plain-arecord-timecode-offset-frames",
+                                arg.substr(sizeof("--plain-arecord-timecode-offset-frames=") - 1));
+                        continue;
+                }
+                if (arg == "--plain-arecord-timecode-offset-frames") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--plain-arecord-timecode-offset-frames requires a value");
+                        (void)parseFrameOffset("--plain-arecord-timecode-offset-frames", argv[++i]);
                         continue;
                 }
 
