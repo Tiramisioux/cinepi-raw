@@ -59,6 +59,10 @@ public:
 		return frames_;
 	}
 
+	int64_t getTcFrameCount() const {
+		return tc_frame_count_;
+	}
+
 	uint16_t photometric;
 	uint16_t samples_per_pixel;
 	uint8_t timecode[8];
