@@ -99,7 +99,8 @@ private:
 
     /* Timecode: wall-clock origin captured at the first frame of each clip */
     bool     tc_origin_set_  { false };
-    uint64_t tc_origin_us_   { 0 };    // ts_us of first frame, for elapsed-time TC
+    uint64_t tc_last_ts_us_  { 0 };    // ts_us of the previous frame, for delta-based counting
+    int64_t  tc_frame_count_ { 0 };    // monotonic frame counter; gaps = dropped frames
     int      tc_start_hh_    { 0 };
     int      tc_start_mm_    { 0 };
     int      tc_start_ss_    { 0 };
