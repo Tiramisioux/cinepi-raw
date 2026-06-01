@@ -238,9 +238,9 @@ private:
 		StreamInfo loinfo;
 		CompletedRequest::ControlList met;
 		int64_t timestamp_us;
-		int64_t tc_frame_count { 0 }; // pre-computed TC frame number, set under encode_mutex_
 		uint64_t index;
 		std::string folder;
+		int64_t tc_frame_count { 0 }; // pre-computed TC frame number, set under encode_mutex_
 	};
 	std::queue<EncodeItem> encode_queue_;
 	std::mutex encode_mutex_;
