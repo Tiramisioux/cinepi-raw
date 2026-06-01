@@ -22,7 +22,10 @@ constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
 constexpr char RECORDER_VU_REDIS_KEY[] = "audio_vu";
 constexpr char REDIS_DEFAULT_URL[] = "redis://127.0.0.1:6379/0";
 constexpr auto RECORDER_VU_PUBLISH_INTERVAL = std::chrono::milliseconds(33);
-constexpr auto AUDIO_MONITOR_SHUTDOWN_TIMEOUT = std::chrono::milliseconds(250);
+// In --discard-output mode the idle monitor now skips draining and exits
+// within one ALSA period (<10 ms).  500 ms gives comfortable headroom while
+// still guaranteeing SIGKILL as a fallback for a stuck process.
+constexpr auto AUDIO_MONITOR_SHUTDOWN_TIMEOUT = std::chrono::milliseconds(500);
 
 // The first audio buffer marker lands after the hardware has already started
 // filling the capture pipeline. Subtract this latency when estimating the
@@ -1068,6 +1071,13 @@ void CinePISound::stopIdleVuMonitoring()
         monitor_vu_pid_ = -1;
     }
     monitoring_vu_ = false;
+
+    // Brief settle so the dsnoop shared-memory segment the idle monitor held is
+    // fully released before the recorder opens a new handle.  Without this, the
+    // recorder may attach to a partially-cleaned dsnoop state and inherit a
+    // pre-start backlog (intercept offset).  50 ms is negligible at record start
+    // and well under one video frame at any supported frame rate.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
 void CinePISound::startIdleVuMonitoring()

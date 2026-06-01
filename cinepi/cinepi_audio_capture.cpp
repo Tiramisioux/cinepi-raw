@@ -533,6 +533,8 @@ int main(int argc, char **argv)
         snd_pcm_sframes_t framesRead =
             snd_pcm_readi(pcm, buffer.data(), framesToRead);
         if (framesRead == -EINTR && stopRequested.load()) {
+            if (options.discardOutput)
+                break; // No drain needed in discard mode; release dsnoop immediately.
             if (!draining) {
                 draining = true;
                 drainDeadline = std::chrono::steady_clock::now() + drainGrace;
@@ -622,6 +624,8 @@ int main(int argc, char **argv)
         }
 
         if (stopRequested.load() && !draining) {
+            if (options.discardOutput)
+                break; // No drain needed in discard mode; release dsnoop immediately.
             draining = true;
             drainDeadline = std::chrono::steady_clock::now() + drainGrace;
         }
@@ -648,5 +652,15 @@ int main(int argc, char **argv)
 
     snd_pcm_drop(pcm);
     snd_pcm_close(pcm);
+
+    // Signal to the parent (cinepi_sound) that the dsnoop capture PCM has been
+    // fully released.  The parent waits for this marker (or a short settle period)
+    // before launching the recorder so the recorder always opens a cold dsnoop
+    // connection with zero pre-start backlog.
+    if (options.discardOutput) {
+        std::cout << "<AUDIO_MONITOR_RELEASED>\n";
+        std::cout.flush();
+    }
+
     return 0;
 }
