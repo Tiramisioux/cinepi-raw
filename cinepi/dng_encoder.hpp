@@ -51,7 +51,7 @@ public:
 		size_t losize,
 		const libcamera::ControlList &metadata,
 		int64_t timestamp_us,
-		uint64_t fn);
+		int64_t tc_frame_count);
 
 	int bufferSize(){
 		return disk_buffer_.size();
@@ -238,6 +238,7 @@ private:
 		StreamInfo loinfo;
 		CompletedRequest::ControlList met;
 		int64_t timestamp_us;
+		int64_t tc_frame_count { 0 }; // pre-computed TC frame number, set under encode_mutex_
 		uint64_t index;
 		std::string folder;
 	};

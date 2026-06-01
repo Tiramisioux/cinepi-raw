@@ -793,7 +793,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                             [[maybe_unused]] size_t             losize,
                             const libcamera::ControlList       &metadata,
                             int64_t                             timestamp_us,
-                            uint64_t                            fn)
+                            int64_t                             tc_frame_count)
 {
     thread_local std::vector<uint8_t> rowBuf;
     thread_local std::vector<uint16_t> row16Buf;
@@ -970,64 +970,23 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
 
     /* ------------------------------------------------------------------
-    *  Choose wall-clock if the controller supplied one, otherwise
-    *  fall back to the timestamp_us that came with the buffer.
-    * ------------------------------------------------------------------ */
+     *  Wall-clock timestamp — used only for TIFF DateTime tags below.
+     *  TC stepping is now done in encodeThread under encode_mutex_ using
+     *  each frame's own sensor timestamp; tc_frame_count is pre-computed
+     *  and passed in as a parameter.
+     * ------------------------------------------------------------------ */
     uint64_t ts_us = wallclock_ts_us_ ? wallclock_ts_us_   // µs since epoch
-                                    : timestamp_us;      // old path
+                                      : static_cast<uint64_t>(timestamp_us);
 
     struct timeval tv;
     tv.tv_sec  = ts_us / 1'000'000;
     tv.tv_usec = ts_us % 1'000'000;
 
     struct tm *lt = localtime(&tv.tv_sec);
-    int fps = fpsRat[0] / fpsRat[1];
-    int fps_int = (fps > 0) ? fps : 24;
 
-    /* ------------------------------------------------------------------
-     *  Timecode: capture wall-clock HH:MM:SS once at the first frame of
-     *  each clip (tc_origin_set_ cleared by resetFrameCount()).
-     *  Subsequent frames advance tc_frame_count_ by rounding the
-     *  inter-frame µs delta to the nearest frame period, so:
-     *    - jitter within ±½ frame always steps by 1 → no duplicates
-     *    - a gap ≥ 1.5× frame period rounds up → natural TC hole for
-     *      each dropped frame
-     * ------------------------------------------------------------------ */
-    if (!tc_origin_set_)
-    {
-        tc_last_ts_us_ = ts_us;
-        tc_frame_count_ = 0;
-        tc_start_hh_   = lt->tm_hour;
-        tc_start_mm_   = lt->tm_min;
-        tc_start_ss_   = lt->tm_sec;
-        tc_fps_        = fps_int;
-        tc_origin_set_ = true;
-    }
-    else
-    {
-        /* Round inter-frame delta to nearest frame count.
-         * raw_elapsed is the unbiased rounded step:
-         *   0  → early jitter (sub-½-period early)
-         *   1  → on-time
-         *  ≥2  → gap: (raw_elapsed − 1) frames were never written to disk
-         *
-         * frames_elapsed floors to 1 so the display TC never duplicates
-         * or runs backward (jitter correction for display only).
-         *
-         * dropped_frames_ counts only genuine holes (raw_elapsed ≥ 2) and
-         * is immune to the +1 floor bias. */
-        uint64_t delta_us = ts_us - tc_last_ts_us_;
-        int64_t raw_elapsed = static_cast<int64_t>(std::llround(
-            static_cast<double>(delta_us) * tc_fps_ / 1'000'000.0));
-        int64_t frames_elapsed = std::max(INT64_C(1), raw_elapsed);
-        tc_frame_count_ += frames_elapsed;
-        tc_last_ts_us_  = ts_us;
-        if (raw_elapsed >= 2)
-            dropped_frames_ += raw_elapsed - 1;
-    }
-
-    int ff  = static_cast<int>(tc_frame_count_ % tc_fps_);
-    int64_t total_s = tc_frame_count_ / tc_fps_;
+    /* tc_start_hh_/mm_/ss_ and tc_fps_ were set at clip origin in encodeThread. */
+    int ff  = static_cast<int>(tc_frame_count % tc_fps_);
+    int64_t total_s = tc_frame_count / tc_fps_;
     int ss  = static_cast<int>(total_s % 60);
     int mm  = static_cast<int>((total_s / 60) % 60);
     int hh  = static_cast<int>((total_s / 3600) % 24);
@@ -1089,6 +1048,53 @@ void DngEncoder::encodeThread(int num)
 
             encode_item = encode_queue_.front();
             encode_queue_.pop();
+
+            /* ── TC step: computed here, under encode_mutex_, so frames are
+             *    processed in FIFO order and each frame's own sensor timestamp
+             *    is used.  This eliminates the wallclock_ts_us_ shared-scalar
+             *    race that was producing phantom holes with >1 encode workers. */
+            if (!tc_origin_set_)
+            {
+                /* First frame of clip: capture wall-clock HH:MM:SS origin. */
+                int fps_int = 24;
+                if (auto fd = encode_item.met.get(controls::FrameDuration); fd && *fd > 0)
+                    fps_int = static_cast<int>(1e9 / static_cast<double>(*fd) + 0.5);
+                if (fps_int <= 0) fps_int = 24;
+
+                /* Prefer wall-clock for the HH:MM:SS display origin; fall back
+                 * to sensor monotonic (small display-only error if not set yet). */
+                uint64_t origin_us = wallclock_ts_us_
+                                     ? wallclock_ts_us_
+                                     : static_cast<uint64_t>(encode_item.timestamp_us);
+                struct timeval tv { static_cast<time_t>(origin_us / 1'000'000ULL),
+                                    static_cast<suseconds_t>(origin_us % 1'000'000ULL) };
+                struct tm lt_val {};
+                localtime_r(&tv.tv_sec, &lt_val);
+
+                tc_last_ts_us_  = encode_item.timestamp_us; /* now monotonic µs */
+                tc_frame_count_ = 0;
+                tc_start_hh_    = lt_val.tm_hour;
+                tc_start_mm_    = lt_val.tm_min;
+                tc_start_ss_    = lt_val.tm_sec;
+                tc_fps_         = fps_int;
+                tc_origin_set_  = true;
+                encode_item.tc_frame_count = 0;
+            }
+            else
+            {
+                /* Delta uses the per-frame sensor timestamp already in the queue.
+                 * No shared scalar, no phantom holes regardless of worker count. */
+                uint64_t delta_us = static_cast<uint64_t>(encode_item.timestamp_us)
+                                    - static_cast<uint64_t>(tc_last_ts_us_);
+                int64_t raw_elapsed = static_cast<int64_t>(std::llround(
+                    static_cast<double>(delta_us) * tc_fps_ / 1'000'000.0));
+                int64_t frames_elapsed = std::max(INT64_C(1), raw_elapsed);
+                tc_frame_count_ += frames_elapsed;
+                tc_last_ts_us_   = encode_item.timestamp_us; /* monotonic */
+                if (raw_elapsed >= 2)
+                    dropped_frames_ += raw_elapsed - 1;
+                encode_item.tc_frame_count = tc_frame_count_;
+            }
         }
 
         frames_ = encode_item.index;
@@ -1141,7 +1147,7 @@ void DngEncoder::encodeThread(int num)
             encode_item.losize,
             encode_item.met,
             encode_item.timestamp_us,
-            encode_item.index);
+            encode_item.tc_frame_count);
 
         /* queue for disk writer */
         {
