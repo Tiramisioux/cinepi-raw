@@ -1006,15 +1006,24 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     else
     {
         /* Round inter-frame delta to nearest frame count.
-         * Jitter within ±½ frame snaps to 1 (no duplicates).
-         * A gap ≥ 1.5× frame period rounds up, producing a TC hole
-         * for each dropped frame. */
+         * raw_elapsed is the unbiased rounded step:
+         *   0  → early jitter (sub-½-period early)
+         *   1  → on-time
+         *  ≥2  → gap: (raw_elapsed − 1) frames were never written to disk
+         *
+         * frames_elapsed floors to 1 so the display TC never duplicates
+         * or runs backward (jitter correction for display only).
+         *
+         * dropped_frames_ counts only genuine holes (raw_elapsed ≥ 2) and
+         * is immune to the +1 floor bias. */
         uint64_t delta_us = ts_us - tc_last_ts_us_;
-        int64_t frames_elapsed = std::max(INT64_C(1),
-            static_cast<int64_t>(std::llround(
-                static_cast<double>(delta_us) * tc_fps_ / 1'000'000.0)));
+        int64_t raw_elapsed = static_cast<int64_t>(std::llround(
+            static_cast<double>(delta_us) * tc_fps_ / 1'000'000.0));
+        int64_t frames_elapsed = std::max(INT64_C(1), raw_elapsed);
         tc_frame_count_ += frames_elapsed;
         tc_last_ts_us_  = ts_us;
+        if (raw_elapsed >= 2)
+            dropped_frames_ += raw_elapsed - 1;
     }
 
     int ff  = static_cast<int>(tc_frame_count_ % tc_fps_);
