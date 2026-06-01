@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -15,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <sched.h>
 #include <sys/prctl.h>
 #include <string>
 #include <thread>
@@ -223,6 +226,41 @@ int recoverCaptureError(snd_pcm_t *handle, int err)
         return 0;
     }
     return err;
+}
+
+// Raise the calling (capture) thread to SCHED_FIFO so heavy DNG-writer storage
+// I/O (heavier and blockier on exFAT than ext4) cannot preempt the ALSA read
+// loop long enough to drop samples and drift the take. Degrades gracefully
+// without RT privileges. Tunable via CINEPI_AUDIO_RT_PRIORITY.
+void tryElevateRealtimePriority()
+{
+    int priority = 20;
+    if (const char *rtPriorityEnv = std::getenv("CINEPI_AUDIO_RT_PRIORITY")) {
+        try {
+            priority = std::stoi(rtPriorityEnv);
+        } catch (...) {
+            std::cerr << "Ignoring invalid CINEPI_AUDIO_RT_PRIORITY value\n";
+        }
+    }
+
+    const int minPriority = sched_get_priority_min(SCHED_FIFO);
+    const int maxPriority = sched_get_priority_max(SCHED_FIFO);
+    if (minPriority < 0 || maxPriority < 0) {
+        std::cerr << "SCHED_FIFO priority range unavailable; leaving capture at default scheduling\n";
+        return;
+    }
+    priority = std::clamp(priority, minPriority, maxPriority);
+
+    sched_param param{};
+    param.sched_priority = priority;
+    if (sched_setscheduler(0, SCHED_FIFO, &param) == 0) {
+        std::cerr << "Capture thread elevated to SCHED_FIFO priority " << priority << "\n";
+    } else {
+        const int savedErrno = errno;
+        std::cerr << "Could not set SCHED_FIFO capture priority (" << std::strerror(savedErrno)
+                  << "); continuing at default scheduling. Grant CAP_SYS_NICE or raise the"
+                     " rtprio ulimit for xrun-resistant capture.\n";
+    }
 }
 
 } // namespace
@@ -439,6 +477,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // Keep the ALSA read loop scheduled ahead of DNG-writer storage I/O so xruns
+    // (and the drift they cause) do not accumulate under heavy 4K / exFAT load.
+    if (!options.discardOutput)
+        tryElevateRealtimePriority();
+
     const timespec triggerMono = currentClock(CLOCK_MONOTONIC);
     const timespec triggerReal = currentClock(CLOCK_REALTIME);
 
@@ -457,6 +500,10 @@ int main(int argc, char **argv)
     std::optional<std::chrono::steady_clock::time_point> drainDeadline;
     const auto drainGrace =
         std::chrono::milliseconds(std::max<unsigned int>(1000, bufferTimeUs / 1000));
+
+    // Wall-clock anchor for xrun gap compensation (used in the success path below).
+    auto lastReadEndMono = std::chrono::steady_clock::now();
+    bool pendingXrunGap = false;
 
     while (true) {
         snd_pcm_sframes_t framesToRead = static_cast<snd_pcm_sframes_t>(periodFrames);
@@ -498,6 +545,9 @@ int main(int argc, char **argv)
                 std::cerr << "Capture read failed: " << snd_strerror(err) << '\n';
                 break;
             }
+            // ALSA dropped samples here; pad the gap with silence on the next good
+            // read so the WAV length stays locked to wall-clock time (no drift).
+            pendingXrunGap = true;
             continue;
         }
 
@@ -505,6 +555,44 @@ int main(int argc, char **argv)
             emitTimestamp("TS_FIRST_BUFFER_A", currentClock(CLOCK_MONOTONIC));
             emittedFirstBufferAfter = true;
         }
+
+        // If ALSA dropped samples before this read, pad the WAV with exactly the
+        // wall-clock time that went missing (minus what this read recovered) so a
+        // dropped buffer becomes a brief glitch instead of accumulating sync drift.
+        const auto nowMono = std::chrono::steady_clock::now();
+        if (pendingXrunGap) {
+            pendingXrunGap = false;
+            if (!options.discardOutput) {
+                const double elapsedSeconds =
+                    std::chrono::duration<double>(nowMono - lastReadEndMono).count();
+                long long gapFrames =
+                    std::llround(elapsedSeconds * static_cast<double>(rate)) -
+                    static_cast<long long>(framesRead);
+                const long long maxGapFrames = static_cast<long long>(rate) * 5;
+                if (gapFrames > maxGapFrames) {
+                    std::cerr << "Clamping xrun silence fill from " << gapFrames
+                              << " to " << maxGapFrames << " frame(s)\n";
+                    gapFrames = maxGapFrames;
+                }
+                if (gapFrames > 0) {
+                    const size_t silenceBytes = static_cast<size_t>(gapFrames) * frameBytes;
+                    const std::vector<uint8_t> silence(silenceBytes, 0);
+                    output.write(reinterpret_cast<const char *>(silence.data()),
+                                 static_cast<std::streamsize>(silenceBytes));
+                    if (output.good()) {
+                        dataBytes += static_cast<uint64_t>(silenceBytes);
+                        framesCaptured += static_cast<uint64_t>(gapFrames);
+                        std::cerr << "Inserted " << gapFrames
+                                  << " silent frame(s) to cover an ALSA xrun gap of "
+                                  << std::fixed << std::setprecision(3) << elapsedSeconds
+                                  << "s; WAV stays aligned to wall clock\n";
+                    } else {
+                        std::cerr << "Failed to write xrun silence padding\n";
+                    }
+                }
+            }
+        }
+        lastReadEndMono = nowMono;
 
         const size_t bytesRead = static_cast<size_t>(framesRead) * frameBytes;
         if (!options.discardOutput) {
