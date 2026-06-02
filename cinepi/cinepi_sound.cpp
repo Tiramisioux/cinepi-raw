@@ -1311,6 +1311,57 @@ void CinePISound::soundThread() {
                 }
             }
 
+            // ADC clock correction: resample WAV to compensate for a slow/fast USB ADC clock.
+            // audio_clock_ppm > 0  → ADC runs slow (fewer samples/sec than nominal) → expand audio.
+            // audio_clock_ppm < 0  → ADC runs fast (more samples/sec than nominal)  → contract audio.
+            // Resampling happens before metadata is written; all timecode math downstream uses
+            // wall-clock timestamps so the BWF anchor is unaffected.
+            const int audio_clock_ppm = options_ ? options_->audio_clock_ppm : 0;
+            if (audio_clock_ppm != 0) {
+                const double actual_rate_d =
+                    static_cast<double>(audioSampleRate) * (1.0 - audio_clock_ppm / 1e6);
+                const int actual_rate = static_cast<int>(std::round(actual_rate_d));
+                if (actual_rate > 0 && actual_rate != audioSampleRate) {
+                    std::ostringstream resamp_tmp_oss;
+                    resamp_tmp_oss << options_->mediaDest << '/' << options_->folder << "/resamp.wav";
+                    const std::string resamp_tmp = resamp_tmp_oss.str();
+
+                    const std::string resamp_codec =
+                        audio_capture_plain_arecord_16bit_ ? "pcm_s16le" : "pcm_s24le";
+
+                    std::ostringstream resamp_cmd;
+                    resamp_cmd << "ffmpeg -hide_banner -loglevel error -y"
+                               << " -i " << shellQuote(filename)
+                               << " -af " << shellQuote("asetrate=" + std::to_string(actual_rate)
+                                                        + ",aresample=" + std::to_string(audioSampleRate))
+                               << " -c:a " << resamp_codec
+                               << ' ' << shellQuote(resamp_tmp);
+
+                    std::string resamp_error;
+                    const int resamp_status = run_with_stderr_capture(resamp_cmd.str(), resamp_error);
+                    if (shellExitCode(resamp_status) != 0) {
+                        console->warn("ADC clock correction resample failed (rc={}, {:+d} ppm): {}; keeping original WAV",
+                                      shellExitCode(resamp_status),
+                                      audio_clock_ppm,
+                                      resamp_error.empty() ? "no stderr output" : resamp_error);
+                        std::error_code ec;
+                        std::filesystem::remove(resamp_tmp, ec);
+                    } else {
+                        std::error_code ec;
+                        std::filesystem::rename(resamp_tmp, filename, ec);
+                        if (ec) {
+                            console->warn("Failed to replace WAV after ADC clock correction ({:+d} ppm): {}; keeping original WAV",
+                                          audio_clock_ppm, ec.message());
+                            std::error_code ec2;
+                            std::filesystem::remove(resamp_tmp, ec2);
+                        } else {
+                            console->info("Applied ADC clock correction: {:+d} ppm, declared input {} Hz → resampled to {} Hz",
+                                          audio_clock_ppm, actual_rate, audioSampleRate);
+                        }
+                    }
+                }
+            }
+
             int64_t vts_start = 0, vts_end = 0;
             int64_t frames = app_->GetEncoder()->timestamps.size();
             if (frames > 0) {
