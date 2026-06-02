@@ -1057,8 +1057,13 @@ void DngEncoder::encodeThread(int num)
             {
                 /* First frame of clip: capture wall-clock HH:MM:SS origin. */
                 int fps_int = 24;
+                /* libcamera FrameDuration is in MICROSECONDS (40000 µs @ 25fps),
+                 * so fps = 1e6 / fd.  Using 1e9 here gives 25000 (1000× too high):
+                 * raw_elapsed = round(40000 * 25000 / 1e6) = 1000 → ~999 phantom
+                 * holes per frame.  The pre-fix path derived this same value as
+                 * fpsRat[0]/fpsRat[1] = round(1e9/fd)/1000, i.e. exactly 1e6/fd. */
                 if (auto fd = encode_item.met.get(controls::FrameDuration); fd && *fd > 0)
-                    fps_int = static_cast<int>(1e9 / static_cast<double>(*fd) + 0.5);
+                    fps_int = static_cast<int>(1'000'000.0 / static_cast<double>(*fd) + 0.5);
                 if (fps_int <= 0) fps_int = 24;
 
                 /* Prefer wall-clock for the HH:MM:SS display origin; fall back
