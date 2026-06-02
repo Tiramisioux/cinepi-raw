@@ -127,6 +127,7 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--disk-nice <int>`       | `auto`  | Nice level applied to disk workers. |
 | `--audio-clock-ppm <int>` | `0`     | ADC clock correction in parts-per-million. `0` disables correction (default). |
 | `--plain-arecord-timecode-offset-frames <int>` | `0` | Frame offset added to the 16-bit plain `arecord` WAV metadata timecode. PCM is not shifted. |
+| `--audio-timecode-offset-frames <int>` | `0` | Frame offset added to the 24-bit USB-capture WAV metadata timecode. PCM is not shifted. |
 
 ### ADC clock correction (`--audio-clock-ppm`)
 
@@ -169,6 +170,21 @@ When active, `cinepi-raw` logs the following after each take:
 
 ```
 Applied ADC clock correction: +1130 ppm, declared input 47946 Hz → resampled to 48000 Hz
+```
+
+### WAV timecode offset (`--audio-timecode-offset-frames`)
+
+A USB capture path can land a fixed number of frames early or late relative to video even after clock correction (analog/buffering latency that is constant across takes). `--audio-timecode-offset-frames` nudges the **WAV metadata timecode** by a whole number of frames to compensate. Only the embedded BWF/iXML timecode is shifted — the PCM samples are never moved.
+
+- This flag covers the **24-bit USB capture (helper) path**. The 16-bit plain-`arecord` path has its own `--plain-arecord-timecode-offset-frames`.
+- **Sign convention:** a **positive** offset moves the timecode later, so audio lands later on the NLE timeline — use a positive value when the sound is *early*. A negative value moves it earlier.
+- Independent of clock correction; both can be active at once.
+- Like the clock-correction flag, Cinemate sets this automatically from `audio.timecode_offset_frames` in `settings.json`; pass it manually only when running `cinepi-raw` directly.
+
+When non-zero, `cinepi-raw` logs after each take:
+
+```
+Applied 24-bit USB capture WAV metadata timecode offset: +2 frames; PCM timing unchanged
 ```
 
 ## Manual DNG encoder
