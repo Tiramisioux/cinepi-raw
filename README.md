@@ -132,7 +132,7 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 
 Some USB audio devices run their internal ADC clock slightly off the nominal 48 000 Hz sample rate. This causes progressive audio-video drift with no xruns and no other symptoms — typically a few frames per minute.
 
-`--audio-clock-ppm` corrects this by resampling the finished WAV after each take using `ffmpeg`. The resampling happens between recording stop and the next take, so it does not affect capture performance.
+`--audio-clock-ppm` corrects this during the post-take `ffmpeg` pass that writes the WAV's BWF/iXML metadata, using `ffmpeg`'s resampler. It runs between recording stop and the next take, so it does not affect capture performance.
 
 **Sign convention:**
 - Positive value → ADC runs **slow** (fewer samples per second than nominal) → WAV is expanded.
@@ -141,15 +141,16 @@ Some USB audio devices run their internal ADC clock slightly off the nominal 48 
 
 **How it works:**
 
-After recording stops and the WAV file has stabilised on disk, `cinepi-raw` runs:
+After recording stops and the WAV file has stabilised on disk, the correction is folded into the single `ffmpeg` pass that writes the BWF/iXML metadata — there is no separate resample step and no intermediate file, so `ssd_monitor` never sees a stray WAV in the take folder. That pass is equivalent to:
 
 ```
-ffmpeg -i take.wav -af "asetrate=<actual_rate>,aresample=48000" -c:a pcm_s24le take.wav
+ffmpeg -i take.wav -af "asetrate=<actual_rate>,aresample=48000" -c:a pcm_s24le \
+  -write_bext 1 -metadata timecode=<tc> ... take.wav
 ```
 
-where `actual_rate = 48000 × (1 − ppm ÷ 1 000 000)`. For `--audio-clock-ppm 1130` this declares the input as 47 946 Hz and resamples to true 48 000 Hz, adding the missing samples and correcting the duration.
+where `actual_rate = 48000 × (1 − ppm ÷ 1 000 000)`. For `--audio-clock-ppm 1130` this declares the input as 47 946 Hz and resamples to true 48 000 Hz, adding the missing samples and correcting the duration. When correction is inactive (ppm `0`, or the computed rate is unchanged, or the 16-bit path) the same pass uses `-c:a copy` and leaves the PCM untouched.
 
-The BWF timecode anchor (`BEXT TimeReference`, iXML offset) is written after resampling and is derived from wall-clock timestamps, so it is unaffected by the sample count change.
+The BWF timecode anchor (`BEXT TimeReference`, iXML offset) is written in that same pass and is derived from wall-clock timestamps, so it is unaffected by the sample count change.
 
 **The 16-bit plain-arecord path is never resampled** regardless of this flag, because the 16-bit capture path is already in sync.
 
