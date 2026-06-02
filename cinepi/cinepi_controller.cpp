@@ -259,8 +259,9 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     data["framerate"]  = completed_request->framerate;
     data["colorTemp"]  = info.colorTemp;
     data["focus"]      = info.focus;
-    data["frameCount"]   = app_->GetEncoder()->getFrameCount();
-    data["tcFrameCount"] = static_cast<Json::Int64>(app_->GetEncoder()->getTcFrameCount());
+    data["frameCount"]    = app_->GetEncoder()->getFrameCount();
+    data["tcFrameCount"]  = static_cast<Json::Int64>(app_->GetEncoder()->getTcFrameCount());
+    data["droppedFrames"] = static_cast<Json::Int64>(app_->GetEncoder()->getDroppedFrames());
     data["bufferSize"]    = app_->GetEncoder()->bufferSize();
     data["bufferSizeMax"] = app_->GetEncoder()->bufferSizeMaxAndReset();
     data["timestamp"]  = static_cast<Json::Int64>(epoch_ns);   // ← TOD ns

@@ -39,6 +39,7 @@ public:
 		originationDate.fill(0);
 		index_ = 0;
 		tc_origin_set_ = false;   // force re-capture of wall-clock origin on next frame
+		dropped_frames_ = 0;
 		buffer_hwm_.store(0, std::memory_order_relaxed);  // reset disk-backlog high-water mark
 	}
 
@@ -51,7 +52,7 @@ public:
 		size_t losize,
 		const libcamera::ControlList &metadata,
 		int64_t timestamp_us,
-		uint64_t fn);
+		int64_t tc_frame_count);
 
 	int bufferSize(){
 		return disk_buffer_.size();
@@ -74,6 +75,13 @@ public:
 
 	int64_t getTcFrameCount() const {
 		return tc_frame_count_;
+	}
+
+	// Frames that produced a hole in the take (inter-frame gap rounded to ≥2
+	// frame periods). Does NOT include the tc_frame_count_ +1 floor used for
+	// display continuity — those are jitter, not missing writes.
+	int64_t getDroppedFrames() const {
+		return dropped_frames_;
 	}
 
 	uint16_t photometric;
@@ -117,7 +125,8 @@ private:
     /* Timecode: wall-clock origin captured at the first frame of each clip */
     bool     tc_origin_set_  { false };
     uint64_t tc_last_ts_us_  { 0 };    // ts_us of the previous frame, for delta-based counting
-    int64_t  tc_frame_count_ { 0 };    // monotonic frame counter; gaps = dropped frames
+    int64_t  tc_frame_count_ { 0 };    // monotonic TC counter (display); +1 floor keeps it forward
+    int64_t  dropped_frames_ { 0 };    // frames with no DNG written (inter-frame gap ≥ 2 periods)
     int      tc_start_hh_    { 0 };
     int      tc_start_mm_    { 0 };
     int      tc_start_ss_    { 0 };
@@ -245,6 +254,7 @@ private:
 		int64_t timestamp_us;
 		uint64_t index;
 		std::string folder;
+		int64_t tc_frame_count { 0 }; // pre-computed TC frame number, set under encode_mutex_
 	};
 	std::queue<EncodeItem> encode_queue_;
 	std::mutex encode_mutex_;
