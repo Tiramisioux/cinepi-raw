@@ -19,7 +19,8 @@
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
 constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
-constexpr char RECORDER_VU_REDIS_KEY[] = "audio_vu";
+constexpr char RECORDER_VU_REDIS_KEY[]    = "audio_vu";
+constexpr char AUDIO_RESAMPLING_REDIS_KEY[] = "audio_resampling";
 constexpr char REDIS_DEFAULT_URL[] = "redis://127.0.0.1:6379/0";
 constexpr auto RECORDER_VU_PUBLISH_INTERVAL = std::chrono::milliseconds(33);
 // In --discard-output mode the idle monitor now skips draining and exits
@@ -1316,7 +1317,10 @@ void CinePISound::soundThread() {
             // audio_clock_ppm < 0  → ADC runs fast (more samples/sec than nominal)  → contract audio.
             // Resampling happens before metadata is written; all timecode math downstream uses
             // wall-clock timestamps so the BWF anchor is unaffected.
-            const int audio_clock_ppm = options_ ? options_->audio_clock_ppm : 0;
+            // Clock correction only applies to the 24-bit capture helper path.
+            // The plain arecord (16-bit) path is already in sync and must not be corrected.
+            const int audio_clock_ppm =
+                (!audio_capture_plain_arecord_16bit_ && options_) ? options_->audio_clock_ppm : 0;
             if (audio_clock_ppm != 0) {
                 const double actual_rate_d =
                     static_cast<double>(audioSampleRate) * (1.0 - audio_clock_ppm / 1e6);
@@ -1328,6 +1332,11 @@ void CinePISound::soundThread() {
 
                     const std::string resamp_codec =
                         audio_capture_plain_arecord_16bit_ ? "pcm_s16le" : "pcm_s24le";
+
+                    if (redis_) {
+                        try { redis_->set(AUDIO_RESAMPLING_REDIS_KEY, "1"); }
+                        catch (...) {}
+                    }
 
                     std::ostringstream resamp_cmd;
                     resamp_cmd << "ffmpeg -hide_banner -loglevel error -y"
@@ -1360,6 +1369,11 @@ void CinePISound::soundThread() {
                         }
                     }
                 }
+            }
+
+            if (redis_) {
+                try { redis_->del(AUDIO_RESAMPLING_REDIS_KEY); }
+                catch (...) {}
             }
 
             int64_t vts_start = 0, vts_end = 0;
