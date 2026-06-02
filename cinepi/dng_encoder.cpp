@@ -1076,14 +1076,26 @@ void DngEncoder::encodeThread(int num)
                 struct tm lt_val {};
                 localtime_r(&tv.tv_sec, &lt_val);
 
+                /* Sub-second frame offset: how many frames into the current
+                 * second did this clip start?  origin_us is a wall-clock µs
+                 * value, so origin_us % 1e6 is the fractional-second part.
+                 * Seeding tc_frame_count_ with this (instead of 0) gives
+                 * frame-accurate absolute TC alignment with external sources.
+                 * The carry propagation in dng_save() already handles
+                 * tc_frame_count_ ≥ tc_fps_ at the second boundary. */
+                uint64_t sub_us     = origin_us % 1'000'000ULL;
+                int64_t sub_frames  = static_cast<int64_t>(
+                    std::llround(static_cast<double>(sub_us) * fps_int / 1'000'000.0));
+                if (sub_frames >= fps_int) sub_frames = fps_int - 1; /* clamp at boundary */
+
                 tc_last_ts_us_  = encode_item.timestamp_us; /* now monotonic µs */
-                tc_frame_count_ = 0;
+                tc_frame_count_ = sub_frames;
                 tc_start_hh_    = lt_val.tm_hour;
                 tc_start_mm_    = lt_val.tm_min;
                 tc_start_ss_    = lt_val.tm_sec;
                 tc_fps_         = fps_int;
                 tc_origin_set_  = true;
-                encode_item.tc_frame_count = 0;
+                encode_item.tc_frame_count = sub_frames;
             }
             else
             {
