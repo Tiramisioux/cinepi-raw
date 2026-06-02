@@ -125,6 +125,50 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--disk-affinity <list>`  | `auto`  | Pin disk workers to the specified CPU list. |
 | `--encode-nice <int>`     | `auto`  | Nice level for encode workers (`-20` = highest priority, `19` = lowest). |
 | `--disk-nice <int>`       | `auto`  | Nice level applied to disk workers. |
+| `--audio-clock-ppm <int>` | `0`     | ADC clock correction in parts-per-million. `0` disables correction (default). |
+| `--plain-arecord-timecode-offset-frames <int>` | `0` | Frame offset added to the 16-bit plain `arecord` WAV metadata timecode. PCM is not shifted. |
+
+### ADC clock correction (`--audio-clock-ppm`)
+
+Some USB audio devices run their internal ADC clock slightly off the nominal 48 000 Hz sample rate. This causes progressive audio-video drift with no xruns and no other symptoms — typically a few frames per minute.
+
+`--audio-clock-ppm` corrects this by resampling the finished WAV after each take using `ffmpeg`. The resampling happens between recording stop and the next take, so it does not affect capture performance.
+
+**Sign convention:**
+- Positive value → ADC runs **slow** (fewer samples per second than nominal) → WAV is expanded.
+- Negative value → ADC runs **fast** (more samples per second) → WAV is contracted.
+- `0` → no correction (default).
+
+**How it works:**
+
+After recording stops and the WAV file has stabilised on disk, `cinepi-raw` runs:
+
+```
+ffmpeg -i take.wav -af "asetrate=<actual_rate>,aresample=48000" -c:a pcm_s24le take.wav
+```
+
+where `actual_rate = 48000 × (1 − ppm ÷ 1 000 000)`. For `--audio-clock-ppm 1130` this declares the input as 47 946 Hz and resamples to true 48 000 Hz, adding the missing samples and correcting the duration.
+
+The BWF timecode anchor (`BEXT TimeReference`, iXML offset) is written after resampling and is derived from wall-clock timestamps, so it is unaffected by the sample count change.
+
+**The 16-bit plain-arecord path is never resampled** regardless of this flag, because the 16-bit capture path is already in sync.
+
+**Normal usage:** this flag is set automatically by Cinemate based on the device entry in `resources/audio_clock_correction.json`. You only need to pass it manually when running `cinepi-raw` directly without Cinemate.
+
+**Measuring the ppm for a new device:**
+
+1. Ensure Phase 1 (SCHED_FIFO) and Phase 2 (dsnoop settle) fixes are in place so storage-driven xruns are not masking the ADC clock offset.
+2. Record a 6-minute take. Confirm zero `Inserted silent frame` lines in the log after the take.
+3. Align in an NLE using the BWF timecode. Measure frame offsets at three clap positions (start, midpoint, end).
+4. Calculate: `ppm = (drift_frames ÷ (take_seconds × fps)) × 1 000 000`
+
+**Log output:**
+
+When active, `cinepi-raw` logs the following after each take:
+
+```
+Applied ADC clock correction: +1130 ppm, declared input 47946 Hz → resampled to 48000 Hz
+```
 
 ## Manual DNG encoder
 
