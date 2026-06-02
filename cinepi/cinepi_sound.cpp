@@ -1465,25 +1465,33 @@ void CinePISound::soundThread() {
                 metadataSource = "take-start-fallback";
             }
 
-            const int configuredPlainArecordOffset =
-                options_ ? options_->plain_arecord_timecode_offset_frames : 0;
-            if (audio_capture_plain_arecord_16bit_ && configuredPlainArecordOffset != 0) {
-                ParsedWavMetadata plainArecordMetadata;
-                plainArecordMetadata.timecode = metadataTimecode;
-                plainArecordMetadata.originationDate = metadataDate;
-                plainArecordMetadata.framerate = output_framerate;
+            // Per-path WAV metadata timecode offset. The 16-bit plain-arecord path uses
+            // plain_arecord_timecode_offset_frames; the 24-bit USB capture (helper) path
+            // uses audio_timecode_offset_frames. Both only shift the embedded timecode —
+            // the PCM is never moved.
+            const bool plainArecordPath = audio_capture_plain_arecord_16bit_;
+            const int configuredTimecodeOffset =
+                options_ ? (plainArecordPath ? options_->plain_arecord_timecode_offset_frames
+                                             : options_->audio_timecode_offset_frames)
+                         : 0;
+            if (configuredTimecodeOffset != 0) {
+                ParsedWavMetadata offsetMetadata;
+                offsetMetadata.timecode = metadataTimecode;
+                offsetMetadata.originationDate = metadataDate;
+                offsetMetadata.framerate = output_framerate;
 
+                const char *pathLabel = plainArecordPath ? "16-bit plain-arecord" : "24-bit USB capture";
                 if (auto correctedMetadata =
-                        offsetMetadataFrames(plainArecordMetadata, configuredPlainArecordOffset)) {
+                        offsetMetadataFrames(offsetMetadata, configuredTimecodeOffset)) {
                     metadataTimecode = correctedMetadata->timecode;
                     metadataDate = correctedMetadata->originationDate;
                     output_framerate = correctedMetadata->framerate;
-                    metadataSource += "+plain-arecord-offset";
-                    console->info("Applied mic_16bit WAV metadata offset: {:+d} frames; PCM timing unchanged",
-                                  configuredPlainArecordOffset);
+                    metadataSource += plainArecordPath ? "+plain-arecord-offset" : "+timecode-offset";
+                    console->info("Applied {} WAV metadata timecode offset: {:+d} frames; PCM timing unchanged",
+                                  pathLabel, configuredTimecodeOffset);
                 } else {
-                    console->warn("Could not apply mic_16bit WAV metadata offset ({:+d} frames); using uncorrected metadata",
-                                  configuredPlainArecordOffset);
+                    console->warn("Could not apply {} WAV metadata timecode offset ({:+d} frames); using uncorrected metadata",
+                                  pathLabel, configuredTimecodeOffset);
                 }
             }
 

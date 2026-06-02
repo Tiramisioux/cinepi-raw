@@ -521,6 +521,20 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                         continue;
                 }
 
+                if (arg.rfind("--audio-timecode-offset-frames=", 0) == 0) {
+                        RawOptions::audio_timecode_offset_frames = parseFrameOffset(
+                                "--audio-timecode-offset-frames",
+                                arg.substr(sizeof("--audio-timecode-offset-frames=") - 1));
+                        continue;
+                }
+                if (arg == "--audio-timecode-offset-frames") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--audio-timecode-offset-frames requires a value");
+                        RawOptions::audio_timecode_offset_frames =
+                                parseFrameOffset("--audio-timecode-offset-frames", argv[++i]);
+                        continue;
+                }
+
                 if (arg.rfind("--audio-clock-ppm=", 0) == 0) {
                         try {
                                 RawOptions::audio_clock_ppm = std::stoi(
