@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cerrno>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -16,7 +17,9 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <sched.h>
 #include <sys/prctl.h>
 #include <string>
@@ -521,6 +524,54 @@ int main(int argc, char **argv)
     const auto drainGrace =
         std::chrono::milliseconds(std::max<unsigned int>(1000, bufferTimeUs / 1000));
 
+    // Decouple capture from disk I/O so exFAT write stalls (which block write()
+    // calls for hundreds of ms under 4K DNG-writer pressure) never stall the ALSA
+    // read loop and cause sample loss. The capture thread pushes audio into a RAM
+    // queue; the writer thread drains it to disk independently.
+    struct WriteQueue {
+        std::queue<std::vector<uint8_t>> items;
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::atomic<bool> done{false};
+        std::atomic<bool> error{false};
+    };
+    WriteQueue wq;
+
+    std::thread writerThread;
+    if (!options.discardOutput) {
+        writerThread = std::thread([&]() {
+            while (true) {
+                std::unique_lock<std::mutex> lock(wq.mtx);
+                wq.cv.wait(lock, [&] { return !wq.items.empty() || wq.done.load(); });
+                while (!wq.items.empty()) {
+                    auto buf = std::move(wq.items.front());
+                    wq.items.pop();
+                    lock.unlock();
+                    output.write(reinterpret_cast<const char *>(buf.data()),
+                                 static_cast<std::streamsize>(buf.size()));
+                    if (!output.good()) {
+                        wq.error.store(true);
+                        std::cerr << "WAV writer: disk write failed\n";
+                    }
+                    lock.lock();
+                }
+                if (wq.done.load())
+                    break;
+            }
+        });
+    }
+
+    // Push an audio chunk to the writer thread. Caller updates framesCaptured /
+    // dataBytes so the wall-clock reconciliation stays accurate regardless of how
+    // much data the writer thread has actually flushed to disk.
+    auto enqueueAudio = [&](const uint8_t *data, size_t bytes) {
+        {
+            std::lock_guard<std::mutex> lock(wq.mtx);
+            wq.items.emplace(data, data + bytes);
+        }
+        wq.cv.notify_one();
+    };
+
     // Running wall-clock anchor. Each successful read reconciles total frames
     // written against elapsed real time and pads any shortfall with silence, so the
     // WAV stays locked to wall-clock length whether samples were lost to an ALSA
@@ -603,30 +654,24 @@ int main(int argc, char **argv)
                 const long long gapFrames = std::min(shortfallFrames, maxGapFrames);
                 const size_t silenceBytes = static_cast<size_t>(gapFrames) * frameBytes;
                 const std::vector<uint8_t> silence(silenceBytes, 0);
-                output.write(reinterpret_cast<const char *>(silence.data()),
-                             static_cast<std::streamsize>(silenceBytes));
-                if (output.good()) {
-                    dataBytes += static_cast<uint64_t>(silenceBytes);
-                    framesCaptured += static_cast<uint64_t>(gapFrames);
-                    std::cerr << "Inserted " << gapFrames
-                              << " silent frame(s) to cover a capture shortfall of "
-                              << std::fixed << std::setprecision(3)
-                              << (static_cast<double>(gapFrames) / static_cast<double>(rate))
-                              << "s; WAV stays aligned to wall clock\n";
-                } else {
-                    std::cerr << "Failed to write capture shortfall padding\n";
-                }
+                enqueueAudio(silence.data(), silenceBytes);
+                dataBytes += static_cast<uint64_t>(silenceBytes);
+                framesCaptured += static_cast<uint64_t>(gapFrames);
+                std::cerr << "Inserted " << gapFrames
+                          << " silent frame(s) to cover a capture shortfall of "
+                          << std::fixed << std::setprecision(3)
+                          << (static_cast<double>(gapFrames) / static_cast<double>(rate))
+                          << "s; WAV stays aligned to wall clock\n";
             }
         }
 
         const size_t bytesRead = static_cast<size_t>(framesRead) * frameBytes;
         if (!options.discardOutput) {
-            output.write(reinterpret_cast<const char *>(buffer.data()),
-                         static_cast<std::streamsize>(bytesRead));
-            if (!output.good()) {
-                std::cerr << "Failed to write WAV payload\n";
+            if (wq.error.load()) {
+                std::cerr << "Stopping capture after WAV writer disk error\n";
                 break;
             }
+            enqueueAudio(buffer.data(), bytesRead);
         }
 
         dataBytes += static_cast<uint64_t>(bytesRead);
@@ -652,6 +697,16 @@ int main(int argc, char **argv)
             draining = true;
             drainDeadline = std::chrono::steady_clock::now() + drainGrace;
         }
+    }
+
+    // Drain the writer queue before touching the output stream again.
+    if (!options.discardOutput && writerThread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(wq.mtx);
+            wq.done.store(true);
+        }
+        wq.cv.notify_one();
+        writerThread.join();
     }
 
     std::cout << "<SAMPLES_CAPTURED: " << framesCaptured << ">\n";
