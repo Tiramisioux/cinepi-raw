@@ -229,12 +229,21 @@ std::optional<uintmax_t> waitForStableFile(const std::string &filename,
 {
     uintmax_t previousSize = 0;
     int stableReads = 0;
+    bool everPositive = false;
+    // A real take writes its WAV header at capture start, so the file reaches a
+    // positive size within a few hundred ms. If it never does, the take produced no
+    // WAV (aborted/failed) — bail fast instead of holding the audio thread for the
+    // full timeout. That timeout otherwise blocks the NEXT take's capture launch and
+    // clips the start of its audio (a dead previous take cost ~2.3s of late start,
+    // swallowing the first clap).
+    constexpr int absentGraceAttempts = 15; // ~1.5s at 100ms interval
 
     for (int attempt = 0; attempt < maxAttempts; ++attempt) {
         std::error_code ec;
         if (std::filesystem::exists(filename, ec)) {
             const auto currentSize = std::filesystem::file_size(filename, ec);
             if (!ec && currentSize > 0) {
+                everPositive = true;
                 if (currentSize == previousSize)
                     ++stableReads;
                 else
@@ -245,6 +254,11 @@ std::optional<uintmax_t> waitForStableFile(const std::string &filename,
                     return currentSize;
             }
         }
+
+        // Dead/aborted take: the WAV never reached a positive size within the grace
+        // window. Stop waiting so the next take's audio can launch immediately.
+        if (!everPositive && attempt >= absentGraceAttempts)
+            return std::nullopt;
 
         std::this_thread::sleep_for(interval);
     }
