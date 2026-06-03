@@ -519,10 +519,6 @@ int main(int argc, char **argv)
     uint64_t framesCaptured = 0;
     bool emittedFirstBufferAfter = false;
     uint64_t dataBytes = 0;
-    bool draining = false;
-    std::optional<std::chrono::steady_clock::time_point> drainDeadline;
-    const auto drainGrace =
-        std::chrono::milliseconds(std::max<unsigned int>(1000, bufferTimeUs / 1000));
 
     // Decouple capture from disk I/O so exFAT write stalls (which block write()
     // calls for hundreds of ms under 4K DNG-writer pressure) never stall the ALSA
@@ -585,40 +581,17 @@ int main(int argc, char **argv)
     const long long reconcileToleranceFrames = static_cast<long long>(periodFrames);
 
     while (true) {
-        snd_pcm_sframes_t framesToRead = static_cast<snd_pcm_sframes_t>(periodFrames);
-        if (draining) {
-            snd_pcm_sframes_t available = snd_pcm_avail_update(pcm);
-            if (available < 0) {
-                err = recoverCaptureError(pcm, static_cast<int>(available));
-                if (err < 0) {
-                    std::cerr << "Capture drain failed: " << snd_strerror(err) << '\n';
-                    break;
-                }
-                continue;
-            }
-
-            if (available == 0) {
-                if (drainDeadline &&
-                    std::chrono::steady_clock::now() < *drainDeadline) {
-                    snd_pcm_wait(pcm, 1);
-                    continue;
-                }
-                break;
-            }
-
-            framesToRead = std::min<snd_pcm_sframes_t>(framesToRead, available);
-        }
+        const snd_pcm_sframes_t framesToRead = static_cast<snd_pcm_sframes_t>(periodFrames);
 
         snd_pcm_sframes_t framesRead =
             snd_pcm_readi(pcm, buffer.data(), framesToRead);
         if (framesRead == -EINTR && stopRequested.load()) {
-            if (options.discardOutput)
-                break; // No drain needed in discard mode; release dsnoop immediately.
-            if (!draining) {
-                draining = true;
-                drainDeadline = std::chrono::steady_clock::now() + drainGrace;
-            }
-            continue;
+            // Stop immediately on both paths. The writer thread flushes any queued
+            // audio, so the ALSA-ring drain is not needed. Draining kept reading
+            // post-stop ambient mic audio for up to ~1 s (the drain grace), which
+            // added a visible tail to the WAV and made the final clap appear late
+            // in the NLE.
+            break;
         }
         if (framesRead < 0) {
             err = recoverCaptureError(pcm, static_cast<int>(framesRead));
@@ -644,7 +617,7 @@ int main(int argc, char **argv)
         const auto nowMono = std::chrono::steady_clock::now();
         if (!captureAnchorMono)
             captureAnchorMono = nowMono;
-        if (!options.discardOutput && !draining) {
+        if (!options.discardOutput) {
             const double elapsedSeconds =
                 std::chrono::duration<double>(nowMono - *captureAnchorMono).count();
             const long long shortfallFrames =
@@ -691,11 +664,8 @@ int main(int argc, char **argv)
             std::cerr << "Disabling live monitor output after playback failure; VU capture continues\n";
         }
 
-        if (stopRequested.load() && !draining) {
-            if (options.discardOutput)
-                break; // No drain needed in discard mode; release dsnoop immediately.
-            draining = true;
-            drainDeadline = std::chrono::steady_clock::now() + drainGrace;
+        if (stopRequested.load()) {
+            break; // Writer thread handles flush; no ALSA drain needed.
         }
     }
 
