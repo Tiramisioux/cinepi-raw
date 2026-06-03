@@ -211,10 +211,7 @@ CinePiOptions::CinePiOptions()
                     "Nice level (-20..19) for disk workers")
                 ("plain-arecord-timecode-offset-frames",
                     value<int>()->default_value(0),
-                    "Frame offset to add to plain arecord WAV metadata timecode; PCM is unchanged")
-                ("audio-clock-ppm",
-                    value<int>()->default_value(0),
-                    "ADC clock offset in ppm (positive = ADC runs slow); resamples WAV to correct duration after recording");
+                    "Frame offset to add to plain arecord WAV metadata timecode; PCM is unchanged");
         options_.add(cinepi_group);
 }
 
@@ -532,26 +529,6 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                                 throw std::runtime_error("--audio-timecode-offset-frames requires a value");
                         RawOptions::audio_timecode_offset_frames =
                                 parseFrameOffset("--audio-timecode-offset-frames", argv[++i]);
-                        continue;
-                }
-
-                if (arg.rfind("--audio-clock-ppm=", 0) == 0) {
-                        try {
-                                RawOptions::audio_clock_ppm = std::stoi(
-                                        arg.substr(sizeof("--audio-clock-ppm=") - 1));
-                        } catch (...) {
-                                throw std::runtime_error("--audio-clock-ppm requires an integer ppm value");
-                        }
-                        continue;
-                }
-                if (arg == "--audio-clock-ppm") {
-                        if (i + 1 >= argc)
-                                throw std::runtime_error("--audio-clock-ppm requires a value");
-                        try {
-                                RawOptions::audio_clock_ppm = std::stoi(argv[++i]);
-                        } catch (...) {
-                                throw std::runtime_error("--audio-clock-ppm requires an integer ppm value");
-                        }
                         continue;
                 }
 

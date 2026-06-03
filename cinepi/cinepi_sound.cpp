@@ -20,7 +20,6 @@
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
 constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
 constexpr char RECORDER_VU_REDIS_KEY[]    = "audio_vu";
-constexpr char AUDIO_RESAMPLING_REDIS_KEY[] = "audio_resampling";
 constexpr char REDIS_DEFAULT_URL[] = "redis://127.0.0.1:6379/0";
 constexpr auto RECORDER_VU_PUBLISH_INTERVAL = std::chrono::milliseconds(33);
 // In --discard-output mode the idle monitor now skips draining and exits
@@ -1332,22 +1331,6 @@ void CinePISound::soundThread() {
 
             // ADC clock correction ppm — applies on the helper capture path for any
             // mic whose card matches the clock-correction database (16- or 24-bit).
-            // The plain arecord fallback is not silence-filled, so its length is
-            // unreliable and it must not be resampled. Resampling is folded into the
-            // metadata ffmpeg pass below so no intermediate file is created and
-            // ssd_monitor never sees a stray WAV.
-            const int audio_clock_ppm =
-                (!audio_capture_via_plain_arecord_ && options_) ? options_->audio_clock_ppm : 0;
-            const double actual_rate_d =
-                static_cast<double>(audioSampleRate) * (1.0 - audio_clock_ppm / 1e6);
-            const int actual_rate = static_cast<int>(std::round(actual_rate_d));
-            const bool apply_clock_correction =
-                audio_clock_ppm != 0 && actual_rate > 0 && actual_rate != audioSampleRate;
-            // Preserve the captured bit depth when resampling: 16-bit mics stay
-            // 16-bit rather than being upconverted to 24-bit.
-            const char *corrected_pcm_codec =
-                audio_capture_is_16bit_mic_ ? "pcm_s16le" : "pcm_s24le";
-
             int64_t vts_start = 0, vts_end = 0;
             int64_t frames = app_->GetEncoder()->timestamps.size();
             if (frames > 0) {
@@ -1543,17 +1526,7 @@ void CinePISound::soundThread() {
 
             ffmpeg_oss << "ffmpeg -hide_banner -loglevel error -y -i " << shellQuote(filename);
             ffmpeg_oss << " -map 0:a:0";
-            if (apply_clock_correction) {
-                // Fold ADC clock correction into the metadata pass: reinterpret the
-                // captured samples at the ADC's true rate, then resample back to the
-                // declared rate. One ffmpeg pass, so ssd_monitor never sees a stray WAV.
-                ffmpeg_oss << " -af "
-                           << shellQuote("asetrate=" + std::to_string(actual_rate)
-                                         + ",aresample=" + std::to_string(audioSampleRate))
-                           << " -c:a " << corrected_pcm_codec;
-            } else {
-                ffmpeg_oss << " -c:a copy";
-            }
+            ffmpeg_oss << " -c:a copy";
             ffmpeg_oss
                        << " -write_bext 1"
                        << " -metadata " << shellQuote("description=CinePI Description")
@@ -1565,21 +1538,8 @@ void CinePISound::soundThread() {
                        << " -metadata " << shellQuote("timecode=" + timecode_tag)
                        << ' ' << shellQuote(tmp_oss.str());
 
-            if (apply_clock_correction && redis_) {
-                try { redis_->set(AUDIO_RESAMPLING_REDIS_KEY, "1"); }
-                catch (...) {}
-            }
-
             std::string ffmpeg_error;
             const int ffmpeg_status = run_with_stderr_capture(ffmpeg_oss.str(), ffmpeg_error);
-
-            // Resampling (if any) is done once ffmpeg returns; clear the GUI flag here
-            // so every exit path below — ffmpeg failure, rename failure, or success —
-            // leaves the key cleared.
-            if (apply_clock_correction && redis_) {
-                try { redis_->del(AUDIO_RESAMPLING_REDIS_KEY); }
-                catch (...) {}
-            }
 
             if (shellExitCode(ffmpeg_status) != 0) {
                 console->critical("ffmpeg WAV metadata write failed (rc={}): {}",
@@ -1595,11 +1555,6 @@ void CinePISound::soundThread() {
                 console->critical("Failed to replace WAV with metadata-updated version: {}", rename_ec.message());
                 finishRecordingAttempt();
                 continue;
-            }
-
-            if (apply_clock_correction) {
-                console->info("Applied ADC clock correction: {:+d} ppm, declared input {} Hz → resampled to {} Hz",
-                              audio_clock_ppm, actual_rate, audioSampleRate);
             }
 
             const std::string ixml =
