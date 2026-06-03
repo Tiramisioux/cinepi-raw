@@ -501,9 +501,17 @@ int main(int argc, char **argv)
     const auto drainGrace =
         std::chrono::milliseconds(std::max<unsigned int>(1000, bufferTimeUs / 1000));
 
-    // Wall-clock anchor for xrun gap compensation (used in the success path below).
-    auto lastReadEndMono = std::chrono::steady_clock::now();
-    bool pendingXrunGap = false;
+    // Running wall-clock anchor. Each successful read reconciles total frames
+    // written against elapsed real time and pads any shortfall with silence, so the
+    // WAV stays locked to wall-clock length whether samples were lost to an ALSA
+    // xrun (-EPIPE) OR silently under-delivered by the USB device (no error raised
+    // at all — invisible to a -EPIPE-gated fill). Anchor is set on the first read.
+    std::optional<std::chrono::steady_clock::time_point> captureAnchorMono;
+    const long long maxGapFrames = static_cast<long long>(rate) * 5;
+    // Pad only past one period of shortfall so normal scheduling jitter never
+    // injects silence; sub-period losses accumulate against the fixed anchor and
+    // get padded once they cross the threshold, so nothing leaks permanently.
+    const long long reconcileToleranceFrames = static_cast<long long>(periodFrames);
 
     while (true) {
         snd_pcm_sframes_t framesToRead = static_cast<snd_pcm_sframes_t>(periodFrames);
@@ -547,9 +555,8 @@ int main(int argc, char **argv)
                 std::cerr << "Capture read failed: " << snd_strerror(err) << '\n';
                 break;
             }
-            // ALSA dropped samples here; pad the gap with silence on the next good
-            // read so the WAV length stays locked to wall-clock time (no drift).
-            pendingXrunGap = true;
+            // Dropped samples (xrun). The running wall-clock reconciliation on the
+            // next good read pads the gap, keeping the WAV aligned to real time.
             continue;
         }
 
@@ -558,43 +565,39 @@ int main(int argc, char **argv)
             emittedFirstBufferAfter = true;
         }
 
-        // If ALSA dropped samples before this read, pad the WAV with exactly the
-        // wall-clock time that went missing (minus what this read recovered) so a
-        // dropped buffer becomes a brief glitch instead of accumulating sync drift.
+        // Reconcile against the running wall-clock anchor BEFORE writing this read's
+        // audio, so inserted silence lands in the gap that opened *before* these
+        // samples. In steady state expected ≈ written and nothing is padded; when
+        // frames went missing (xrun OR silent under-delivery) expected outruns
+        // written and we insert exactly the shortfall.
         const auto nowMono = std::chrono::steady_clock::now();
-        if (pendingXrunGap) {
-            pendingXrunGap = false;
-            if (!options.discardOutput) {
-                const double elapsedSeconds =
-                    std::chrono::duration<double>(nowMono - lastReadEndMono).count();
-                long long gapFrames =
-                    std::llround(elapsedSeconds * static_cast<double>(rate)) -
-                    static_cast<long long>(framesRead);
-                const long long maxGapFrames = static_cast<long long>(rate) * 5;
-                if (gapFrames > maxGapFrames) {
-                    std::cerr << "Clamping xrun silence fill from " << gapFrames
-                              << " to " << maxGapFrames << " frame(s)\n";
-                    gapFrames = maxGapFrames;
-                }
-                if (gapFrames > 0) {
-                    const size_t silenceBytes = static_cast<size_t>(gapFrames) * frameBytes;
-                    const std::vector<uint8_t> silence(silenceBytes, 0);
-                    output.write(reinterpret_cast<const char *>(silence.data()),
-                                 static_cast<std::streamsize>(silenceBytes));
-                    if (output.good()) {
-                        dataBytes += static_cast<uint64_t>(silenceBytes);
-                        framesCaptured += static_cast<uint64_t>(gapFrames);
-                        std::cerr << "Inserted " << gapFrames
-                                  << " silent frame(s) to cover an ALSA xrun gap of "
-                                  << std::fixed << std::setprecision(3) << elapsedSeconds
-                                  << "s; WAV stays aligned to wall clock\n";
-                    } else {
-                        std::cerr << "Failed to write xrun silence padding\n";
-                    }
+        if (!captureAnchorMono)
+            captureAnchorMono = nowMono;
+        if (!options.discardOutput && !draining) {
+            const double elapsedSeconds =
+                std::chrono::duration<double>(nowMono - *captureAnchorMono).count();
+            const long long shortfallFrames =
+                std::llround(elapsedSeconds * static_cast<double>(rate)) -
+                static_cast<long long>(framesCaptured);
+            if (shortfallFrames > reconcileToleranceFrames) {
+                const long long gapFrames = std::min(shortfallFrames, maxGapFrames);
+                const size_t silenceBytes = static_cast<size_t>(gapFrames) * frameBytes;
+                const std::vector<uint8_t> silence(silenceBytes, 0);
+                output.write(reinterpret_cast<const char *>(silence.data()),
+                             static_cast<std::streamsize>(silenceBytes));
+                if (output.good()) {
+                    dataBytes += static_cast<uint64_t>(silenceBytes);
+                    framesCaptured += static_cast<uint64_t>(gapFrames);
+                    std::cerr << "Inserted " << gapFrames
+                              << " silent frame(s) to cover a capture shortfall of "
+                              << std::fixed << std::setprecision(3)
+                              << (static_cast<double>(gapFrames) / static_cast<double>(rate))
+                              << "s; WAV stays aligned to wall clock\n";
+                } else {
+                    std::cerr << "Failed to write capture shortfall padding\n";
                 }
             }
         }
-        lastReadEndMono = nowMono;
 
         const size_t bytesRead = static_cast<size_t>(framesRead) * frameBytes;
         if (!options.discardOutput) {
