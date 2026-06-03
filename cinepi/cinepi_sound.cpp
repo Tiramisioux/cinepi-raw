@@ -829,11 +829,17 @@ void CinePISound::record_start() {
     }
 
     const std::string helperBinary = locateAudioCaptureHelper();
-    const bool use_plain_arecord_for_16bit = (defaultDevice == "mic_16bit");
+    const bool is_16bit_mic = (defaultDevice == "mic_16bit");
+    // Route every format through the capture helper whenever it is available:
+    // the helper carries the SCHED_FIFO + xrun silence-fill protection. A 16-bit
+    // mic on plain arecord drops samples under storage load, producing a short
+    // WAV — progressive drift plus a dead-silent tail equal to the lost frames.
+    // Plain arecord is now only a fallback for a missing helper binary.
+    const bool use_helper = !helperBinary.empty();
 
     cmdStream.str("");
     cmdStream.clear();
-    if (!helperBinary.empty() && !use_plain_arecord_for_16bit) {
+    if (use_helper) {
         cmdStream << shellQuote(helperBinary)
                   << " --device " << shellQuote(defaultDevice)
                   << " --format " << shellQuote(audioFormat)
@@ -842,11 +848,7 @@ void CinePISound::record_start() {
                   << " --output " << shellQuote(filename)
                   << " 2>&1";
     } else {
-        if (use_plain_arecord_for_16bit) {
-            console->info("Using plain arecord for mic_16bit take capture while leaving idle monitoring active");
-        } else {
-            console->warn("cinepi-audio-capture helper not found; falling back to arecord without precise audio-start markers");
-        }
+        console->warn("cinepi-audio-capture helper not found; falling back to plain arecord without precise audio-start markers or xrun silence-fill");
         cmdStream << "arecord"
                   << " -q"
                   << " -D " << defaultDevice
@@ -873,20 +875,21 @@ void CinePISound::record_start() {
     ts_audio_start_realtime = 0;
     audio_capture_started_ = false;
     audio_capture_emits_markers_ = true;
-    audio_capture_plain_arecord_16bit_ = use_plain_arecord_for_16bit;
+    audio_capture_via_plain_arecord_ = !use_helper;
+    audio_capture_is_16bit_mic_ = is_16bit_mic;
     audio_capture_gain_db_ = 0.0;
-    if (audio_capture_plain_arecord_16bit_ && redis_) {
+    if (audio_capture_is_16bit_mic_ && redis_) {
         try {
             auto gainValue = redis_->get("audio_capture_gain_db");
             if (gainValue && !gainValue->empty()) {
                 audio_capture_gain_db_ = std::stod(*gainValue);
             }
         } catch (const std::exception &exc) {
-            console->warn("Invalid audio_capture_gain_db for mic_16bit plain arecord path: {}", exc.what());
+            console->warn("Invalid audio_capture_gain_db for mic_16bit path: {}", exc.what());
             audio_capture_gain_db_ = 0.0;
         }
     }
-    if (audio_capture_plain_arecord_16bit_ && std::abs(audio_capture_gain_db_) > 1e-6) {
+    if (audio_capture_is_16bit_mic_ && std::abs(audio_capture_gain_db_) > 1e-6) {
         console->info("Queued mic_16bit software gain from settings: {} dB",
                       formatDecibels(audio_capture_gain_db_));
     }
@@ -896,8 +899,8 @@ void CinePISound::record_start() {
     std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
     pending_audio_capture_ = PendingAudioCapture{
         cmdStream.str(),
-        !use_plain_arecord_for_16bit,
-        !use_plain_arecord_for_16bit && !helperBinary.empty()
+        use_helper,
+        use_helper
     };
 }
 
@@ -1243,7 +1246,8 @@ void CinePISound::soundThread() {
             auto finishRecordingAttempt = [this]() {
                 audio_capture_started_ = false;
                 audio_capture_emits_markers_ = true;
-                audio_capture_plain_arecord_16bit_ = false;
+                audio_capture_via_plain_arecord_ = false;
+                audio_capture_is_16bit_mic_ = false;
                 audio_capture_gain_db_ = 0.0;
                 vu_meter.fill(0);
                 clearRecorderVuMeter();
@@ -1269,7 +1273,7 @@ void CinePISound::soundThread() {
             }
             console->debug("WAV ready for metadata update: {} bytes", *wavSize);
 
-            if (audio_capture_plain_arecord_16bit_ && std::abs(audio_capture_gain_db_) > 1e-6) {
+            if (audio_capture_is_16bit_mic_ && std::abs(audio_capture_gain_db_) > 1e-6) {
                 std::ostringstream gainFilter;
                 gainFilter << "volume=" << std::fixed << std::setprecision(3)
                            << audio_capture_gain_db_ << "dB";
@@ -1312,17 +1316,23 @@ void CinePISound::soundThread() {
                 }
             }
 
-            // ADC clock correction ppm — only for the 24-bit helper path; the plain
-            // arecord (16-bit) path is already in sync and must not be corrected.
-            // Resampling is folded into the metadata ffmpeg pass below so no
-            // intermediate file is created and ssd_monitor never sees a stray WAV.
+            // ADC clock correction ppm — applies on the helper capture path for any
+            // mic whose card matches the clock-correction database (16- or 24-bit).
+            // The plain arecord fallback is not silence-filled, so its length is
+            // unreliable and it must not be resampled. Resampling is folded into the
+            // metadata ffmpeg pass below so no intermediate file is created and
+            // ssd_monitor never sees a stray WAV.
             const int audio_clock_ppm =
-                (!audio_capture_plain_arecord_16bit_ && options_) ? options_->audio_clock_ppm : 0;
+                (!audio_capture_via_plain_arecord_ && options_) ? options_->audio_clock_ppm : 0;
             const double actual_rate_d =
                 static_cast<double>(audioSampleRate) * (1.0 - audio_clock_ppm / 1e6);
             const int actual_rate = static_cast<int>(std::round(actual_rate_d));
             const bool apply_clock_correction =
                 audio_clock_ppm != 0 && actual_rate > 0 && actual_rate != audioSampleRate;
+            // Preserve the captured bit depth when resampling: 16-bit mics stay
+            // 16-bit rather than being upconverted to 24-bit.
+            const char *corrected_pcm_codec =
+                audio_capture_is_16bit_mic_ ? "pcm_s16le" : "pcm_s24le";
 
             int64_t vts_start = 0, vts_end = 0;
             int64_t frames = app_->GetEncoder()->timestamps.size();
@@ -1465,11 +1475,11 @@ void CinePISound::soundThread() {
                 metadataSource = "take-start-fallback";
             }
 
-            // Per-path WAV metadata timecode offset. The 16-bit plain-arecord path uses
-            // plain_arecord_timecode_offset_frames; the 24-bit USB capture (helper) path
-            // uses audio_timecode_offset_frames. Both only shift the embedded timecode —
-            // the PCM is never moved.
-            const bool plainArecordPath = audio_capture_plain_arecord_16bit_;
+            // Per-path WAV metadata timecode offset. The helper capture path (16- and
+            // 24-bit) uses audio_timecode_offset_frames; the plain-arecord fallback uses
+            // plain_arecord_timecode_offset_frames. Both only shift the embedded
+            // timecode — the PCM is never moved.
+            const bool plainArecordPath = audio_capture_via_plain_arecord_;
             const int configuredTimecodeOffset =
                 options_ ? (plainArecordPath ? options_->plain_arecord_timecode_offset_frames
                                              : options_->audio_timecode_offset_frames)
@@ -1480,7 +1490,7 @@ void CinePISound::soundThread() {
                 offsetMetadata.originationDate = metadataDate;
                 offsetMetadata.framerate = output_framerate;
 
-                const char *pathLabel = plainArecordPath ? "16-bit plain-arecord" : "24-bit USB capture";
+                const char *pathLabel = plainArecordPath ? "plain-arecord fallback" : "helper capture";
                 if (auto correctedMetadata =
                         offsetMetadataFrames(offsetMetadata, configuredTimecodeOffset)) {
                     metadataTimecode = correctedMetadata->timecode;
@@ -1526,7 +1536,7 @@ void CinePISound::soundThread() {
                 ffmpeg_oss << " -af "
                            << shellQuote("asetrate=" + std::to_string(actual_rate)
                                          + ",aresample=" + std::to_string(audioSampleRate))
-                           << " -c:a pcm_s24le";
+                           << " -c:a " << corrected_pcm_codec;
             } else {
                 ffmpeg_oss << " -c:a copy";
             }
