@@ -425,8 +425,13 @@ int main(int argc, char **argv)
     if (!options.discardOutput)
         writeWaveHeader(output, options.channels, rate, formatInfo.bitsPerSample, 0);
 
+    // The idle monitor needs low latency for live VU/HDMI, but the record path has
+    // no live monitor — give it a large ring buffer so the capture thread can ride
+    // out DNG-writer storage stalls without overrunning. An overrun discards the
+    // ALSA ring (dropped samples = silent holes in the WAV); 2 s of headroom absorbs
+    // the multi-hundred-ms stalls seen under 4K NVMe write load.
     unsigned int periodTimeUs = 10000;
-    unsigned int bufferTimeUs = 40000;
+    unsigned int bufferTimeUs = options.discardOutput ? 40000u : 2000000u;
     snd_pcm_hw_params_set_period_time_near(pcm, hw, &periodTimeUs, &dir);
     snd_pcm_hw_params_set_buffer_time_near(pcm, hw, &bufferTimeUs, &dir);
 
@@ -434,6 +439,19 @@ int main(int argc, char **argv)
         std::cerr << "Failed to apply ALSA capture parameters: " << snd_strerror(err) << '\n';
         snd_pcm_close(pcm);
         return 1;
+    }
+
+    {
+        snd_pcm_uframes_t negotiatedBuffer = 0;
+        if (snd_pcm_hw_params_get_buffer_size(hw, &negotiatedBuffer) == 0) {
+            const unsigned long long bufMs =
+                static_cast<unsigned long long>(negotiatedBuffer) * 1000ULL /
+                (rate > 0 ? rate : 48000);
+            std::cerr << "Capture ring buffer: " << negotiatedBuffer << " frames (~"
+                      << bufMs << " ms)"
+                      << (options.discardOutput ? " [idle monitor]" : " [record]")
+                      << '\n';
+        }
     }
 
     snd_pcm_t *monitorPcm = nullptr;
