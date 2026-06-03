@@ -128,6 +128,7 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--audio-clock-ppm <int>` | `0`     | ADC clock correction in parts-per-million. `0` disables correction (default). |
 | `--plain-arecord-timecode-offset-frames <int>` | `0` | Frame offset added to the 16-bit plain `arecord` WAV metadata timecode. PCM is not shifted. |
 | `--audio-timecode-offset-frames <int>` | `0` | Frame offset added to the 24-bit USB-capture WAV metadata timecode. PCM is not shifted. |
+| `--unique-camera-model <string>` | `"Blackmagic Pocket Cinema Camera 4K"` | Override the `UniqueCameraModel` DNG tag embedded in every recorded frame. Cinemate can set this automatically from `camera.camera_name` in `settings.json`; pass it manually only when running `cinepi-raw` directly. |
 
 ### ADC clock correction (`--audio-clock-ppm`)
 
@@ -218,7 +219,9 @@ Applied 24-bit USB capture WAV metadata timecode offset: +2 frames; PCM timing u
 
 At capture, ISO is real analog gain applied on the sensor — it changes the recorded raw pixel values. Setting it too high introduces noise that is baked into the data and cannot be removed in post.
 
-Once your DNGs are in Resolve's Camera RAW tab, the pixel values on disk are fixed. ISO there is a decode-time parameter. In Gen 4 color science, changing it selects a different log curve that shifts contrast as well as brightness. In Gen 5, ISO and the Exposure slider are equivalent — both apply a linear gain at decode. In either case, correcting a wrong ISO in Resolve costs no additional quality, as long as the original sensor data was not catastrophically over- or underexposed at capture.
+Once your DNGs are in Resolve's Camera RAW tab, the pixel values on disk are fixed. ISO there is a decode-time parameter. In Gen 4 color science, changing it selects a different log curve that shifts contrast as well as brightness; in Gen 5, ISO and the Exposure slider are equivalent — both apply a linear gain at decode. In either case, correcting a wrong ISO in Resolve costs no additional quality, as long as the original sensor data was not catastrophically over- or underexposed at capture.
+
+References: [BRAW decode – blackmagiccameraapk.pro](https://blackmagiccameraapk.pro/blackmagic-raw-explained/) · [Gen 4 vs Gen 5 color science – Blackmagic forum](https://forum.blackmagicdesign.com/viewtopic.php?f=2&t=130645&start=50) · [ISO vs Exposure – Blackmagic forum](https://forum.blackmagicdesign.com/viewtopic.php?f=2&t=123096) · [DaVinci Resolve 18.6 Camera RAW manual](https://www.steakunderwater.com/VFXPedia/__man/Resolve18-6/DaVinciResolve18_Manual_files/part202.htm)
 
 ## Audio recording
 

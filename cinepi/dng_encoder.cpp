@@ -734,7 +734,7 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.make       = "Raspberry Pi";
     dng_info.model      = "SONY IMX585-AAQJ1";
     dng_info.software   = "Libcamera;cinepi-raw";
-    dng_info.ucm        = "Blackmagic Pocket Cinema Camera 4K";
+    dng_info.ucm        = options_->ucm.value_or("Blackmagic Pocket Cinema Camera 4K");
     dng_info.serial     = getHwId();
     dng_info.compression = COMPRESSION_NONE;
 
