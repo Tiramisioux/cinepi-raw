@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,7 +17,10 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <queue>
+#include <sched.h>
 #include <sys/prctl.h>
 #include <string>
 #include <thread>
@@ -225,6 +231,41 @@ int recoverCaptureError(snd_pcm_t *handle, int err)
     return err;
 }
 
+// Raise the calling (capture) thread to SCHED_FIFO so heavy DNG-writer storage
+// I/O (heavier and blockier on exFAT than ext4) cannot preempt the ALSA read
+// loop long enough to drop samples and drift the take. Degrades gracefully
+// without RT privileges. Tunable via CINEPI_AUDIO_RT_PRIORITY.
+void tryElevateRealtimePriority()
+{
+    int priority = 20;
+    if (const char *rtPriorityEnv = std::getenv("CINEPI_AUDIO_RT_PRIORITY")) {
+        try {
+            priority = std::stoi(rtPriorityEnv);
+        } catch (...) {
+            std::cerr << "Ignoring invalid CINEPI_AUDIO_RT_PRIORITY value\n";
+        }
+    }
+
+    const int minPriority = sched_get_priority_min(SCHED_FIFO);
+    const int maxPriority = sched_get_priority_max(SCHED_FIFO);
+    if (minPriority < 0 || maxPriority < 0) {
+        std::cerr << "SCHED_FIFO priority range unavailable; leaving capture at default scheduling\n";
+        return;
+    }
+    priority = std::clamp(priority, minPriority, maxPriority);
+
+    sched_param param{};
+    param.sched_priority = priority;
+    if (sched_setscheduler(0, SCHED_FIFO, &param) == 0) {
+        std::cerr << "Capture thread elevated to SCHED_FIFO priority " << priority << "\n";
+    } else {
+        const int savedErrno = errno;
+        std::cerr << "Could not set SCHED_FIFO capture priority (" << std::strerror(savedErrno)
+                  << "); continuing at default scheduling. Grant CAP_SYS_NICE or raise the"
+                     " rtprio ulimit for xrun-resistant capture.\n";
+    }
+}
+
 } // namespace
 
 bool configurePlaybackPcm(snd_pcm_t *pcm,
@@ -387,8 +428,15 @@ int main(int argc, char **argv)
     if (!options.discardOutput)
         writeWaveHeader(output, options.channels, rate, formatInfo.bitsPerSample, 0);
 
+    // The idle monitor needs low latency for live VU/HDMI, but the record path has
+    // no live monitor — give it a large ring buffer so the capture thread can ride
+    // out DNG-writer storage stalls without overrunning. An overrun discards the
+    // ALSA ring (dropped samples = silent holes in the WAV). 1 s of headroom covers
+    // the multi-hundred-ms stalls seen under 4K NVMe write load while keeping the
+    // end-of-take drain grace at its 1 s floor (a larger buffer would lengthen the
+    // post-stop drain). The wall-clock reconciliation backstops any rarer >1 s stall.
     unsigned int periodTimeUs = 10000;
-    unsigned int bufferTimeUs = 40000;
+    unsigned int bufferTimeUs = options.discardOutput ? 40000u : 1000000u;
     snd_pcm_hw_params_set_period_time_near(pcm, hw, &periodTimeUs, &dir);
     snd_pcm_hw_params_set_buffer_time_near(pcm, hw, &bufferTimeUs, &dir);
 
@@ -396,6 +444,19 @@ int main(int argc, char **argv)
         std::cerr << "Failed to apply ALSA capture parameters: " << snd_strerror(err) << '\n';
         snd_pcm_close(pcm);
         return 1;
+    }
+
+    {
+        snd_pcm_uframes_t negotiatedBuffer = 0;
+        if (snd_pcm_hw_params_get_buffer_size(hw, &negotiatedBuffer) == 0) {
+            const unsigned long long bufMs =
+                static_cast<unsigned long long>(negotiatedBuffer) * 1000ULL /
+                (rate > 0 ? rate : 48000);
+            std::cerr << "Capture ring buffer: " << negotiatedBuffer << " frames (~"
+                      << bufMs << " ms)"
+                      << (options.discardOutput ? " [idle monitor]" : " [record]")
+                      << '\n';
+        }
     }
 
     snd_pcm_t *monitorPcm = nullptr;
@@ -439,6 +500,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // Keep the ALSA read loop scheduled ahead of DNG-writer storage I/O so xruns
+    // (and the drift they cause) do not accumulate under heavy 4K / exFAT load.
+    if (!options.discardOutput)
+        tryElevateRealtimePriority();
+
     const timespec triggerMono = currentClock(CLOCK_MONOTONIC);
     const timespec triggerReal = currentClock(CLOCK_REALTIME);
 
@@ -457,6 +523,66 @@ int main(int argc, char **argv)
     std::optional<std::chrono::steady_clock::time_point> drainDeadline;
     const auto drainGrace =
         std::chrono::milliseconds(std::max<unsigned int>(1000, bufferTimeUs / 1000));
+
+    // Decouple capture from disk I/O so exFAT write stalls (which block write()
+    // calls for hundreds of ms under 4K DNG-writer pressure) never stall the ALSA
+    // read loop and cause sample loss. The capture thread pushes audio into a RAM
+    // queue; the writer thread drains it to disk independently.
+    struct WriteQueue {
+        std::queue<std::vector<uint8_t>> items;
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::atomic<bool> done{false};
+        std::atomic<bool> error{false};
+    };
+    WriteQueue wq;
+
+    std::thread writerThread;
+    if (!options.discardOutput) {
+        writerThread = std::thread([&]() {
+            while (true) {
+                std::unique_lock<std::mutex> lock(wq.mtx);
+                wq.cv.wait(lock, [&] { return !wq.items.empty() || wq.done.load(); });
+                while (!wq.items.empty()) {
+                    auto buf = std::move(wq.items.front());
+                    wq.items.pop();
+                    lock.unlock();
+                    output.write(reinterpret_cast<const char *>(buf.data()),
+                                 static_cast<std::streamsize>(buf.size()));
+                    if (!output.good()) {
+                        wq.error.store(true);
+                        std::cerr << "WAV writer: disk write failed\n";
+                    }
+                    lock.lock();
+                }
+                if (wq.done.load())
+                    break;
+            }
+        });
+    }
+
+    // Push an audio chunk to the writer thread. Caller updates framesCaptured /
+    // dataBytes so the wall-clock reconciliation stays accurate regardless of how
+    // much data the writer thread has actually flushed to disk.
+    auto enqueueAudio = [&](const uint8_t *data, size_t bytes) {
+        {
+            std::lock_guard<std::mutex> lock(wq.mtx);
+            wq.items.emplace(data, data + bytes);
+        }
+        wq.cv.notify_one();
+    };
+
+    // Running wall-clock anchor. Each successful read reconciles total frames
+    // written against elapsed real time and pads any shortfall with silence, so the
+    // WAV stays locked to wall-clock length whether samples were lost to an ALSA
+    // xrun (-EPIPE) OR silently under-delivered by the USB device (no error raised
+    // at all — invisible to a -EPIPE-gated fill). Anchor is set on the first read.
+    std::optional<std::chrono::steady_clock::time_point> captureAnchorMono;
+    const long long maxGapFrames = static_cast<long long>(rate) * 5;
+    // Pad only past one period of shortfall so normal scheduling jitter never
+    // injects silence; sub-period losses accumulate against the fixed anchor and
+    // get padded once they cross the threshold, so nothing leaks permanently.
+    const long long reconcileToleranceFrames = static_cast<long long>(periodFrames);
 
     while (true) {
         snd_pcm_sframes_t framesToRead = static_cast<snd_pcm_sframes_t>(periodFrames);
@@ -486,6 +612,8 @@ int main(int argc, char **argv)
         snd_pcm_sframes_t framesRead =
             snd_pcm_readi(pcm, buffer.data(), framesToRead);
         if (framesRead == -EINTR && stopRequested.load()) {
+            if (options.discardOutput)
+                break; // No drain needed in discard mode; release dsnoop immediately.
             if (!draining) {
                 draining = true;
                 drainDeadline = std::chrono::steady_clock::now() + drainGrace;
@@ -498,6 +626,8 @@ int main(int argc, char **argv)
                 std::cerr << "Capture read failed: " << snd_strerror(err) << '\n';
                 break;
             }
+            // Dropped samples (xrun). The running wall-clock reconciliation on the
+            // next good read pads the gap, keeping the WAV aligned to real time.
             continue;
         }
 
@@ -506,14 +636,42 @@ int main(int argc, char **argv)
             emittedFirstBufferAfter = true;
         }
 
+        // Reconcile against the running wall-clock anchor BEFORE writing this read's
+        // audio, so inserted silence lands in the gap that opened *before* these
+        // samples. In steady state expected ≈ written and nothing is padded; when
+        // frames went missing (xrun OR silent under-delivery) expected outruns
+        // written and we insert exactly the shortfall.
+        const auto nowMono = std::chrono::steady_clock::now();
+        if (!captureAnchorMono)
+            captureAnchorMono = nowMono;
+        if (!options.discardOutput && !draining) {
+            const double elapsedSeconds =
+                std::chrono::duration<double>(nowMono - *captureAnchorMono).count();
+            const long long shortfallFrames =
+                std::llround(elapsedSeconds * static_cast<double>(rate)) -
+                static_cast<long long>(framesCaptured);
+            if (shortfallFrames > reconcileToleranceFrames) {
+                const long long gapFrames = std::min(shortfallFrames, maxGapFrames);
+                const size_t silenceBytes = static_cast<size_t>(gapFrames) * frameBytes;
+                const std::vector<uint8_t> silence(silenceBytes, 0);
+                enqueueAudio(silence.data(), silenceBytes);
+                dataBytes += static_cast<uint64_t>(silenceBytes);
+                framesCaptured += static_cast<uint64_t>(gapFrames);
+                std::cerr << "Inserted " << gapFrames
+                          << " silent frame(s) to cover a capture shortfall of "
+                          << std::fixed << std::setprecision(3)
+                          << (static_cast<double>(gapFrames) / static_cast<double>(rate))
+                          << "s; WAV stays aligned to wall clock\n";
+            }
+        }
+
         const size_t bytesRead = static_cast<size_t>(framesRead) * frameBytes;
         if (!options.discardOutput) {
-            output.write(reinterpret_cast<const char *>(buffer.data()),
-                         static_cast<std::streamsize>(bytesRead));
-            if (!output.good()) {
-                std::cerr << "Failed to write WAV payload\n";
+            if (wq.error.load()) {
+                std::cerr << "Stopping capture after WAV writer disk error\n";
                 break;
             }
+            enqueueAudio(buffer.data(), bytesRead);
         }
 
         dataBytes += static_cast<uint64_t>(bytesRead);
@@ -534,9 +692,21 @@ int main(int argc, char **argv)
         }
 
         if (stopRequested.load() && !draining) {
+            if (options.discardOutput)
+                break; // No drain needed in discard mode; release dsnoop immediately.
             draining = true;
             drainDeadline = std::chrono::steady_clock::now() + drainGrace;
         }
+    }
+
+    // Drain the writer queue before touching the output stream again.
+    if (!options.discardOutput && writerThread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(wq.mtx);
+            wq.done.store(true);
+        }
+        wq.cv.notify_one();
+        writerThread.join();
     }
 
     std::cout << "<SAMPLES_CAPTURED: " << framesCaptured << ">\n";
@@ -560,5 +730,15 @@ int main(int argc, char **argv)
 
     snd_pcm_drop(pcm);
     snd_pcm_close(pcm);
+
+    // Signal to the parent (cinepi_sound) that the dsnoop capture PCM has been
+    // fully released.  The parent waits for this marker (or a short settle period)
+    // before launching the recorder so the recorder always opens a cold dsnoop
+    // connection with zero pre-start backlog.
+    if (options.discardOutput) {
+        std::cout << "<AUDIO_MONITOR_RELEASED>\n";
+        std::cout.flush();
+    }
+
     return 0;
 }
