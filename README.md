@@ -214,6 +214,12 @@ Applied 24-bit USB capture WAV metadata timecode offset: +2 frames; PCM timing u
 
   This example pins encode workers to CPUs 4–5 with a higher priority while leaving disk flush threads on the little cores with a lower scheduling priority.
   
+## ISO and the DNG decode pipeline
+
+At capture, ISO is real analog gain applied on the sensor — it changes the recorded raw pixel values. Setting it too high introduces noise that is baked into the data and cannot be removed in post.
+
+Once your DNGs are in Resolve's Camera RAW tab, the pixel values on disk are fixed. ISO there is a decode-time parameter. In Gen 4 color science, changing it selects a different log curve that shifts contrast as well as brightness. In Gen 5, ISO and the Exposure slider are equivalent — both apply a linear gain at decode. In either case, correcting a wrong ISO in Resolve costs no additional quality, as long as the original sensor data was not catastrophically over- or underexposed at capture.
+
 ## Audio recording
 
 - Places WAV output alongside  DNG take (`media/RAW/<folder>.wav`).
