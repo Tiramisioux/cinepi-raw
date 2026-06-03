@@ -428,10 +428,12 @@ int main(int argc, char **argv)
     // The idle monitor needs low latency for live VU/HDMI, but the record path has
     // no live monitor — give it a large ring buffer so the capture thread can ride
     // out DNG-writer storage stalls without overrunning. An overrun discards the
-    // ALSA ring (dropped samples = silent holes in the WAV); 2 s of headroom absorbs
-    // the multi-hundred-ms stalls seen under 4K NVMe write load.
+    // ALSA ring (dropped samples = silent holes in the WAV). 1 s of headroom covers
+    // the multi-hundred-ms stalls seen under 4K NVMe write load while keeping the
+    // end-of-take drain grace at its 1 s floor (a larger buffer would lengthen the
+    // post-stop drain). The wall-clock reconciliation backstops any rarer >1 s stall.
     unsigned int periodTimeUs = 10000;
-    unsigned int bufferTimeUs = options.discardOutput ? 40000u : 2000000u;
+    unsigned int bufferTimeUs = options.discardOutput ? 40000u : 1000000u;
     snd_pcm_hw_params_set_period_time_near(pcm, hw, &periodTimeUs, &dir);
     snd_pcm_hw_params_set_buffer_time_near(pcm, hw, &bufferTimeUs, &dir);
 
