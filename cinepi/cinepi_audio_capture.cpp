@@ -22,6 +22,7 @@
 #include <queue>
 #include <sched.h>
 #include <sys/prctl.h>
+#include <unistd.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -231,13 +232,21 @@ int recoverCaptureError(snd_pcm_t *handle, int err)
     return err;
 }
 
-// Raise the calling (capture) thread to SCHED_FIFO so heavy DNG-writer storage
-// I/O (heavier and blockier on exFAT than ext4) cannot preempt the ALSA read
-// loop long enough to drop samples and drift the take. Degrades gracefully
-// without RT privileges. Tunable via CINEPI_AUDIO_RT_PRIORITY.
+// Raise the capture thread to SCHED_FIFO and pin it to the last CPU core so
+// DNG-writer threads never share that core. On Pi 4/5 the NVMe SSD and USB
+// mic share the same xHCI USB controller; a 4K DNG burst causes USB interrupt
+// latency that stalls ALSA reads even with SCHED_FIFO if the capture thread
+// is competing for CPU time with DNG workers. Pinning audio to an exclusive
+// core (the last one) eliminates that competition: the DNG-writer affinity
+// (set from cinemate via --disk-affinity / --encode-affinity) avoids that same
+// core, so the audio interrupt is always serviced immediately.
+//
+// Priority defaults to 80 — well above DNG workers (SCHED_NORMAL) and below
+// kernel RT threads (~99). Overridable via CINEPI_AUDIO_RT_PRIORITY env var.
 void tryElevateRealtimePriority()
 {
-    int priority = 20;
+    // ── SCHED_FIFO priority ───────────────────────────────────────────────
+    int priority = 80;
     if (const char *rtPriorityEnv = std::getenv("CINEPI_AUDIO_RT_PRIORITY")) {
         try {
             priority = std::stoi(rtPriorityEnv);
@@ -263,6 +272,25 @@ void tryElevateRealtimePriority()
         std::cerr << "Could not set SCHED_FIFO capture priority (" << std::strerror(savedErrno)
                   << "); continuing at default scheduling. Grant CAP_SYS_NICE or raise the"
                      " rtprio ulimit for xrun-resistant capture.\n";
+    }
+
+    // ── CPU isolation: pin to last core ──────────────────────────────────
+    // Keeps the capture thread on a core the DNG writers are told to avoid
+    // (via --disk-affinity / --encode-affinity passed from cinemate), so
+    // USB audio interrupts are always dispatched to an uncontested CPU.
+    const long nCpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nCpus > 1) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        const int audioCpu = static_cast<int>(nCpus) - 1;
+        CPU_SET(audioCpu, &cpuset);
+        if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+            std::cerr << "Capture thread pinned to CPU " << audioCpu
+                      << " (of " << nCpus << " available)\n";
+        } else {
+            std::cerr << "Could not pin capture thread to CPU " << audioCpu
+                      << "; running on any core\n";
+        }
     }
 }
 
