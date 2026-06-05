@@ -376,8 +376,9 @@ static void unpack_pisp_comp1_row_to_packed12(const uint8_t *src, uint8_t *dst, 
         uint16_t working[8] {};
         uint8_t packed[12] {};
         decode_pisp_comp1_block(src, working);
-        pack_row_16_to_12bit(working, packed, remaining);
-        std::memcpy(dst + (static_cast<size_t>(x) / 2u) * 3u, packed, (remaining * 12u + 7u) / 8u);
+        const uint32_t tail = std::min(remaining, 8u);
+        pack_row_16_to_12bit(working, packed, tail);
+        std::memcpy(dst + (static_cast<size_t>(x) / 2u) * 3u, packed, (tail * 12u + 7u) / 8u);
     }
 }
 
@@ -952,19 +953,18 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(0xC614, TIFF_ASCII, ucm_tag_.size(), ucm_tag_.data());
 
     /* ▸ CinemaDNG tag 0xC764  –  FrameRate (SRATIONAL) */
-
-    // fallback: use CLI --framerate (same behaviour as old encoder)
+    // Use the configured frame rate. The FrameDuration metadata path that
+    // was here previously embedded the sensor's quantised register period
+    // (e.g. 25.011 for a 25 fps target) due to VMAX/HMAX rounding. With
+    // the IMX585 getBlanking patch the sensor delivers the nominal rate
+    // exactly, and using the configured value is correct for all sensors.
+    // The denominator of 1000 gives three decimal places of precision for
+    // fractional rates such as 23.976.
+    double fps = options_->framerate.value_or(DEFAULT_FRAMERATE);
     int32_t fpsRat[2] = {
-        static_cast<int32_t>(*options_->framerate + 0.5),   // numerator
-        1000                                                      // denominator
+        static_cast<int32_t>(std::round(fps * 1000)),  // e.g. 25000 for 25 fps
+        1000
     };
-
-    // preferred: per-frame value from libcamera metadata
-    if (auto fd = metadata.get(controls::FrameDuration); fd && *fd > 0)
-    {
-        double fps = 1e9 / static_cast<double>(*fd);              // ns → fps
-        fpsRat[0] = static_cast<int32_t>(fps + 0.5);       // numerator
-    }
 
     ifd.addEntry(0xC764, TIFF_SRATIONAL, 1, fpsRat);
 

@@ -211,8 +211,6 @@ bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
     if (buffer_it == completed_request->buffers.end() || !buffer_it->second)
         return false;
 
-    auto startOverall = std::chrono::high_resolution_clock::now();
-
     auto startWriteSync = std::chrono::high_resolution_clock::now();
     BufferReadSync r(app_, buffer_it->second);
     auto endWriteSync = std::chrono::high_resolution_clock::now();
@@ -229,8 +227,6 @@ bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
     auto startPublish = std::chrono::high_resolution_clock::now();
     streamer_->publish("/stream", std::string(jpegBuffer.begin(), jpegBuffer.end()));
     auto endPublish = std::chrono::high_resolution_clock::now();
-
-    auto endOverall = std::chrono::high_resolution_clock::now();
 
     // Logging the durations
     console->trace("Duration of WriteSync: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endWriteSync - startWriteSync).count());

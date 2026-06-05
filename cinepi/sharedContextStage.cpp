@@ -39,7 +39,7 @@ struct SharedMetadata {
 };
 
 struct SharedMemoryBuffer {
-    SharedMemoryBuffer() : fd_raw(-1), fd_isp(-1), fd_lores(-1), frame(-1), procid(-1) {}
+    SharedMemoryBuffer() : fd_raw(-1), fd_isp(-1), fd_lores(-1), procid(-1), frame(-1) {}
     int fd_raw;
     int fd_isp;
     int fd_lores;
