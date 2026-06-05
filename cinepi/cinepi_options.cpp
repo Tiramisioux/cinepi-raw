@@ -215,7 +215,7 @@ CinePiOptions::CinePiOptions()
                 ("unique-camera-model",
                     value<std::string>(),
                     "Override the DNG UniqueCameraModel tag "
-                    "(default: \"Blackmagic Pocket Cinema Camera 4K\")");
+                    "(default: \"cinepi\")");
         options_.add(cinepi_group);
 }
 
