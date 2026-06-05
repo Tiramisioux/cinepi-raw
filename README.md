@@ -128,7 +128,7 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-rawâ
 | `--audio-clock-ppm <int>` | `0`     | ADC clock correction in parts-per-million. `0` disables correction (default). |
 | `--plain-arecord-timecode-offset-frames <int>` | `0` | Frame offset added to the 16-bit plain `arecord` WAV metadata timecode. PCM is not shifted. |
 | `--audio-timecode-offset-frames <int>` | `0` | Frame offset added to the 24-bit USB-capture WAV metadata timecode. PCM is not shifted. |
-| `--unique-camera-model <string>` | `"Blackmagic Pocket Cinema Camera 4K"` | Override the `UniqueCameraModel` DNG tag embedded in every recorded frame. Cinemate can set this automatically from `camera.camera_name` in `settings.json`; pass it manually only when running `cinepi-raw` directly. |
+| `--unique-camera-model <string>` | `"cinepi"` | Override the `UniqueCameraModel` DNG tag embedded in every recorded frame. Cinemate sets this automatically when `override_camera_name: true` and a `camera_name` are set under `camera.cam0` / `camera.cam1` in `settings.json`; pass it manually only when running `cinepi-raw` directly. |
 
 ### ADC clock correction (`--audio-clock-ppm`)
 
