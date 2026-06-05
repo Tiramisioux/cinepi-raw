@@ -603,11 +603,11 @@ int main(int argc, char **argv)
     // at all — invisible to a -EPIPE-gated fill). Anchor is set on the first read.
     std::optional<std::chrono::steady_clock::time_point> captureAnchorMono;
     const long long maxGapFrames = static_cast<long long>(rate) * 5;
-    // Fill on shortfalls > 1/8 period (~2.7ms at 48kHz). This is above steady-clock
+    // Fill on shortfalls > 1/16 period (~1.3ms at 48kHz). This is above steady-clock
     // scheduling jitter on a SCHED_FIFO-isolated core (~0.5ms) but below the
     // smallest real contention stall, so micro-losses from exFAT metadata pressure
     // are filled before they accumulate across periods into audible drift.
-    const long long reconcileToleranceFrames = static_cast<long long>(periodFrames) / 8;
+    const long long reconcileToleranceFrames = static_cast<long long>(periodFrames) / 16;
 
     while (true) {
         const snd_pcm_sframes_t framesToRead = static_cast<snd_pcm_sframes_t>(periodFrames);
