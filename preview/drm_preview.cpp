@@ -330,8 +330,8 @@ DrmPreview::DrmPreview(Options const *options,
                        std::optional<uint32_t> connector)
     : Preview(options)
     , last_fd_(-1)
-    , forced_connector_(connector)
     , first_time_(true)
+    , forced_connector_(connector)
 
 {
 	drmfd_ = drmOpen("vc4", NULL);
