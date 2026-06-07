@@ -528,13 +528,35 @@ void DngEncoder::configureThreadContext(const std::string &baseName,
     std::vector<int> cpus_to_pin;
     if (affinity && !affinity->empty())
     {
-        if (affinity->size() >= total)
+        /* ── Audio-core isolation guard ───────────────────────────────────
+         * cinepi-audio-capture pins itself to the last online core at
+         * SCHED_FIFO priority 80 (see cinepi_audio_capture.cpp). DNG encode
+         * and disk workers must never share that core, or the USB-audio
+         * capture loop stalls and the WAV loses sync. Strip the audio core
+         * from any requested set here so a storage recorder profile can never
+         * place workers on it (a stale ext4 "2-3" on a 4-core Pi would).
+         * No-op when the audio core was not requested. Skipped on <=2 cores,
+         * where there is nothing to isolate. */
+        std::vector<int> safe_affinity;
+        const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        const int audio_core = (online_cpus > 2) ? static_cast<int>(online_cpus) - 1 : -1;
+        for (int cpu : *affinity)
+            if (cpu != audio_core)
+                safe_affinity.push_back(cpu);
+        if (safe_affinity.empty())   /* only the audio core was requested */
+            for (int cpu = 0; cpu < static_cast<int>(online_cpus) - 1; ++cpu)
+                safe_affinity.push_back(cpu);
+        if (console && audio_core >= 0 && safe_affinity.size() != affinity->size())
+            console->info("{}: excluded audio core {} from requested affinity",
+                          name, audio_core);
+
+        if (safe_affinity.size() >= total)
         {
-            cpus_to_pin.push_back((*affinity)[index % affinity->size()]);
+            cpus_to_pin.push_back(safe_affinity[index % safe_affinity.size()]);
         }
         else
         {
-            cpus_to_pin.assign(affinity->begin(), affinity->end());
+            cpus_to_pin.assign(safe_affinity.begin(), safe_affinity.end());
         }
 
         cpu_set_t cpu_mask;
