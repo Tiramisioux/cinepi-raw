@@ -39,6 +39,7 @@ public:
 		originationDate.fill(0);
 		index_ = 0;
 		tc_origin_set_ = false;   // force re-capture of wall-clock origin on next frame
+		tc_frame_count_ = 0;      // prevent stale value from previous take appearing in stats
 		dropped_frames_ = 0;
 		buffer_hwm_.store(0, std::memory_order_relaxed);  // reset disk-backlog high-water mark
 	}
@@ -99,6 +100,7 @@ public:
 	void reset_encoder(){
 		encoder_initialized_ = false;
 	}
+    uint64_t getWallClockTimestampUs() const { return wallclock_ts_us_; }
     bool buffer_full()           // inline definition
     {
         std::lock_guard<std::mutex> lk(ram_mtx_);

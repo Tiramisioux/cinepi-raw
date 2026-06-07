@@ -181,7 +181,11 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
             // their embedded folder path; only the disk_buffer_ backlog is
             // dropped here.
             app.GetEncoder()->clearPool();
-			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
+            // Use the sensor-derived wall-clock set by process() for this
+            // frame so the folder FXX equals llround(sub_us × fps / 1e6),
+            // which is exactly how the DNG TC origin sub_frames is computed.
+            uint64_t wall_ts_us = app.GetEncoder()->getWallClockTimestampUs();
+			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber(), wall_ts_us);
             if (controller.folderOpen)
                 sound.record_start();
             app.GetEncoder()->resetFrameCount(); // folder already open

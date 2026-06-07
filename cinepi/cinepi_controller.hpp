@@ -113,17 +113,6 @@ class CinePIController : public CinePIState
         if (!disk_mounted(options_))
             return 0;
 
-        /* helper: guarantee we have a writable directory (race-safe) */
-        auto ensure_folder = [this]()
-        {
-            if (!folderOpen)                                            // first cam
-                folderOpen = create_clip_folder(app_->GetOptions(),
-                                                getClipNumber());
-            /*  after the change in utils.cpp create_clip_folder() now returns
-                true even if the directory already exists, so the second camera
-                will immediately get folderOpen == true as well. */
-        };
-
         /* ── 1. EDGE-trigger coming from UI / GPIO ─────────────────────────── */
         if (trigger_ != 0)
         {
@@ -132,7 +121,9 @@ class CinePIController : public CinePIState
 
             if (state > 0)                          /* ↑ start */
             {
-                ensure_folder();
+                // Folder creation is handled by cinepi_raw.cpp after this
+                // returns, using the sensor-derived wall-clock timestamp so
+                // the folder FXX matches the DNG TC origin exactly.
                 setRecording(true);
                 is_recording_  = true;
                 baseline_flag_ = 1;                 // keep level in sync
@@ -163,7 +154,6 @@ class CinePIController : public CinePIState
 
             if (rec_flag && !is_recording_)         // already rolling → join
             {
-                ensure_folder();
                 setRecording(true);
                 is_recording_ = true;
                 return +1;
@@ -179,7 +169,6 @@ class CinePIController : public CinePIState
             if (rec_flag && !is_recording_)         /* rising edge → start */
             {
                 console->info("Safety-net started recording (late-join).");
-                ensure_folder();
                 setRecording(true);
                 is_recording_ = true;
                 return +1;
