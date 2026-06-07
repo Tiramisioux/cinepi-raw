@@ -172,6 +172,15 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		int trigger = controller.triggerRec();
 
         if (trigger > 0) {                       // recording just started
+            // Drop any frames still queued from the previous take before
+            // opening the new clip folder.  This covers the case where the
+            // operator presses rec while the buffer is still flushing (green
+            // state): without this, the watchdog could see a high buffer fill
+            // from the old take and auto-stop the new recording immediately.
+            // Frames in encode_queue_ finish writing to the OLD folder via
+            // their embedded folder path; only the disk_buffer_ backlog is
+            // dropped here.
+            app.GetEncoder()->clearPool();
 			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
             if (controller.folderOpen)
                 sound.record_start();
@@ -191,13 +200,10 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		{
 			if (app.GetEncoder()->buffer_full())
 			{
-				if (justStarted)
-				{
-					// first frame after you hit Record: clear and go on
-					app.GetEncoder()->clearPool();
-					console->warn("RAM pool was full at start — cleared and continuing");
-				}
-				else
+				// Buffer still full after clearPool() — encode_queue_ items
+				// from the old take are draining.  Let the first frame through;
+				// the encoder will consume a permit and continue.
+				if (!justStarted)
 				{
 					controller.setRecording(false);
 					console->warn("RAM pool exhausted — recording stopped");
