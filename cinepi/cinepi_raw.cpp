@@ -172,15 +172,13 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		int trigger = controller.triggerRec();
 
         if (trigger > 0) {                       // recording just started
-            // Drop any frames still queued from the previous take before
-            // opening the new clip folder.  This covers the case where the
-            // operator presses rec while the buffer is still flushing (green
-            // state): without this, the watchdog could see a high buffer fill
-            // from the old take and auto-stop the new recording immediately.
-            // Frames in encode_queue_ finish writing to the OLD folder via
-            // their embedded folder path; only the disk_buffer_ backlog is
-            // dropped here.
-            app.GetEncoder()->clearPool();
+            // Nothing is dropped here.  The previous take's buffered frames
+            // (encode_queue_ awaiting compression and disk_buffer_ awaiting
+            // write) are left to finish flushing to their own clip folder, so
+            // no recorded frame is lost.  Cinemate blocks the rec trigger while
+            // the green is_writing_buf flush is in progress, so by the time a
+            // start edge reaches us the RAM buffer has already drained and the
+            // new take begins with free buffers.
             // Use the sensor-derived wall-clock set by process() for this
             // frame so the folder FXX equals llround(sub_us × fps / 1e6),
             // which is exactly how the DNG TC origin sub_frames is computed.
@@ -204,9 +202,10 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		{
 			if (app.GetEncoder()->buffer_full())
 			{
-				// Buffer still full after clearPool() — encode_queue_ items
-				// from the old take are draining.  Let the first frame through;
-				// the encoder will consume a permit and continue.
+				// Buffer still full at the first frame of a new take — the
+				// previous take's frames had not finished draining yet.  Let
+				// the first frame through (justStarted); only a steady-state
+				// take that fills RAM should stop here.
 				if (!justStarted)
 				{
 					controller.setRecording(false);

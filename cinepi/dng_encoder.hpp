@@ -126,10 +126,6 @@ public:
 	/* ---- PUBLIC: number of frame buffers that fit in RAM ---- */
 	size_t maxRamBuffers() const { return max_ram_buffers_; }
 
-	/// Drain any queued frames and free their buffers so that
-	/// buffer_full() will return false again.
-	void clearPool();
-
 private:
     /* NEW – cached wall-clock timestamp (0 = not set yet) */
     uint64_t wallclock_ts_us_ { 0 };

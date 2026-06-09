@@ -1313,25 +1313,6 @@ void DngEncoder::diskThread(int num)
     }
 }
 
-void DngEncoder::clearPool()
-{
-    // 1) Drain any pending disk items (free their mem_bufs)
-    {
-        std::lock_guard<std::mutex> lock(disk_mutex_);
-        while (!disk_buffer_.empty()) {
-            auto &item = disk_buffer_.front();
-            releasePooledBuffer(static_cast<uint8_t *>(item.mem_buf));
-            // return permit
-            {
-                std::lock_guard<std::mutex> lk(ram_mtx_);
-                if (ram_buffers_ > 0) --ram_buffers_;
-            }
-            disk_buffer_.pop();
-        }
-        ram_cv_.notify_all();
-    }
-}
-
 uint8_t *DngEncoder::acquirePooledBuffer()
 {
     const size_t required_size = dng_info.buffer_size;
