@@ -13,6 +13,7 @@
  #include <libcamera/formats.h>     // libcamera::formats::
  #include <cmath>
 #include <cstring>
+#include <cerrno>
  #include <stdexcept>
  #include <iomanip>
  
@@ -1269,12 +1270,31 @@ void DngEncoder::diskThread(int num)
 
             // Always use actual used size returned by dng_save
             ssize_t bytes_written = write(fd, disk_item.mem_buf, disk_item.size);
-            if (bytes_written < 0 || static_cast<size_t>(bytes_written) != disk_item.size) {
+            bool write_ok = (bytes_written >= 0 &&
+                             static_cast<size_t>(bytes_written) == disk_item.size);
+            if (!write_ok) {
+                int werr = errno;
+                write_failures_.fetch_add(1, std::memory_order_relaxed);
                 perror("Error writing to file");
+                console->error("DNG write FAILED ({}): wrote {} of {} bytes - {}",
+                               filename, bytes_written, disk_item.size, strerror(werr));
             }
-            close(fd);
+            // close() can surface deferred write-back errors that write() did
+            // not report (common on FUSE/ntfs-3g and network filesystems).
+            // Count those too, but only when the write itself looked OK so a
+            // single lost frame is not counted twice.
+            if (close(fd) != 0 && write_ok) {
+                int cerr = errno;
+                write_failures_.fetch_add(1, std::memory_order_relaxed);
+                console->error("DNG write FAILED on close ({}) - {}",
+                               filename, strerror(cerr));
+            }
         } else {
+            int oerr = errno;
+            write_failures_.fetch_add(1, std::memory_order_relaxed);
             perror("Failed to open file for writing");
+            console->error("DNG write FAILED to open ({}) - {}",
+                           filename, strerror(oerr));
         }
 
         // Clean up

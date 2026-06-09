@@ -41,6 +41,7 @@ public:
 		tc_origin_set_ = false;   // force re-capture of wall-clock origin on next frame
 		tc_frame_count_ = 0;      // prevent stale value from previous take appearing in stats
 		dropped_frames_ = 0;
+		write_failures_.store(0, std::memory_order_relaxed);  // reset disk-write-failure count
 		buffer_hwm_.store(0, std::memory_order_relaxed);  // reset disk-backlog high-water mark
 	}
 
@@ -83,6 +84,15 @@ public:
 	// display continuity — those are jitter, not missing writes.
 	int64_t getDroppedFrames() const {
 		return dropped_frames_;
+	}
+
+	// Frames that were delivered and encoded but could NOT be written to disk
+	// (open/write/close failure or short write). Distinct from getDroppedFrames():
+	// a storage device that cannot keep up — e.g. NTFS under sustained 4K — loses
+	// frames here with NO inter-frame sensor gap, so this is the only live signal
+	// for write-stage data loss. Counted across all disk worker threads.
+	int64_t getWriteFailures() const {
+		return write_failures_.load(std::memory_order_relaxed);
 	}
 
 	uint16_t photometric;
@@ -129,6 +139,7 @@ private:
     uint64_t tc_last_ts_us_  { 0 };    // ts_us of the previous frame, for delta-based counting
     int64_t  tc_frame_count_ { 0 };    // monotonic TC counter (display); +1 floor keeps it forward
     int64_t  dropped_frames_ { 0 };    // frames with no DNG written (inter-frame gap ≥ 2 periods)
+    std::atomic<int64_t> write_failures_ { 0 };  // frames lost at disk write (open/write/close fail or short write)
     int      tc_start_hh_    { 0 };
     int      tc_start_mm_    { 0 };
     int      tc_start_ss_    { 0 };

@@ -262,6 +262,7 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     data["frameCount"]    = app_->GetEncoder()->getFrameCount();
     data["tcFrameCount"]  = static_cast<Json::Int64>(app_->GetEncoder()->getTcFrameCount());
     data["droppedFrames"] = static_cast<Json::Int64>(app_->GetEncoder()->getDroppedFrames());
+    data["writeFailures"] = static_cast<Json::Int64>(app_->GetEncoder()->getWriteFailures());
     data["bufferSize"]    = app_->GetEncoder()->bufferSize();
     data["bufferSizeMax"] = app_->GetEncoder()->bufferSizeMaxAndReset();
     data["timestamp"]  = static_cast<Json::Int64>(epoch_ns);   // ← TOD ns
