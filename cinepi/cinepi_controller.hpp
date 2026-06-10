@@ -7,6 +7,8 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cmath>
+#include <algorithm>
 
 //external dependancies
 #include <sw/redis++/redis++.h>
@@ -90,6 +92,16 @@ class CinePIController : public CinePIState
         }
 
         void process(CompletedRequestPtr &completed_request);
+
+        // Closed-loop frame-rate phase lock. Drives the recorded frame cadence
+        // onto the operator's nominal fps (fps_user) by trimming
+        // FrameDurationLimits frame-to-frame; the integer-VBLANK quantisation is
+        // dithered out (first-order sigma-delta) so the *average* rate is exact.
+        // VBLANK-only: never touches HMAX/line length. No-op unless enabled and
+        // recording. Closed-loop, so it idles harmlessly if the sensor is already
+        // on target (e.g. a future exact-rate libcamera patch).
+        void updatePhaseLock(int64_t sensorTsNs);
+
         void process_stream_info(libcamera::StreamConfiguration const &cfg){
 
             Json::Value data;
@@ -206,6 +218,18 @@ class CinePIController : public CinePIState
         // }
 
         bool ready_announced_ = false;
+
+        // ── Frame-rate phase lock (sigma-delta VBLANK dither) ───────────────
+        std::atomic_bool phaseLockEnabled_{false};   // runtime enable (redis)
+        double   pllKi_         = 0.05;   // integral gain (us duration per us err)
+        double   pllDeadbandUs_ = 4.0;    // freeze integration below this |err|
+        bool     pllActive_     = false;  // lock currently running this take
+        int64_t  pllT0Ns_       = 0;      // sensor ts at lock start
+        uint64_t pllFrameCount_ = 0;      // frames since lock start
+        double   pllTargetFps_  = 0.0;    // nominal target (fps_user)
+        double   pllBaseDurUs_  = 0.0;    // ideal period 1e6/target (us)
+        double   pllReqDurUs_    = 0.0;   // current requested duration (us, float)
+        long     pllLastDurUs_  = -1;     // last duration pushed to FrameDurationLimits
 
         int baseline_flag_{0};          // remembers last seen is_recording level
 

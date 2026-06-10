@@ -164,6 +164,22 @@ void CinePIController::sync(){
     else
             redis_->set(CONTROL_KEY_ZOOM, std::to_string(options_->Zoom()));
 
+    // ── Frame-rate phase-lock config (write defaults if the keys are absent) ──
+    if (auto v = redis_->get(CONTROL_KEY_PHASE_LOCK); v && !v->empty()) {
+        try { phaseLockEnabled_.store(std::stoi(*v) != 0); } catch (...) {}
+    } else {
+        redis_->set(CONTROL_KEY_PHASE_LOCK, "0");
+    }
+    if (auto v = redis_->get(CONTROL_KEY_PLL_KI); v && !v->empty()) {
+        try { pllKi_ = std::stod(*v); } catch (...) {}
+    } else {
+        redis_->set(CONTROL_KEY_PLL_KI, std::to_string(pllKi_));
+    }
+    if (auto v = redis_->get(CONTROL_KEY_PLL_DEADBAND); v && !v->empty()) {
+        try { pllDeadbandUs_ = std::stod(*v); } catch (...) {}
+    } else {
+        redis_->set(CONTROL_KEY_PLL_DEADBAND, std::to_string(pllDeadbandUs_));
+    }
 
     console->critical(14);
 
@@ -298,6 +314,12 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
 
     const char *tc_key = (options_->CamPort() == "cam1") ? "tc_cam1" : "tc_cam0";
     redis_->set(tc_key, tc.str());
+
+    /* ────────────────────────────────────────────────────────────── */
+    /*  5. Closed-loop frame-rate phase lock (uses the monotonic       */
+    /*     SensorTimestamp; no-op unless enabled + recording)          */
+    /* ────────────────────────────────────────────────────────────── */
+    updatePhaseLock(info.ts);
 }
 
 
@@ -508,6 +530,18 @@ void CinePIController::mainThread(){
                 app_->SetControls(cl);
             }
         }},
+        { CONTROL_KEY_PHASE_LOCK, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                try { phaseLockEnabled_.store(std::stoi(*r) != 0); } catch (...) {}
+                console->info("Frame-rate phase lock {}", phaseLockEnabled_.load() ? "ENABLED" : "disabled");
+            }
+        }},
+        { CONTROL_KEY_PLL_KI, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) { try { pllKi_ = std::stod(*r); } catch (...) {} }
+        }},
+        { CONTROL_KEY_PLL_DEADBAND, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) { try { pllDeadbandUs_ = std::stod(*r); } catch (...) {} }
+        }},
         { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
             cameraInit_ = true;
             buffer_size_sent_ = false;
@@ -628,4 +662,82 @@ void CinePIController::mainThread(){
             // Handle exceptions.
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Closed-loop frame-rate phase lock                                  */
+/*                                                                     */
+/*  Integral controller on accumulated phase error, measured against   */
+/*  the monotonic SensorTimestamp. Output is FrameDurationLimits; the   */
+/*  integer-VBLANK quantisation downstream turns the smoothly-varying   */
+/*  request into a first-order sigma-delta dither between two adjacent  */
+/*  lines, so the *average* recorded cadence equals the operator's      */
+/*  nominal fps exactly — beating the ~half-line (~125 ppm) floor of a  */
+/*  single fixed correction factor. VBLANK-only: never touches HMAX, so */
+/*  the 4K line-length failure mode cannot recur. Closed-loop, so it    */
+/*  idles harmlessly if the sensor is already on target.                */
+/* ------------------------------------------------------------------ */
+void CinePIController::updatePhaseLock(int64_t sensorTsNs)
+{
+    /* Disabled or not recording: release the lock (the normal fps handler
+     * owns FrameDurationLimits) and re-arm for the next take. */
+    if (!phaseLockEnabled_.load() || !is_recording_) {
+        pllActive_ = false;
+        return;
+    }
+
+    if (!pllActive_) {
+        /* Arm at the first recorded frame. Target the operator's NOMINAL fps
+         * (fps_user) — the true intent — not the corrected hardware fps. */
+        double target = 0.0;
+        if (auto v = redis_->get("fps_user"); v && !v->empty()) {
+            try { target = std::stod(*v); } catch (...) { target = 0.0; }
+        }
+        if (target <= 1.0)
+            return;                          /* no valid target yet; retry next frame */
+        pllTargetFps_  = target;
+        pllBaseDurUs_  = 1.0e6 / target;     /* ideal period (us) */
+        pllReqDurUs_   = pllBaseDurUs_;       /* start from nominal */
+        pllT0Ns_       = sensorTsNs;
+        pllFrameCount_ = 0;
+        pllLastDurUs_  = -1;
+        pllActive_     = true;
+        return;                               /* this frame is the t0 datum */
+    }
+
+    pllFrameCount_++;
+    const double targetPeriodNs = 1.0e9 / pllTargetFps_;
+    const double idealNs   = static_cast<double>(pllFrameCount_) * targetPeriodNs;
+    const double elapsedNs = static_cast<double>(sensorTsNs - pllT0Ns_);
+    /* phaseErr > 0  → running slow / behind (need shorter frames)
+     * phaseErr < 0  → running fast / ahead  (need longer frames)        */
+    const double phaseErrUs = (elapsedNs - idealNs) * 1e-3;
+
+    /* Integrate only outside the deadband so the loop stops churning once the
+     * accumulated error is negligible (anti-jitter guard #1). */
+    if (std::abs(phaseErrUs) > pllDeadbandUs_)
+        pllReqDurUs_ -= pllKi_ * phaseErrUs;
+
+    /* Never wander far from nominal (anti-jitter guard #2 + safety net). */
+    const double kClampUs = 150.0;
+    pllReqDurUs_ = std::clamp(pllReqDurUs_,
+                              pllBaseDurUs_ - kClampUs,
+                              pllBaseDurUs_ + kClampUs);
+
+    /* Push the duration only when the integer-us value changes: this is where
+     * the integer-VBLANK quantisation produces the sigma-delta dither, and it
+     * caps control traffic to actual line flips (anti-jitter guard #3). */
+    const long durUs = std::lround(pllReqDurUs_);
+    if (durUs != pllLastDurUs_) {
+        pllLastDurUs_ = durUs;
+        long int dv[2] = { durUs, durUs };
+        libcamera::Span<const long int, 2> range(dv, 2);
+        libcamera::ControlList cl;
+        cl.set(libcamera::controls::FrameDurationLimits, range);
+        app_->SetControls(cl);
+    }
+
+    /* Telemetry for the test harness. */
+    redis_->set("pll_phase_err_us", std::to_string(std::lround(phaseErrUs)));
+    redis_->set("pll_req_dur_us", std::to_string(durUs));
 }
