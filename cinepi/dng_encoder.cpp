@@ -1179,17 +1179,48 @@ void DngEncoder::encodeThread(int num)
         /* ────────────────────────────────────────────────────── */
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        size_t tiff_size = dng_save(
-            num,
-            static_cast<const uint8_t *>(mem_buf),
-            static_cast<const uint8_t *>(encode_item.mem),
-            encode_item.info,
-            static_cast<const uint8_t *>(encode_item.lomem),
-            encode_item.loinfo,
-            encode_item.losize,
-            encode_item.met,
-            encode_item.timestamp_us,
-            encode_item.tc_frame_count);
+        size_t tiff_size = 0;
+        try
+        {
+            tiff_size = dng_save(
+                num,
+                static_cast<const uint8_t *>(mem_buf),
+                static_cast<const uint8_t *>(encode_item.mem),
+                encode_item.info,
+                static_cast<const uint8_t *>(encode_item.lomem),
+                encode_item.loinfo,
+                encode_item.losize,
+                encode_item.met,
+                encode_item.timestamp_us,
+                encode_item.tc_frame_count);
+        }
+        catch (const std::exception &e)
+        {
+            /* dng_save can throw (e.g. "Unsupported Bayer format", or bad_alloc).
+             * Drop this frame WITHOUT killing the encode thread: an uncaught
+             * throw here would leave frames_in_flight_ incremented forever and
+             * permanently jam the rec-gate (green stuck on, every future
+             * recording blocked). Mirror the alloc-fail drop cleanup, and also
+             * run the normal-path camera-buffer release tail so the libcamera
+             * encode_buffer_queue_ does not leak a buffer. */
+            console->error("Thread[{}] dng_save failed for frame {}: {} — frame dropped",
+                           num, encode_item.index, e.what());
+            frames_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+            if (mem_buf)
+                releasePooledBuffer(mem_buf);
+            {
+                std::lock_guard<std::mutex> lk(ram_mtx_);
+                if (ram_buffers_ > 0)
+                    --ram_buffers_;
+            }
+            ram_cv_.notify_one();
+            input_done_callback_(nullptr);
+            output_ready_callback_(encode_item.mem,
+                                   encode_item.size,
+                                   encode_item.timestamp_us,
+                                   true);
+            continue;
+        }
 
         /* queue for disk writer */
         {
