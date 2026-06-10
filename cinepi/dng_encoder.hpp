@@ -43,6 +43,14 @@ public:
 		dropped_frames_ = 0;
 		write_failures_.store(0, std::memory_order_relaxed);  // reset disk-write-failure count
 		buffer_hwm_.store(0, std::memory_order_relaxed);  // reset disk-backlog high-water mark
+		// NOTE: frames_in_flight_ is intentionally NOT reset here. Unlike the
+		// per-take counters above, it is a cross-take gauge of frames captured
+		// but not yet on disk, maintained solely by the balanced ++/-- in
+		// EncodeBuffer2 / encodeThread-drop / diskThread. The rec-gate keeps it
+		// at 0 by the time a new take starts, so a reset would be a no-op in the
+		// happy path; forcing 0 while stragglers are still draining would drive
+		// it negative as their decrements land — i.e. it would falsely read
+		// "done" mid-flush. Let the balanced accounting own this value.
 	}
 
 	size_t dng_save(int thread_num,
@@ -95,6 +103,15 @@ public:
 		return write_failures_.load(std::memory_order_relaxed);
 	}
 
+	// Total frames captured but not yet on disk: encode_queue_ + mid-encode + disk_buffer_.
+	// Incremented when a frame enters encode_queue_ (EncodeBuffer2), decremented when
+	// diskThread finishes with it (write success or any error/drop path).
+	// Use this — not bufferSize() — to gate "still flushing" signals; bufferSize() only
+	// covers the disk half and goes to zero while encode_queue_ is still draining.
+	int64_t getFramesInFlight() const {
+		return frames_in_flight_.load(std::memory_order_relaxed);
+	}
+
 	uint16_t photometric;
 	uint16_t samples_per_pixel;
 	uint8_t timecode[8];
@@ -144,6 +161,7 @@ private:
     /* ──  NEW: in-RAM buffer accounting  ─────────────────────── */
     std::atomic<int>      buffer_hwm_{0};    /* peak disk_buffer_ depth since last publish */
     std::atomic<size_t>   ram_buffers_{0};   /* # TIFF blocks living in RAM   */
+    std::atomic<int64_t>  frames_in_flight_{0}; /* capture→written: encode_queue_ + mid-encode + disk_buffer_ */
     size_t                max_ram_buffers_;  /* hard cap calculated at setup  */
     std::mutex            ram_mtx_;
     std::condition_variable ram_cv_;

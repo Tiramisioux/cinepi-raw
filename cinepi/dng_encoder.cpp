@@ -629,6 +629,7 @@ void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const 
             options_ ? options_->folder : std::string()
         };
         encode_queue_.push(item);
+        frames_in_flight_.fetch_add(1, std::memory_order_relaxed);
         encode_cond_var_.notify_one();
     }
 }
@@ -1160,8 +1161,9 @@ void DngEncoder::encodeThread(int num)
                                BLOCK_SIZE,
                                dng_info.buffer_size) != 0)
             {
-                /* Allocation failed – release the reserved permit */
+                /* Allocation failed – release the reserved permit; frame is dropped */
                 perror("posix_memalign");
+                frames_in_flight_.fetch_sub(1, std::memory_order_relaxed);
                 {
                     std::lock_guard<std::mutex> lk(ram_mtx_);
                     if (ram_buffers_ > 0)
@@ -1296,6 +1298,9 @@ void DngEncoder::diskThread(int num)
             console->error("DNG write FAILED to open ({}) - {}",
                            filename, strerror(oerr));
         }
+
+        // Frame fully handled (written or errored) — release in-flight count
+        frames_in_flight_.fetch_sub(1, std::memory_order_relaxed);
 
         // Clean up
         releasePooledBuffer(static_cast<uint8_t *>(disk_item.mem_buf));
