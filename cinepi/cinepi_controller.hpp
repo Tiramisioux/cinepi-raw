@@ -221,8 +221,10 @@ class CinePIController : public CinePIState
 
         // ── Frame-rate phase lock (sigma-delta VBLANK dither) ───────────────
         std::atomic_bool phaseLockEnabled_{false};   // runtime enable (redis)
-        double   pllKi_         = 0.05;   // integral gain (us duration per us err)
-        double   pllDeadbandUs_ = 4.0;    // freeze integration below this |err|
+        double   pllKp_         = 0.30;   // proportional gain (damping) — dominant
+        double   pllKi_         = 0.003;  // integral gain (removes steady offset)
+        double   pllIntegral_   = 0.0;    // integral accumulator (us)
+        double   pllDeadbandUs_ = 4.0;    // hold duration below this |err| (anti-jitter)
         bool     pllActive_     = false;  // lock currently running this take
         int64_t  pllT0Ns_       = 0;      // sensor ts at lock start
         uint64_t pllFrameCount_ = 0;      // frames since lock start

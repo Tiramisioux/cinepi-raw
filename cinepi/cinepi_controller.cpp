@@ -170,6 +170,11 @@ void CinePIController::sync(){
     } else {
         redis_->set(CONTROL_KEY_PHASE_LOCK, "0");
     }
+    if (auto v = redis_->get(CONTROL_KEY_PLL_KP); v && !v->empty()) {
+        try { pllKp_ = std::stod(*v); } catch (...) {}
+    } else {
+        redis_->set(CONTROL_KEY_PLL_KP, std::to_string(pllKp_));
+    }
     if (auto v = redis_->get(CONTROL_KEY_PLL_KI); v && !v->empty()) {
         try { pllKi_ = std::stod(*v); } catch (...) {}
     } else {
@@ -536,6 +541,9 @@ void CinePIController::mainThread(){
                 console->info("Frame-rate phase lock {}", phaseLockEnabled_.load() ? "ENABLED" : "disabled");
             }
         }},
+        { CONTROL_KEY_PLL_KP, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) { try { pllKp_ = std::stod(*r); } catch (...) {} }
+        }},
         { CONTROL_KEY_PLL_KI, [this](const std::optional<std::string>& r) {
             if(r && !r->empty()) { try { pllKi_ = std::stod(*r); } catch (...) {} }
         }},
@@ -698,6 +706,7 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
         pllTargetFps_  = target;
         pllBaseDurUs_  = 1.0e6 / target;     /* ideal period (us) */
         pllReqDurUs_   = pllBaseDurUs_;       /* start from nominal */
+        pllIntegral_   = 0.0;
         pllT0Ns_       = sensorTsNs;
         pllFrameCount_ = 0;
         pllLastDurUs_  = -1;
@@ -713,16 +722,22 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
      * phaseErr < 0  → running fast / ahead  (need longer frames)        */
     const double phaseErrUs = (elapsedNs - idealNs) * 1e-3;
 
-    /* Integrate only outside the deadband so the loop stops churning once the
-     * accumulated error is negligible (anti-jitter guard #1). */
-    if (std::abs(phaseErrUs) > pllDeadbandUs_)
-        pllReqDurUs_ -= pllKi_ * phaseErrUs;
-
-    /* Never wander far from nominal (anti-jitter guard #2 + safety net). */
+    /* PI clock servo. The proportional term provides damping — pure integral
+     * control here is an undamped oscillator (phase'' ∝ −phase). The small
+     * integral removes the steady-state offset left by the VBLANK quantisation
+     * bias. Held inside the deadband so a locked loop doesn't chatter
+     * (anti-jitter guard #1). */
     const double kClampUs = 150.0;
-    pllReqDurUs_ = std::clamp(pllReqDurUs_,
-                              pllBaseDurUs_ - kClampUs,
-                              pllBaseDurUs_ + kClampUs);
+    if (std::abs(phaseErrUs) > pllDeadbandUs_) {
+        pllIntegral_ += phaseErrUs;
+        const double iClamp = kClampUs / std::max(pllKi_, 1e-9);   /* anti-windup */
+        pllIntegral_ = std::clamp(pllIntegral_, -iClamp, iClamp);
+        pllReqDurUs_ = pllBaseDurUs_ - (pllKp_ * phaseErrUs + pllKi_ * pllIntegral_);
+        /* Never wander far from nominal (anti-jitter guard #2 + safety net). */
+        pllReqDurUs_ = std::clamp(pllReqDurUs_,
+                                  pllBaseDurUs_ - kClampUs,
+                                  pllBaseDurUs_ + kClampUs);
+    }
 
     /* Push the duration only when the integer-us value changes: this is where
      * the integer-VBLANK quantisation produces the sigma-delta dither, and it

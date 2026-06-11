@@ -47,7 +47,8 @@
 
 // Closed-loop frame-rate phase lock (sigma-delta VBLANK dither). Off by default.
 #define CONTROL_KEY_PHASE_LOCK "fps_phase_lock"   // 0/1 enable
-#define CONTROL_KEY_PLL_KI "pll_ki"               // integral gain (us per us of phase error)
+#define CONTROL_KEY_PLL_KP "pll_kp"               // proportional gain (damping)
+#define CONTROL_KEY_PLL_KI "pll_ki"               // integral gain (removes steady offset)
 #define CONTROL_KEY_PLL_DEADBAND "pll_deadband_us" // phase-error deadband (us)
 
 class CinePIState
