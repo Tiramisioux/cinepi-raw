@@ -687,22 +687,29 @@ void CinePIController::mainThread(){
 /* ------------------------------------------------------------------ */
 void CinePIController::updatePhaseLock(int64_t sensorTsNs)
 {
-    /* Disabled or not recording: release the lock (the normal fps handler
-     * owns FrameDurationLimits) and re-arm for the next take. */
-    if (!phaseLockEnabled_.load() || !is_recording_) {
+    /* Disabled: release the lock (the normal fps handler owns FrameDurationLimits). */
+    if (!phaseLockEnabled_.load()) {
         pllActive_ = false;
+        pllLastTsNs_ = 0;
         return;
     }
 
-    if (!pllActive_) {
-        /* Arm at the first recorded frame. Target the operator's NOMINAL fps
-         * (fps_user) — the true intent — not the corrected hardware fps. */
-        double target = 0.0;
-        if (auto v = redis_->get("fps_user"); v && !v->empty()) {
-            try { target = std::stod(*v); } catch (...) { target = 0.0; }
-        }
-        if (target <= 1.0)
-            return;                          /* no valid target yet; retry next frame */
+    /* Target = operator's NOMINAL fps (fps_user), not the corrected hardware
+     * fps. Read each frame so an fps change re-arms the lock. */
+    double target = pllTargetFps_;
+    if (auto v = redis_->get("fps_user"); v && !v->empty()) {
+        try { target = std::stod(*v); } catch (...) {}
+    }
+    if (target <= 1.0) { pllActive_ = false; pllLastTsNs_ = 0; return; }
+
+    /* Re-arm on first enable, an fps change, or a large sensor-timestamp gap
+     * (mode reconfigure / stall) so a fresh lock starts from a clean datum.
+     * Runs in preview as well as recording → the sensor is already locked when
+     * recording starts, so the recorded clip has no head-of-take transient. */
+    bool gap = (pllActive_ && pllLastTsNs_ != 0 &&
+                (sensorTsNs - pllLastTsNs_) > static_cast<int64_t>(3.0 * pllBaseDurUs_ * 1000.0));
+    pllLastTsNs_ = sensorTsNs;
+    if (!pllActive_ || std::abs(target - pllTargetFps_) > 1e-6 || gap) {
         pllTargetFps_  = target;
         pllBaseDurUs_  = 1.0e6 / target;     /* ideal period (us) */
         pllReqDurUs_   = pllBaseDurUs_;       /* start from nominal */

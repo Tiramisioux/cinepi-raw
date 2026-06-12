@@ -97,9 +97,11 @@ class CinePIController : public CinePIState
         // onto the operator's nominal fps (fps_user) by trimming
         // FrameDurationLimits frame-to-frame; the integer-VBLANK quantisation is
         // dithered out (first-order sigma-delta) so the *average* rate is exact.
-        // VBLANK-only: never touches HMAX/line length. No-op unless enabled and
-        // recording. Closed-loop, so it idles harmlessly if the sensor is already
-        // on target (e.g. a future exact-rate libcamera patch).
+        // VBLANK-only: never touches HMAX/line length. Runs continuously while
+        // enabled (preview + recording) so the sensor is already locked when
+        // recording starts — no head-of-take transient. Closed-loop, so it idles
+        // harmlessly if the sensor is already on target (e.g. a future exact-rate
+        // libcamera patch). No-op when disabled (default).
         void updatePhaseLock(int64_t sensorTsNs);
 
         void process_stream_info(libcamera::StreamConfiguration const &cfg){
@@ -234,6 +236,7 @@ class CinePIController : public CinePIState
         double   pllBaseDurUs_  = 0.0;    // ideal period 1e6/target (us)
         double   pllReqDurUs_    = 0.0;   // current requested duration (us, float)
         long     pllLastDurUs_  = -1;     // last duration pushed to FrameDurationLimits
+        int64_t  pllLastTsNs_   = 0;      // last sensor ts (gap detect → re-arm on reconfigure)
 
         int baseline_flag_{0};          // remembers last seen is_recording level
 
