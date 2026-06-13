@@ -744,6 +744,22 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
      * phaseErr < 0  → running fast / ahead  (need longer frames)        */
     const double phaseErrUs = (elapsedNs - idealNs) * 1e-3;
 
+    /* Safety re-arm (preview only): if a discontinuity has leaked a phase error
+     * larger than half a frame — e.g. a mode reconfigure delivered as a burst of
+     * sub-1.5-frame gaps that slipped past the gap detector — reset the datum
+     * now. The clamp-limited loop would otherwise take tens of seconds to bleed
+     * such an offset (≈47 s for 169 ms), outlasting the preview settle and
+     * leaving a convergence ramp in the clip. During RECORDING a large error is
+     * genuine drift and must be tracked, never reset. */
+    if (!is_recording_ && std::abs(phaseErrUs) > 0.5e6 / pllTargetFps_) {
+        pllReqDurUs_   = pllBaseDurUs_;
+        pllIntegral_   = 0.0;
+        pllT0Ns_       = sensorTsNs;
+        pllFrameCount_ = 0;
+        pllLastDurUs_  = -1;
+        return;
+    }
+
     /* PI clock servo. The proportional term provides damping — pure integral
      * control here is an undamped oscillator (phase'' ∝ −phase). The small
      * integral removes the steady-state offset left by the VBLANK quantisation
