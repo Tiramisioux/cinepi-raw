@@ -702,14 +702,13 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
     }
     if (target <= 1.0) { pllActive_ = false; pllLastTsNs_ = 0; return; }
 
-    /* Re-arm on first enable, an fps change, or a large sensor-timestamp gap
-     * (mode reconfigure / stall) so a fresh lock starts from a clean datum.
-     * Runs in preview as well as recording → the sensor is already locked when
+    /* Runs in preview as well as recording → the sensor is already locked when
      * recording starts, so the recorded clip has no head-of-take transient. */
-    bool gap = (pllActive_ && pllLastTsNs_ != 0 &&
-                (sensorTsNs - pllLastTsNs_) > static_cast<int64_t>(3.0 * pllBaseDurUs_ * 1000.0));
+    int64_t dt = (pllActive_ && pllLastTsNs_ != 0) ? (sensorTsNs - pllLastTsNs_) : 0;
     pllLastTsNs_ = sensorTsNs;
-    if (!pllActive_ || std::abs(target - pllTargetFps_) > 1e-6 || gap) {
+
+    /* Re-arm only on first enable or an fps change (clean datum reset). */
+    if (!pllActive_ || std::abs(target - pllTargetFps_) > 1e-6) {
         pllTargetFps_  = target;
         pllBaseDurUs_  = 1.0e6 / target;     /* ideal period (us) */
         pllReqDurUs_   = pllBaseDurUs_;       /* start from nominal */
@@ -719,6 +718,18 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
         pllLastDurUs_  = -1;
         pllActive_     = true;
         return;                               /* this frame is the t0 datum */
+    }
+
+    /* Absorb a multi-frame inter-frame gap — a dropped-frame burst OR a camera
+     * reconfigure stall — into the frame count, so the accumulated phase stays
+     * continuous instead of spiking by the whole gap (which the clamp-limited
+     * loop would then take tens of seconds to bleed off). Mirrors the libcamera
+     * rpi.sync dropped-frame accounting. */
+    const double periodNs = 1.0e9 / target;
+    if (dt > static_cast<int64_t>(1.8 * periodNs)) {
+        uint64_t missed = static_cast<uint64_t>((static_cast<double>(dt) + 0.5 * periodNs) / periodNs);
+        if (missed > 1)
+            pllFrameCount_ += (missed - 1);
     }
 
     pllFrameCount_++;
