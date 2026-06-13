@@ -706,9 +706,19 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
      * recording starts, so the recorded clip has no head-of-take transient. */
     int64_t dt = (pllActive_ && pllLastTsNs_ != 0) ? (sensorTsNs - pllLastTsNs_) : 0;
     pllLastTsNs_ = sensorTsNs;
+    const double periodNs = 1.0e9 / target;
 
-    /* Re-arm only on first enable or an fps change (clean datum reset). */
-    if (!pllActive_ || std::abs(target - pllTargetFps_) > 1e-6) {
+    /* A gap of >1.5 frames is a discontinuity. In PREVIEW it is a camera
+     * reconfigure / stall: re-arm for a clean lock (there is time to re-converge
+     * before recording, and a partial-frame reconfigure stall can't be absorbed
+     * exactly). While RECORDING it is a dropped-frame burst: absorb the missed
+     * frames into the count so the lock survives the drop and the phase doesn't
+     * spike (mirrors libcamera rpi.sync dropped-frame accounting). */
+    bool bigGap     = (pllActive_ && dt > static_cast<int64_t>(1.5 * periodNs));
+    bool forceRearm = (bigGap && !is_recording_);
+
+    /* Re-arm on first enable, an fps change, or a preview-side discontinuity. */
+    if (!pllActive_ || std::abs(target - pllTargetFps_) > 1e-6 || forceRearm) {
         pllTargetFps_  = target;
         pllBaseDurUs_  = 1.0e6 / target;     /* ideal period (us) */
         pllReqDurUs_   = pllBaseDurUs_;       /* start from nominal */
@@ -720,13 +730,7 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
         return;                               /* this frame is the t0 datum */
     }
 
-    /* Absorb a multi-frame inter-frame gap — a dropped-frame burst OR a camera
-     * reconfigure stall — into the frame count, so the accumulated phase stays
-     * continuous instead of spiking by the whole gap (which the clamp-limited
-     * loop would then take tens of seconds to bleed off). Mirrors the libcamera
-     * rpi.sync dropped-frame accounting. */
-    const double periodNs = 1.0e9 / target;
-    if (dt > static_cast<int64_t>(1.8 * periodNs)) {
+    if (bigGap) {   /* recording-side drop burst: absorb missed frames */
         uint64_t missed = static_cast<uint64_t>((static_cast<double>(dt) + 0.5 * periodNs) / periodNs);
         if (missed > 1)
             pllFrameCount_ += (missed - 1);
