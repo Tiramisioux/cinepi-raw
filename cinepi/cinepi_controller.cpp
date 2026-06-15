@@ -321,10 +321,11 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     redis_->set(tc_key, tc.str());
 
     /* ────────────────────────────────────────────────────────────── */
-    /*  5. Closed-loop frame-rate phase lock (uses the monotonic       */
-    /*     SensorTimestamp; no-op unless enabled + recording)          */
+    /*  5. Closed-loop frame-rate phase lock. References the Pi wall    */
+    /*     clock (FrameWallClock = the audio clock, computed above).    */
+    /*     No-op unless enabled; suppressed on the --sync client.       */
     /* ────────────────────────────────────────────────────────────── */
-    updatePhaseLock(info.ts);
+    updatePhaseLock(static_cast<int64_t>(epoch_ns));
 }
 
 
@@ -676,7 +677,8 @@ void CinePIController::mainThread(){
 /*  Closed-loop frame-rate phase lock                                  */
 /*                                                                     */
 /*  Integral controller on accumulated phase error, measured against   */
-/*  the monotonic SensorTimestamp. Output is FrameDurationLimits; the   */
+/*  the Pi wall clock (FrameWallClock, de-jittered, = the audio clock). */
+/*  Output is FrameDurationLimits; the                                  */
 /*  integer-VBLANK quantisation downstream turns the smoothly-varying   */
 /*  request into a first-order sigma-delta dither between two adjacent  */
 /*  lines, so the *average* recorded cadence equals the operator's      */
@@ -684,11 +686,21 @@ void CinePIController::mainThread(){
 /*  single fixed correction factor. VBLANK-only: never touches HMAX, so */
 /*  the 4K line-length failure mode cannot recur. Closed-loop, so it    */
 /*  idles harmlessly if the sensor is already on target.                */
+/*                                                                     */
+/*  Role: this is the single absolute disciplinarian. It runs on a lone */
+/*  sensor (--sync off) and on the dual master (--sync server), but is   */
+/*  suppressed on the --sync client, where rpi.sync owns the VBLANK to   */
+/*  hold the relative A->B genlock. Inferred from options_->sync.        */
 /* ------------------------------------------------------------------ */
-void CinePIController::updatePhaseLock(int64_t sensorTsNs)
+void CinePIController::updatePhaseLock(int64_t refTsNs)
 {
-    /* Disabled: release the lock (the normal fps handler owns FrameDurationLimits). */
-    if (!phaseLockEnabled_.load()) {
+    /* Disabled, or this instance is the --sync client (sync == 2): release the
+     * lock. On a dual-sensor genlock rig the client's VBLANK is owned by libcamera
+     * rpi.sync (relative A->B lock); the absolute Pi-clock discipline runs only on
+     * the master (--sync off or server). Inferring the role here means the same
+     * shared fps_phase_lock key works for single and dual — the client self-
+     * suppresses — so no per-camera key is needed. */
+    if (!phaseLockEnabled_.load() || options_->sync == 2) {
         pllActive_ = false;
         pllLastTsNs_ = 0;
         return;
@@ -704,8 +716,8 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
 
     /* Runs in preview as well as recording → the sensor is already locked when
      * recording starts, so the recorded clip has no head-of-take transient. */
-    int64_t dt = (pllActive_ && pllLastTsNs_ != 0) ? (sensorTsNs - pllLastTsNs_) : 0;
-    pllLastTsNs_ = sensorTsNs;
+    int64_t dt = (pllActive_ && pllLastTsNs_ != 0) ? (refTsNs - pllLastTsNs_) : 0;
+    pllLastTsNs_ = refTsNs;
     const double periodNs = 1.0e9 / target;
 
     /* A gap of >1.5 frames is a discontinuity. In PREVIEW it is a camera
@@ -723,7 +735,7 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
         pllBaseDurUs_  = 1.0e6 / target;     /* ideal period (us) */
         pllReqDurUs_   = pllBaseDurUs_;       /* start from nominal */
         pllIntegral_   = 0.0;
-        pllT0Ns_       = sensorTsNs;
+        pllT0Ns_       = refTsNs;
         pllFrameCount_ = 0;
         pllLastDurUs_  = -1;
         pllActive_     = true;
@@ -739,7 +751,7 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
     pllFrameCount_++;
     const double targetPeriodNs = 1.0e9 / pllTargetFps_;
     const double idealNs   = static_cast<double>(pllFrameCount_) * targetPeriodNs;
-    const double elapsedNs = static_cast<double>(sensorTsNs - pllT0Ns_);
+    const double elapsedNs = static_cast<double>(refTsNs - pllT0Ns_);
     /* phaseErr > 0  → running slow / behind (need shorter frames)
      * phaseErr < 0  → running fast / ahead  (need longer frames)        */
     const double phaseErrUs = (elapsedNs - idealNs) * 1e-3;
@@ -754,7 +766,7 @@ void CinePIController::updatePhaseLock(int64_t sensorTsNs)
     if (!is_recording_ && std::abs(phaseErrUs) > 0.5e6 / pllTargetFps_) {
         pllReqDurUs_   = pllBaseDurUs_;
         pllIntegral_   = 0.0;
-        pllT0Ns_       = sensorTsNs;
+        pllT0Ns_       = refTsNs;
         pllFrameCount_ = 0;
         pllLastDurUs_  = -1;
         return;

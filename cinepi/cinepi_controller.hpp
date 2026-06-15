@@ -102,7 +102,16 @@ class CinePIController : public CinePIState
         // recording starts — no head-of-take transient. Closed-loop, so it idles
         // harmlessly if the sensor is already on target (e.g. a future exact-rate
         // libcamera patch). No-op when disabled (default).
-        void updatePhaseLock(int64_t sensorTsNs);
+        //
+        // Reference clock = the Pi wall clock (controls::FrameWallClock, passed in
+        // as refTsNs), which is the clock the audio is captured against, so video
+        // and audio share one timebase across all sensors. This instance is the
+        // single ABSOLUTE disciplinarian: it runs on a single sensor (--sync off)
+        // and on the dual-sensor master (--sync server), but suppresses itself on
+        // the --sync client, where libcamera rpi.sync owns that sensor's VBLANK to
+        // hold the relative A->B lock. Role is inferred from options_->sync, so the
+        // same phase_lock setting works for single and dual with no per-camera key.
+        void updatePhaseLock(int64_t refTsNs);
 
         void process_stream_info(libcamera::StreamConfiguration const &cfg){
 
