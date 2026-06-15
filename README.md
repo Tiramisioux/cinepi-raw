@@ -188,6 +188,33 @@ When non-zero, `cinepi-raw` logs after each take:
 Applied 24-bit USB capture WAV metadata timecode offset: +2 frames; PCM timing unchanged
 ```
 
+## Frame-rate phase lock
+
+Off by default (`fps_phase_lock` Redis key). A closed-loop servo that holds the
+recorded frame cadence on the operator's nominal fps, so audio and video stay in
+sync across long takes.
+
+**How it differs from stock cinepi-raw:** stock cinepi-raw sets one
+`FrameDurationLimits` per fps change and lets the sensor free-run, so a small
+fixed quantisation/crystal offset between the requested rate and what the sensor
+actually delivers accumulates over a take. The phase lock measures and corrects
+every frame instead.
+
+**How it works:** each frame in `process()` it compares the accumulated frame
+phase (from the monotonic `SensorTimestamp`) against the ideal `n / fps` and trims
+`FrameDurationLimits` with a PI servo. The integer-VBLANK quantisation downstream
+is dithered (first-order sigma-delta) so the *average* rate is exact. It is
+VBLANK-only (never touches line length) and pre-converges during preview, so a
+clip is locked from the first frame.
+
+**What it means for sync:** the video cadence tracks the Pi clock — the same clock
+the audio is captured against — so A/V no longer drift apart over long takes; the
+residual is a bounded sub-frame offset, not an accumulating drift.
+
+Gains are tunable live via `pll_kp` / `pll_ki` / `pll_deadband_us`. Do not enable
+it alongside multi-camera `--sync` genlock on the same sensor — the dither breaks
+rpi.sync's constant-rate assumption (discipline the sync server's rate instead).
+
 ## Manual DNG encoder
 
 - Manual writing of DNG tags. 
