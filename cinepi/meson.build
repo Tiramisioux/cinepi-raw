@@ -56,3 +56,11 @@ executable('cinepi-audio-capture',
            'cinepi_audio_capture.cpp',
            dependencies : [alsa_dep],
            install : true)
+
+# Unit tests for the pure frame-rate phase-lock control core. No libcamera / redis
+# deps — it includes only cinepi/phase_lock_core.hpp. Run with `meson test`.
+phase_lock_core_test = executable('phase_lock_core_test',
+           '../tests/phase_lock_core_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('phase_lock_core', phase_lock_core_test)

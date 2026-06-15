@@ -25,6 +25,7 @@
 
 #include "dng_encoder.hpp"
 #include "utils.hpp"
+#include "phase_lock_core.hpp"
 
 #define CHANNEL_CONTROLS "cp_controls"
 #define CHANNEL_STATS "cp_stats"
@@ -231,21 +232,14 @@ class CinePIController : public CinePIState
         bool ready_announced_ = false;
 
         // ── Frame-rate phase lock (sigma-delta VBLANK dither) ───────────────
-        std::atomic_bool phaseLockEnabled_{false};   // runtime enable (redis)
+        // Control law is the pure cinepi::phaseLockStep() in phase_lock_core.hpp
+        // (unit-tested); this class only owns the runtime enable, the live-tunable
+        // gains, and the per-frame servo state.
+        std::atomic_bool        phaseLockEnabled_{false}; // runtime enable (redis fps_phase_lock)
         // Defaults tuned on imx585 mode0 @25fps (Pi-verified: +1066 -> -9 ppm,
         // ~2-3 line dither). Runtime-tunable via Redis (pll_kp/pll_ki/pll_deadband_us).
-        double   pllKp_         = 0.06;   // proportional gain (damping) — keep small so it doesn't rail the clamp
-        double   pllKi_         = 0.0015; // integral gain (walks to the operating VBLANK, removes steady offset)
-        double   pllIntegral_   = 0.0;    // integral accumulator (us)
-        double   pllDeadbandUs_ = 6.0;    // hold duration below this |err| (anti-jitter)
-        bool     pllActive_     = false;  // lock currently running this take
-        int64_t  pllT0Ns_       = 0;      // sensor ts at lock start
-        uint64_t pllFrameCount_ = 0;      // frames since lock start
-        double   pllTargetFps_  = 0.0;    // nominal target (fps_user)
-        double   pllBaseDurUs_  = 0.0;    // ideal period 1e6/target (us)
-        double   pllReqDurUs_    = 0.0;   // current requested duration (us, float)
-        long     pllLastDurUs_  = -1;     // last duration pushed to FrameDurationLimits
-        int64_t  pllLastTsNs_   = 0;      // last sensor ts (gap detect → re-arm on reconfigure)
+        cinepi::PhaseLockParams pllParams_{};             // kp / ki / deadbandUs / clampUs
+        cinepi::PhaseLockState  pllState_{};              // per-frame servo state
 
         int baseline_flag_{0};          // remembers last seen is_recording level
 

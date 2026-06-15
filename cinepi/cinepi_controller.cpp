@@ -171,19 +171,19 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_PHASE_LOCK, "0");
     }
     if (auto v = redis_->get(CONTROL_KEY_PLL_KP); v && !v->empty()) {
-        try { pllKp_ = std::stod(*v); } catch (...) {}
+        try { pllParams_.kp = std::stod(*v); } catch (...) {}
     } else {
-        redis_->set(CONTROL_KEY_PLL_KP, std::to_string(pllKp_));
+        redis_->set(CONTROL_KEY_PLL_KP, std::to_string(pllParams_.kp));
     }
     if (auto v = redis_->get(CONTROL_KEY_PLL_KI); v && !v->empty()) {
-        try { pllKi_ = std::stod(*v); } catch (...) {}
+        try { pllParams_.ki = std::stod(*v); } catch (...) {}
     } else {
-        redis_->set(CONTROL_KEY_PLL_KI, std::to_string(pllKi_));
+        redis_->set(CONTROL_KEY_PLL_KI, std::to_string(pllParams_.ki));
     }
     if (auto v = redis_->get(CONTROL_KEY_PLL_DEADBAND); v && !v->empty()) {
-        try { pllDeadbandUs_ = std::stod(*v); } catch (...) {}
+        try { pllParams_.deadbandUs = std::stod(*v); } catch (...) {}
     } else {
-        redis_->set(CONTROL_KEY_PLL_DEADBAND, std::to_string(pllDeadbandUs_));
+        redis_->set(CONTROL_KEY_PLL_DEADBAND, std::to_string(pllParams_.deadbandUs));
     }
 
     console->critical(14);
@@ -543,13 +543,13 @@ void CinePIController::mainThread(){
             }
         }},
         { CONTROL_KEY_PLL_KP, [this](const std::optional<std::string>& r) {
-            if(r && !r->empty()) { try { pllKp_ = std::stod(*r); } catch (...) {} }
+            if(r && !r->empty()) { try { pllParams_.kp = std::stod(*r); } catch (...) {} }
         }},
         { CONTROL_KEY_PLL_KI, [this](const std::optional<std::string>& r) {
-            if(r && !r->empty()) { try { pllKi_ = std::stod(*r); } catch (...) {} }
+            if(r && !r->empty()) { try { pllParams_.ki = std::stod(*r); } catch (...) {} }
         }},
         { CONTROL_KEY_PLL_DEADBAND, [this](const std::optional<std::string>& r) {
-            if(r && !r->empty()) { try { pllDeadbandUs_ = std::stod(*r); } catch (...) {} }
+            if(r && !r->empty()) { try { pllParams_.deadbandUs = std::stod(*r); } catch (...) {} }
         }},
         { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
             cameraInit_ = true;
@@ -694,115 +694,36 @@ void CinePIController::mainThread(){
 /* ------------------------------------------------------------------ */
 void CinePIController::updatePhaseLock(int64_t refTsNs)
 {
-    /* Disabled, or this instance is the --sync client (sync == 2): release the
-     * lock. On a dual-sensor genlock rig the client's VBLANK is owned by libcamera
-     * rpi.sync (relative A->B lock); the absolute Pi-clock discipline runs only on
-     * the master (--sync off or server). Inferring the role here means the same
-     * shared fps_phase_lock key works for single and dual — the client self-
-     * suppresses — so no per-camera key is needed. */
-    if (!phaseLockEnabled_.load() || options_->sync == 2) {
-        pllActive_ = false;
-        pllLastTsNs_ = 0;
-        return;
-    }
-
-    /* Target = operator's NOMINAL fps (fps_user), not the corrected hardware
-     * fps. Read each frame so an fps change re-arms the lock. */
-    double target = pllTargetFps_;
+    /* I/O lives here; the control law is the pure phaseLockStep() in
+     * phase_lock_core.hpp (unit-tested in tests/phase_lock_core_test.cpp).
+     *
+     * Target = operator's NOMINAL fps (fps_user), read each frame so an fps change
+     * re-arms the lock. The reference clock is the Pi wall clock (FrameWallClock),
+     * passed in as refTsNs by process(). The --sync client role suppresses the
+     * lock so libcamera rpi.sync owns that sensor's VBLANK on a genlock rig. */
+    double target = pllState_.targetFps;
     if (auto v = redis_->get("fps_user"); v && !v->empty()) {
         try { target = std::stod(*v); } catch (...) {}
     }
-    if (target <= 1.0) { pllActive_ = false; pllLastTsNs_ = 0; return; }
 
-    /* Runs in preview as well as recording → the sensor is already locked when
-     * recording starts, so the recorded clip has no head-of-take transient. */
-    int64_t dt = (pllActive_ && pllLastTsNs_ != 0) ? (refTsNs - pllLastTsNs_) : 0;
-    pllLastTsNs_ = refTsNs;
-    const double periodNs = 1.0e9 / target;
+    const bool roleClient = (options_->sync == 2);
+    cinepi::PhaseLockResult res = cinepi::phaseLockStep(
+        pllState_, pllParams_, phaseLockEnabled_.load(), roleClient,
+        is_recording_, target, refTsNs);
 
-    /* A gap of >1.5 frames is a discontinuity. In PREVIEW it is a camera
-     * reconfigure / stall: re-arm for a clean lock (there is time to re-converge
-     * before recording, and a partial-frame reconfigure stall can't be absorbed
-     * exactly). While RECORDING it is a dropped-frame burst: absorb the missed
-     * frames into the count so the lock survives the drop and the phase doesn't
-     * spike (mirrors libcamera rpi.sync dropped-frame accounting). */
-    bool bigGap     = (pllActive_ && dt > static_cast<int64_t>(1.5 * periodNs));
-    bool forceRearm = (bigGap && !is_recording_);
-
-    /* Re-arm on first enable, an fps change, or a preview-side discontinuity. */
-    if (!pllActive_ || std::abs(target - pllTargetFps_) > 1e-6 || forceRearm) {
-        pllTargetFps_  = target;
-        pllBaseDurUs_  = 1.0e6 / target;     /* ideal period (us) */
-        pllReqDurUs_   = pllBaseDurUs_;       /* start from nominal */
-        pllIntegral_   = 0.0;
-        pllT0Ns_       = refTsNs;
-        pllFrameCount_ = 0;
-        pllLastDurUs_  = -1;
-        pllActive_     = true;
-        return;                               /* this frame is the t0 datum */
-    }
-
-    if (bigGap) {   /* recording-side drop burst: absorb missed frames */
-        uint64_t missed = static_cast<uint64_t>((static_cast<double>(dt) + 0.5 * periodNs) / periodNs);
-        if (missed > 1)
-            pllFrameCount_ += (missed - 1);
-    }
-
-    pllFrameCount_++;
-    const double targetPeriodNs = 1.0e9 / pllTargetFps_;
-    const double idealNs   = static_cast<double>(pllFrameCount_) * targetPeriodNs;
-    const double elapsedNs = static_cast<double>(refTsNs - pllT0Ns_);
-    /* phaseErr > 0  → running slow / behind (need shorter frames)
-     * phaseErr < 0  → running fast / ahead  (need longer frames)        */
-    const double phaseErrUs = (elapsedNs - idealNs) * 1e-3;
-
-    /* Safety re-arm (preview only): if a discontinuity has leaked a phase error
-     * larger than half a frame — e.g. a mode reconfigure delivered as a burst of
-     * sub-1.5-frame gaps that slipped past the gap detector — reset the datum
-     * now. The clamp-limited loop would otherwise take tens of seconds to bleed
-     * such an offset (≈47 s for 169 ms), outlasting the preview settle and
-     * leaving a convergence ramp in the clip. During RECORDING a large error is
-     * genuine drift and must be tracked, never reset. */
-    if (!is_recording_ && std::abs(phaseErrUs) > 0.5e6 / pllTargetFps_) {
-        pllReqDurUs_   = pllBaseDurUs_;
-        pllIntegral_   = 0.0;
-        pllT0Ns_       = refTsNs;
-        pllFrameCount_ = 0;
-        pllLastDurUs_  = -1;
-        return;
-    }
-
-    /* PI clock servo. The proportional term provides damping — pure integral
-     * control here is an undamped oscillator (phase'' ∝ −phase). The small
-     * integral removes the steady-state offset left by the VBLANK quantisation
-     * bias. Held inside the deadband so a locked loop doesn't chatter
-     * (anti-jitter guard #1). */
-    const double kClampUs = 150.0;
-    if (std::abs(phaseErrUs) > pllDeadbandUs_) {
-        pllIntegral_ += phaseErrUs;
-        const double iClamp = kClampUs / std::max(pllKi_, 1e-9);   /* anti-windup */
-        pllIntegral_ = std::clamp(pllIntegral_, -iClamp, iClamp);
-        pllReqDurUs_ = pllBaseDurUs_ - (pllKp_ * phaseErrUs + pllKi_ * pllIntegral_);
-        /* Never wander far from nominal (anti-jitter guard #2 + safety net). */
-        pllReqDurUs_ = std::clamp(pllReqDurUs_,
-                                  pllBaseDurUs_ - kClampUs,
-                                  pllBaseDurUs_ + kClampUs);
-    }
-
-    /* Push the duration only when the integer-us value changes: this is where
-     * the integer-VBLANK quantisation produces the sigma-delta dither, and it
-     * caps control traffic to actual line flips (anti-jitter guard #3). */
-    const long durUs = std::lround(pllReqDurUs_);
-    if (durUs != pllLastDurUs_) {
-        pllLastDurUs_ = durUs;
-        long int dv[2] = { durUs, durUs };
+    /* Push FrameDurationLimits only on an integer-us change — this is where the
+     * integer-VBLANK quantisation downstream becomes the sigma-delta dither. */
+    if (res.setControls) {
+        long int dv[2] = { res.durUs, res.durUs };
         libcamera::Span<const long int, 2> range(dv, 2);
         libcamera::ControlList cl;
         cl.set(libcamera::controls::FrameDurationLimits, range);
         app_->SetControls(cl);
     }
 
-    /* Telemetry for the test harness. */
-    redis_->set("pll_phase_err_us", std::to_string(std::lround(phaseErrUs)));
-    redis_->set("pll_req_dur_us", std::to_string(durUs));
+    /* Telemetry for the test harness (only when the servo actually ran). */
+    if (res.servoRan) {
+        redis_->set("pll_phase_err_us", std::to_string(std::lround(res.phaseErrUs)));
+        redis_->set("pll_req_dur_us", std::to_string(res.durUs));
+    }
 }
