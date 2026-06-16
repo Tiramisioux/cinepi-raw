@@ -167,9 +167,14 @@ clip is locked from the first frame.
 the audio is captured against — so A/V no longer drift apart over long takes; the
 residual is a bounded sub-frame offset, not an accumulating drift.
 
-Gains are tunable live via `pll_kp` / `pll_ki` / `pll_deadband_us`. Do not enable
-it alongside multi-camera `--sync` genlock on the same sensor — the dither breaks
-rpi.sync's constant-rate assumption (discipline the sync server's rate instead).
+Gains are tunable live via `pll_kp` / `pll_ki` / `pll_deadband_us`. On a
+multi-camera `--sync` genlock rig it is safe to leave enabled: cinepi-raw infers
+its role from `--sync` and runs the absolute Pi-clock discipline only on the
+master (`--sync` off or `server`). The `--sync` client self-suppresses the lock
+so libcamera's rpi.sync owns that sensor's VBLANK and holds the relative A→B
+genlock — the lock never shares a sensor's VBLANK with rpi.sync, which is the
+conflict the client gate prevents. If you would rather keep the master strictly
+constant-rate, disable the lock and discipline the sync server's rate instead.
 
 ## Manual DNG encoder
 
