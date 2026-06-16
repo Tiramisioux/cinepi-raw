@@ -757,7 +757,12 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
 
     /* ──  Static strings & misc  ──────────────────────────────── */
     dng_info.make       = "Raspberry Pi";
-    dng_info.model      = "SONY IMX585-AAQJ1";
+    /* Model = the attached sensor (libcamera properties::Model, falling back to
+     * the camera id), captured into options_->model in cinepi_raw.cpp. So the DNG
+     * carries the real sensor name even when cinepi-raw is run without Cinemate. */
+    dng_info.model      = (options_ && !options_->model.empty())
+                              ? options_->model
+                              : std::string("unknown sensor");
     dng_info.software   = "Libcamera;cinepi-raw";
     dng_info.ucm        = options_->ucm.value_or("cinepi");
     dng_info.serial     = getHwId();
