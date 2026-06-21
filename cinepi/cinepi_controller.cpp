@@ -288,6 +288,7 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     data["bufferSizeMax"]   = app_->GetEncoder()->bufferSizeMaxAndReset();
     data["framesInFlight"]  = static_cast<Json::Int64>(app_->GetEncoder()->getFramesInFlight());
     data["timestamp"]  = static_cast<Json::Int64>(epoch_ns);   // ← TOD ns
+    data["cameraPort"] = options_->CamPort();                  // cam0 / cam1 — disambiguates the shared cp_stats channel
     redis_->publish(CHANNEL_STATS, data.toStyledString());
 
     /* cache per-camera timestamp key (TOD ns) */
