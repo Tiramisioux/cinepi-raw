@@ -105,6 +105,37 @@ then
 ```bash
 cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0 
 ```
+
+### Choosing the `--mode` packing (`U` vs `P`) per Pi model
+
+`--mode` is `WIDTH:HEIGHT:BIT_DEPTH:PACKING`. The last field selects the camera-stream pixel format:
+
+| Token | Meaning | libcamera format (12-bit) |
+|-------|---------|---------------------------|
+| `U`   | **U**npacked — one 16-bit sample per pixel | `SBGGR12` |
+| `P`   | **P**acked — CSI-2 packed (smaller, less DMA/CMA) | `SBGGR12_CSI2P` |
+
+Pick the token by camera receiver, **not** by sensor:
+
+| Pi model | Receiver | Recommended packing | Why |
+|----------|----------|---------------------|-----|
+| Pi 5 / CM5 | PiSP (`rp1-cfe`) | `U` | Plenty of bandwidth/CMA; an unpacked stream is simplest. A `P` request is delivered as PiSP `COMP1` and decoded by the DNG encoder. |
+| Pi 4 / Pi 400 / CM4 | VC4/Unicam (`unicam`) | `P` | Packed CSI-2 uses ~1.33× less DMA/CMA at 12-bit (~1.6× at 10-bit), which the high-fps modes need on the smaller Pi 4 CMA pool. |
+
+The DNG encoder produces a correct DNG for **both** `U` and `P` at 10- and 12-bit, so the choice is about bandwidth/CMA, not correctness. (Earlier builds only handled the unpacked stream and emitted a garbled "wrong bit order" raw when fed a `P` stream on Pi 4 — that is fixed: the encoder now branches on the actual packed/unpacked format.)
+
+Manual examples (IMX477 on `cam0`):
+
+```bash
+# Pi 4 / VC4 — packed; Pi 4 also skips --tuning-file
+cinepi-raw --mode 2028:1080:12:P --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --hdmi-port 1 --cam-port cam0
+
+# Pi 5 / PiSP — unpacked, with the PiSP tuning file
+cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0
+```
+
+When launched by CineMate this is automatic: the packing token is data-driven from `resources/sensors.json` (`packing_by_platform`) and resolved against the detected Pi model, so you normally never set it by hand.
+
 # CineMate fork
 
 _Adapted to libcamera 0.5 / rpicam-apps 1.0.7._

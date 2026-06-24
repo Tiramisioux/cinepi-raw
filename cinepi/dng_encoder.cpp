@@ -886,15 +886,60 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
         for (uint32_t y = 0; y < info.height; ++y)
         {
-            const uint16_t *src = reinterpret_cast<const uint16_t *>(
-                                    raw + y * info.stride);
-            pack_row_12bit(src, rowBuf.data(), info.width);
-            write_pod(buf, rowBuf.data(), rowPacked);
+            if (bayer_format.packed)
+            {
+                /* CSI2-packed 12-bit (SBGGR12_CSI2P — the Pi 4 / VC4 'P' path).
+                 * The receiver already delivers the exact contiguous 12-bit DNG
+                 * layout that pack_row_12bit() produces, so the packed row is
+                 * copied verbatim. The previous code reinterpreted these bytes
+                 * as a uint16 array (valid only for the *unpacked* stream below),
+                 * which produced the garbled "wrong bit order" raw on Pi 4. */
+                write_pod(buf, raw + y * info.stride, rowPacked);
+            }
+            else
+            {
+                /* Unpacked SBGGR12 (Pi 5 / PiSP 'U'): 16-bit samples, right-
+                 * justified in the low 12 bits. */
+                const uint16_t *src = reinterpret_cast<const uint16_t *>(
+                                        raw + y * info.stride);
+                pack_row_12bit(src, rowBuf.data(), info.width);
+                write_pod(buf, rowBuf.data(), rowPacked);
+            }
+        }
+    }
+    else if (dng_info.bits == 10)
+    {
+        const uint32_t rowPacked = (info.width * 10 + 7) / 8;   /* 1.25 B / px */
+        /* pack_10bit_data() writes 5 bytes per 4-pixel group; size the scratch
+         * row to the rounded-up group count so a width that is not a multiple of
+         * 4 cannot overflow it. For the standard 10-bit modes (mult-of-4 width)
+         * this equals rowPacked exactly. */
+        rowBuf.resize(((info.width + 3u) / 4u) * 5u);
+
+        for (uint32_t y = 0; y < info.height; ++y)
+        {
+            if (bayer_format.packed)
+            {
+                /* CSI2-packed 10-bit (SBGGR10_CSI2P — the Pi 4 / VC4 'P' path):
+                 * already in the contiguous 10-bit DNG layout, copy verbatim. */
+                write_pod(buf, raw + y * info.stride, rowPacked);
+            }
+            else
+            {
+                /* Unpacked SBGGR10 (Pi 5 / PiSP 'U'): 16-bit samples, right-
+                 * justified in the low 10 bits → repack to contiguous 10-bit.
+                 * (The old verbatim path mishandled this: it copied a packed-
+                 * sized byte run out of a 16-bit-strided buffer.) */
+                const uint16_t *src = reinterpret_cast<const uint16_t *>(
+                                        raw + y * info.stride);
+                pack_10bit_data(src, rowBuf.data(), info.width);
+                write_pod(buf, rowBuf.data(), rowPacked);
+            }
         }
     }
     else
     {
-        /* 10-, 14- or 16-bit → copy verbatim, one active row each */
+        /* 14- or 16-bit → copy verbatim, one active row each */
         const uint32_t rowBytes = (info.width * dng_info.bits + 7) / 8;
         for (uint32_t y = 0; y < info.height; ++y)
             write_pod(buf, raw + y * info.stride, rowBytes);
