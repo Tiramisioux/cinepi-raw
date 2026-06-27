@@ -220,6 +220,39 @@ static inline void pack_row_16_to_12bit(const uint16_t *src,
     }
 }
 
+/* Unpack MIPI CSI-2 RAW12 (2 px in 3 bytes) to right-justified 16-bit (0..4095).
+ * VC4/Unicam delivers SBGGR12_CSI2P in this layout — verified against real Pi 4
+ * IMX477 captures (decoding as contiguous-12 instead gives a checkerboard/
+ * "wrong bit order" raw). Byte 2 holds the two low nibbles: the even pixel takes
+ * the low nibble, the odd pixel the high nibble. The output is right-justified so
+ * it feeds pack_row_12bit() (NOT pack_row_16_to_12bit, which drops 4 LSBs). */
+static inline void unpack_csi2_raw12(const uint8_t *src, uint16_t *dst, uint32_t width)
+{
+    for (uint32_t x = 0; x + 1 < width; x += 2)
+    {
+        const uint8_t b0 = src[0], b1 = src[1], b2 = src[2];
+        dst[x]     = (static_cast<uint16_t>(b0) << 4) |  (b2 & 0x0F);
+        dst[x + 1] = (static_cast<uint16_t>(b1) << 4) | ((b2 >> 4) & 0x0F);
+        src += 3;
+    }
+}
+
+/* Unpack MIPI CSI-2 RAW10 (4 px in 5 bytes) to right-justified 16-bit (0..1023).
+ * Byte 4 holds the four pixels' low 2 bits, first pixel in the lowest pair. Same
+ * MIPI convention as RAW12 above; feeds pack_10bit_data(). */
+static inline void unpack_csi2_raw10(const uint8_t *src, uint16_t *dst, uint32_t width)
+{
+    for (uint32_t x = 0; x + 3 < width; x += 4)
+    {
+        const uint8_t b0 = src[0], b1 = src[1], b2 = src[2], b3 = src[3], b4 = src[4];
+        dst[x]     = (static_cast<uint16_t>(b0) << 2) |  (b4 & 0x03);
+        dst[x + 1] = (static_cast<uint16_t>(b1) << 2) | ((b4 >> 2) & 0x03);
+        dst[x + 2] = (static_cast<uint16_t>(b2) << 2) | ((b4 >> 4) & 0x03);
+        dst[x + 3] = (static_cast<uint16_t>(b3) << 2) | ((b4 >> 6) & 0x03);
+        src += 5;
+    }
+}
+
 /*
  * PiSP COMP1 compressed Bayer decode.
  *
@@ -883,28 +916,30 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     {
         const uint32_t rowPacked = (info.width * 12 + 7) / 8;   /* 1.5 B / px */
         rowBuf.resize(rowPacked);
+        if (bayer_format.packed)
+            row16Buf.resize(info.width);
 
         for (uint32_t y = 0; y < info.height; ++y)
         {
+            const uint16_t *src;
             if (bayer_format.packed)
             {
-                /* CSI2-packed 12-bit (SBGGR12_CSI2P — the Pi 4 / VC4 'P' path).
-                 * The receiver already delivers the exact contiguous 12-bit DNG
-                 * layout that pack_row_12bit() produces, so the packed row is
-                 * copied verbatim. The previous code reinterpreted these bytes
-                 * as a uint16 array (valid only for the *unpacked* stream below),
-                 * which produced the garbled "wrong bit order" raw on Pi 4. */
-                write_pod(buf, raw + y * info.stride, rowPacked);
+                /* CSI2-packed 12-bit (SBGGR12_CSI2P — the Pi 4 / VC4 'P' path):
+                 * the receiver delivers MIPI CSI-2 RAW12, so unpack to right-
+                 * justified 16-bit before re-packing to the contiguous 12-bit DNG
+                 * layout. (A verbatim copy or a uint16 reinterpret here gives the
+                 * garbled "wrong bit order" raw seen on Pi 4.) */
+                unpack_csi2_raw12(raw + y * info.stride, row16Buf.data(), info.width);
+                src = row16Buf.data();
             }
             else
             {
                 /* Unpacked SBGGR12 (Pi 5 / PiSP 'U'): 16-bit samples, right-
                  * justified in the low 12 bits. */
-                const uint16_t *src = reinterpret_cast<const uint16_t *>(
-                                        raw + y * info.stride);
-                pack_row_12bit(src, rowBuf.data(), info.width);
-                write_pod(buf, rowBuf.data(), rowPacked);
+                src = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
             }
+            pack_row_12bit(src, rowBuf.data(), info.width);
+            write_pod(buf, rowBuf.data(), rowPacked);
         }
     }
     else if (dng_info.bits == 10)
@@ -915,26 +950,29 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
          * 4 cannot overflow it. For the standard 10-bit modes (mult-of-4 width)
          * this equals rowPacked exactly. */
         rowBuf.resize(((info.width + 3u) / 4u) * 5u);
+        if (bayer_format.packed)
+            row16Buf.resize(info.width);
 
         for (uint32_t y = 0; y < info.height; ++y)
         {
+            const uint16_t *src;
             if (bayer_format.packed)
             {
                 /* CSI2-packed 10-bit (SBGGR10_CSI2P — the Pi 4 / VC4 'P' path):
-                 * already in the contiguous 10-bit DNG layout, copy verbatim. */
-                write_pod(buf, raw + y * info.stride, rowPacked);
+                 * MIPI CSI-2 RAW10 → unpack to right-justified 16-bit, then
+                 * re-pack to the contiguous 10-bit DNG layout. (Same MIPI-vs-
+                 * contiguous fix as the 12-bit path above.) */
+                unpack_csi2_raw10(raw + y * info.stride, row16Buf.data(), info.width);
+                src = row16Buf.data();
             }
             else
             {
                 /* Unpacked SBGGR10 (Pi 5 / PiSP 'U'): 16-bit samples, right-
-                 * justified in the low 10 bits → repack to contiguous 10-bit.
-                 * (The old verbatim path mishandled this: it copied a packed-
-                 * sized byte run out of a 16-bit-strided buffer.) */
-                const uint16_t *src = reinterpret_cast<const uint16_t *>(
-                                        raw + y * info.stride);
-                pack_10bit_data(src, rowBuf.data(), info.width);
-                write_pod(buf, rowBuf.data(), rowPacked);
+                 * justified in the low 10 bits. */
+                src = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
             }
+            pack_10bit_data(src, rowBuf.data(), info.width);
+            write_pod(buf, rowBuf.data(), rowPacked);
         }
     }
     else
