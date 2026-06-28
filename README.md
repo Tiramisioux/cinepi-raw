@@ -20,9 +20,10 @@ sudo apt install -y python-pip git python3-jinja2 ffmpeg
 ## Install libcamera
 
 ```shell
-git clone https://github.com/raspberrypi/libcamera && \
-sudo find ~/libcamera -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod +x {} \; && \
+git clone https://github.com/will127534/libcamera && \
 cd libcamera && \
+git checkout 9d0cdfe5 && \
+sudo find ~/libcamera -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod +x {} \; && \
 sudo meson setup build --buildtype=release \
   -Dpipelines=rpi/vc4,rpi/pisp \
   -Dipas=rpi/vc4,rpi/pisp \
