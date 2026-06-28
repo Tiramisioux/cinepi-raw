@@ -20,7 +20,7 @@ sudo apt install -y python-pip git python3-jinja2 ffmpeg
 ## Install libcamera
 
 ```shell
-git clone https://github.com/will127534/libcamera && \
+git clone https://github.com/Tiramisioux/libcamera && \
 cd libcamera && \
 git checkout 9d0cdfe5 && \
 sudo find ~/libcamera -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod +x {} \; && \
