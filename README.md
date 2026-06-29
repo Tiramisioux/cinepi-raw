@@ -22,7 +22,7 @@ sudo apt install -y python-pip git python3-jinja2 ffmpeg
 ```shell
 git clone https://github.com/Tiramisioux/libcamera && \
 cd libcamera && \
-git checkout 9d0cdfe5 && \
+git checkout cinemate && \
 sudo find ~/libcamera -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod +x {} \; && \
 sudo meson setup build --buildtype=release \
   -Dpipelines=rpi/vc4,rpi/pisp \
