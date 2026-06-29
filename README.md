@@ -34,7 +34,7 @@ sudo meson setup build --buildtype=release \
   -Dcam=disabled \
   -Dqcam=disabled \
   -Ddocumentation=disabled \
-  -Dpycamera=enabled && \
+  -Dpycamera=disabled && \
 sudo ninja -C build install && \
 cd
 ```
