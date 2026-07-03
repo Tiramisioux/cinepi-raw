@@ -1,5 +1,6 @@
 #include "utils.hpp"
 #include <chrono>
+#include <cmath>
 #include <libcamera/control_ids.h>
 #include <libcamera/formats.h>
 #include <sys/time.h> // Required for gettimeofday
@@ -35,11 +36,19 @@ bool disk_mounted(RawOptions const *options){
 }
 
 void generate_filename(RawOptions *options, unsigned int clip_number,
-                       const libcamera::ControlList &metadata)
+                       const libcamera::ControlList &metadata, uint64_t ts_us)
 {
-    /* 1. Time stamp -------------------------------------------------------- */
+    /* 1. Time stamp --------------------------------------------------------
+     *  Prefer the sensor-derived wall-clock (ts_us µs since epoch) so the
+     *  filename uses the same moment as the DNG TC origin.  Fall back to
+     *  gettimeofday() only when no sensor timestamp is available.           */
     struct timeval tv;
-    gettimeofday(&tv, nullptr);
+    if (ts_us) {
+        tv.tv_sec  = static_cast<time_t>(ts_us / 1'000'000ULL);
+        tv.tv_usec = static_cast<suseconds_t>(ts_us % 1'000'000ULL);
+    } else {
+        gettimeofday(&tv, nullptr);
+    }
 
     std::time_t    raw_time     = tv.tv_sec;
     long           microseconds = tv.tv_usec;
@@ -48,38 +57,45 @@ void generate_filename(RawOptions *options, unsigned int clip_number,
     std::tm *time_info = std::localtime(&raw_time);
     std::strftime(time_string, sizeof(time_string), "%y-%m-%d_%H%M%S", time_info);
 
-    /* 2. Frame number inside the current second (FF) ----------------------- */
-    double frameRate = 24.0;                       // fallback
-    if (!metadata.empty())
+    /* 2. Frame number inside the current second (FF) -----------------------
+     *  Use the configured frame rate from options (set by the Redis FPS
+     *  handler) so the sub-second frame matches the DNG TC origin exactly.
+     *  Fall back to metadata FrameDuration, then to 24 fps.  Use llround to
+     *  match the DNG encoder's sub_frames calculation (llround vs floor was
+     *  the source of the one-frame-off between folder name and DNG TC).      */
+    double frameRate = 24.0;
+    if (options->framerate && *options->framerate > 0)
+        frameRate = *options->framerate;
+    else if (!metadata.empty())
         if (auto fd = metadata.get(libcamera::controls::FrameDuration);
             fd && *fd > 0)
-            frameRate = 1e6 / static_cast<double>(*fd);      // µs
+            frameRate = 1e6 / static_cast<double>(*fd);
 
     int frameNumber = static_cast<int>(
-                        (microseconds) / (1'000'000 / frameRate)) %
-                      static_cast<int>(frameRate);
+        std::llround(static_cast<double>(microseconds) * frameRate / 1'000'000.0)
+    ) % static_cast<int>(frameRate);
 
     /* 3. Assemble filename, incl. camera suffix ---------------------------- */
-    char filename[160];                            // plenty of room
+    char filename[160];
     const char *suffix = options->camPort.empty()
-                           ? "camX"                // debug default
+                           ? "camX"
                            : options->camPort.c_str();
 
     snprintf(filename, sizeof(filename),
              "CINEPI_%s_F%02d_C%05d_%s",
              time_string, frameNumber, clip_number, suffix);
 
-    options->folder = filename;                    // store for later
+    options->folder = filename;
 }
 
 
 
-bool create_clip_folder(RawOptions *options, unsigned int clip_number)
+bool create_clip_folder(RawOptions *options, unsigned int clip_number, uint64_t ts_us)
 {
     if (!disk_mounted(options))
         return false;
 
-    generate_filename(options, clip_number);
+    generate_filename(options, clip_number, libcamera::ControlList(), ts_us);
 
     std::string dir = options->mediaDest + "/" + options->folder;
 

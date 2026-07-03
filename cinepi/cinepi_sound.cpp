@@ -4,7 +4,6 @@
 #include <boost/property_tree/xml_parser.hpp>
 #include <boost/rational.hpp>
 #include <boost/numeric/conversion/cast.hpp>
-#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -20,11 +19,13 @@
 
 constexpr int FIXED_AUDIO_SAMPLE_RATE = 48000;
 constexpr int FALLBACK_AUDIO_SAMPLE_RATE = 44100;
-constexpr char RECORDER_VU_REDIS_KEY[] = "audio_vu";
+constexpr char RECORDER_VU_REDIS_KEY[]    = "audio_vu";
 constexpr char REDIS_DEFAULT_URL[] = "redis://127.0.0.1:6379/0";
 constexpr auto RECORDER_VU_PUBLISH_INTERVAL = std::chrono::milliseconds(33);
-constexpr auto AUDIO_MONITOR_SHUTDOWN_TIMEOUT = std::chrono::milliseconds(250);
-constexpr auto AUDIO_DEVICE_SETTLE_TIME = std::chrono::milliseconds(1200);
+// In --discard-output mode the idle monitor now skips draining and exits
+// within one ALSA period (<10 ms).  500 ms gives comfortable headroom while
+// still guaranteeing SIGKILL as a fallback for a stuck process.
+constexpr auto AUDIO_MONITOR_SHUTDOWN_TIMEOUT = std::chrono::milliseconds(500);
 
 // The first audio buffer marker lands after the hardware has already started
 // filling the capture pipeline. Subtract this latency when estimating the
@@ -74,18 +75,6 @@ std::string formatSeconds(double value)
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(6) << std::max(0.0, value);
     return oss.str();
-}
-
-bool parseTruthyValue(const std::optional<std::string> &value)
-{
-    if (!value)
-        return false;
-
-    std::string normalized = *value;
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return normalized == "1" || normalized == "true" ||
-           normalized == "yes" || normalized == "on";
 }
 
 std::optional<double> probeDurationSeconds(const std::string &filename)
@@ -239,12 +228,21 @@ std::optional<uintmax_t> waitForStableFile(const std::string &filename,
 {
     uintmax_t previousSize = 0;
     int stableReads = 0;
+    bool everPositive = false;
+    // A real take writes its WAV header at capture start, so the file reaches a
+    // positive size within a few hundred ms. If it never does, the take produced no
+    // WAV (aborted/failed) — bail fast instead of holding the audio thread for the
+    // full timeout. That timeout otherwise blocks the NEXT take's capture launch and
+    // clips the start of its audio (a dead previous take cost ~2.3s of late start,
+    // swallowing the first clap).
+    constexpr int absentGraceAttempts = 15; // ~1.5s at 100ms interval
 
     for (int attempt = 0; attempt < maxAttempts; ++attempt) {
         std::error_code ec;
         if (std::filesystem::exists(filename, ec)) {
             const auto currentSize = std::filesystem::file_size(filename, ec);
             if (!ec && currentSize > 0) {
+                everPositive = true;
                 if (currentSize == previousSize)
                     ++stableReads;
                 else
@@ -255,6 +253,11 @@ std::optional<uintmax_t> waitForStableFile(const std::string &filename,
                     return currentSize;
             }
         }
+
+        // Dead/aborted take: the WAV never reached a positive size within the grace
+        // window. Stop waiting so the next take's audio can launch immediately.
+        if (!everPositive && attempt >= absentGraceAttempts)
+            return std::nullopt;
 
         std::this_thread::sleep_for(interval);
     }
@@ -365,6 +368,13 @@ std::optional<ParsedWavMetadata> offsetMetadataSeconds(const ParsedWavMetadata &
 
     const int frameOffset = static_cast<int>(std::llround(secondsOffset * timecodeFramerate));
     return offsetMetadataFrames(metadata, frameOffset);
+}
+
+std::string formatDecibels(double value)
+{
+    std::ostringstream oss;
+    oss << std::showpos << std::fixed << std::setprecision(3) << value;
+    return oss.str();
 }
 
 std::optional<ParsedWavMetadata> buildMetadataFromWallclockNs(int64_t timestampNs,
@@ -747,69 +757,6 @@ void CinePISound::clearRecorderVuMeter()
     last_vu_publish_ts_ = std::chrono::steady_clock::time_point{};
 }
 
-void CinePISound::clearAudioConfig()
-{
-    audioFormat.clear();
-    defaultDevice.clear();
-    audioSampleRate = 0;
-    audioChannels = 0;
-    canRecordAudio = false;
-}
-
-void CinePISound::markAudioConfigDirty(const std::string& action, const std::string& device)
-{
-    {
-        std::lock_guard<std::mutex> lock(audio_config_mutex_);
-        audio_config_dirty_ = true;
-        audio_config_dirty_at_ = std::chrono::steady_clock::now();
-        clearAudioConfig();
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
-        pending_audio_capture_.reset();
-    }
-
-    stopMonitoring();
-    cleanupStaleIdleMonitorProcesses(console);
-    vu_meter.fill(0);
-    clearRecorderVuMeter();
-    console->warn("Audio device {} for {}; clearing cached capture config and waiting for ALSA to settle",
-                  action,
-                  device);
-}
-
-bool CinePISound::refreshAudioConfigIfSettled(bool force, const std::string& reason)
-{
-    std::unique_lock<std::mutex> lock(audio_config_mutex_);
-    if (!audio_config_dirty_)
-        return canRecordAudio;
-
-    while (true) {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = now - audio_config_dirty_at_;
-        if (elapsed >= AUDIO_DEVICE_SETTLE_TIME)
-            break;
-
-        if (!force)
-            return false;
-
-        const auto waitFor = AUDIO_DEVICE_SETTLE_TIME - elapsed;
-        lock.unlock();
-        std::this_thread::sleep_for(waitFor);
-        lock.lock();
-
-        if (!audio_config_dirty_)
-            return canRecordAudio;
-    }
-
-    console->info("Refreshing audio capture config after device change ({})", reason);
-    detectRecordingDevices();
-    parseHardwareParams();
-    audio_config_dirty_ = false;
-    return canRecordAudio;
-}
-
 void CinePISound::start() {
     cleanupStaleIdleMonitorProcesses(console);
     detectRecordingDevices();
@@ -860,38 +807,8 @@ bool CinePISound::tryAudioConfig(const std::string& device, const std::string& f
 void CinePISound::record_start() {
     console->info("record_start() called");
 
-    refreshAudioConfigIfSettled(true, "record_start");
-
-    std::string selectedDevice;
-    std::string selectedFormat;
-    int selectedChannels = 0;
-    int selectedSampleRate = 0;
-    bool selectedCanRecordAudio = false;
-    {
-        std::lock_guard<std::mutex> lock(audio_config_mutex_);
-        selectedDevice = defaultDevice;
-        selectedFormat = audioFormat;
-        selectedChannels = audioChannels;
-        selectedSampleRate = audioSampleRate;
-        selectedCanRecordAudio = canRecordAudio;
-    }
-
-    if (!selectedCanRecordAudio) {
+    if (!canRecordAudio) {
         console->warn("Audio recording not allowed (canRecordAudio = false)");
-        return;
-    }
-
-    bool storagePrerollActive = false;
-    if (redis_) {
-        try {
-            storagePrerollActive = parseTruthyValue(redis_->get("storage_preroll_active"));
-        } catch (const std::exception &exc) {
-            console->debug("Failed to read storage pre-roll state from Redis: {}", exc.what());
-        }
-    }
-
-    if (storagePrerollActive) {
-        console->info("Skipping audio capture during storage pre-roll take");
         return;
     }
 
@@ -919,56 +836,44 @@ void CinePISound::record_start() {
     std::string filename = oss.str();
     std::filesystem::create_directories(options_->mediaDest + "/" + options_->folder);
 
-    if (selectedDevice.empty() || selectedFormat.empty() || selectedChannels == 0 || selectedSampleRate <= 0) {
+    if (defaultDevice.empty() || audioFormat.empty() || audioChannels == 0) {
         console->error("record_start(): Missing audio configuration — cannot start recording");
         return;
     }
 
     const std::string helperBinary = locateAudioCaptureHelper();
-    const bool use_plain_arecord_for_16bit = (selectedDevice == "mic_16bit");
-    const std::string capturePath =
-        use_plain_arecord_for_16bit
-            ? "plain-arecord-mic16"
-            : (!helperBinary.empty() ? "cinepi-audio-capture" : "plain-arecord-helper-missing");
-    const bool captureEmitsMarkers = !use_plain_arecord_for_16bit && !helperBinary.empty();
-    const bool stopMonitorBeforeLaunch = !use_plain_arecord_for_16bit;
+    const bool is_16bit_mic = (defaultDevice == "mic_16bit");
+    // Route every format through the capture helper whenever it is available:
+    // the helper carries the SCHED_FIFO + xrun silence-fill protection. A 16-bit
+    // mic on plain arecord drops samples under storage load, producing a short
+    // WAV — progressive drift plus a dead-silent tail equal to the lost frames.
+    // Plain arecord is now only a fallback for a missing helper binary.
+    const bool use_helper = !helperBinary.empty();
 
     cmdStream.str("");
     cmdStream.clear();
-    if (captureEmitsMarkers) {
+    if (use_helper) {
         cmdStream << shellQuote(helperBinary)
-                  << " --device " << shellQuote(selectedDevice)
-                  << " --format " << shellQuote(selectedFormat)
-                  << " --channels " << selectedChannels
-                  << " --rate " << selectedSampleRate
+                  << " --device " << shellQuote(defaultDevice)
+                  << " --format " << shellQuote(audioFormat)
+                  << " --channels " << audioChannels
+                  << " --rate " << audioSampleRate
                   << " --output " << shellQuote(filename)
                   << " 2>&1";
     } else {
-        if (use_plain_arecord_for_16bit) {
-            console->info("Using plain arecord for mic_16bit take capture while leaving idle monitoring active");
-        } else {
-            console->warn("cinepi-audio-capture helper not found; falling back to arecord without precise audio-start markers");
-        }
+        console->warn("cinepi-audio-capture helper not found; falling back to plain arecord without precise audio-start markers or xrun silence-fill");
         cmdStream << "arecord"
                   << " -q"
-                  << " -D " << selectedDevice
-                  << " -f " << selectedFormat
-                  << " -c " << selectedChannels
-                  << " -r " << selectedSampleRate
+                  << " -D " << defaultDevice
+                  << " -f " << audioFormat
+                  << " -c " << audioChannels
+                  << " -r " << audioSampleRate
                   << " -t wav"
                   << " --disable-softvol"
                   << " " << shellQuote(filename)
                   << " 2>&1";
     }
 
-    console->info("Audio capture path selected: {} (device {}, format {}, channels {}, rate {}, emits_start_markers {}, stop_idle_monitor_before_launch {})",
-                  capturePath,
-                  selectedDevice,
-                  selectedFormat,
-                  selectedChannels,
-                  selectedSampleRate,
-                  captureEmitsMarkers ? "yes" : "no",
-                  stopMonitorBeforeLaunch ? "yes" : "no");
     console->info("Queueing audio capture command: {}", cmdStream.str());
     console->info("Video recording will continue immediately while audio starts asynchronously");
 
@@ -982,21 +887,34 @@ void CinePISound::record_start() {
     ts_end = 0;
     ts_audio_start_realtime = 0;
     audio_capture_started_ = false;
-    audio_capture_emits_markers_ = captureEmitsMarkers;
-    audio_capture_path_ = capturePath;
+    audio_capture_emits_markers_ = true;
+    audio_capture_via_plain_arecord_ = !use_helper;
+    audio_capture_is_16bit_mic_ = is_16bit_mic;
+    audio_capture_gain_db_ = 0.0;
+    if (audio_capture_is_16bit_mic_ && redis_) {
+        try {
+            auto gainValue = redis_->get("audio_capture_gain_db");
+            if (gainValue && !gainValue->empty()) {
+                audio_capture_gain_db_ = std::stod(*gainValue);
+            }
+        } catch (const std::exception &exc) {
+            console->warn("Invalid audio_capture_gain_db for mic_16bit path: {}", exc.what());
+            audio_capture_gain_db_ = 0.0;
+        }
+    }
+    if (audio_capture_is_16bit_mic_ && std::abs(audio_capture_gain_db_) > 1e-6) {
+        console->info("Queued mic_16bit software gain from settings: {} dB",
+                      formatDecibels(audio_capture_gain_db_));
+    }
     publishRecorderVuMeter(true);
 
     record_ = true;
     std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
     pending_audio_capture_ = PendingAudioCapture{
         cmdStream.str(),
-        capturePath,
-        stopMonitorBeforeLaunch,
-        captureEmitsMarkers
+        use_helper,
+        use_helper
     };
-
-    if (!captureEmitsMarkers && capturedAudioSampleRate <= 0)
-        capturedAudioSampleRate = selectedSampleRate;
 }
 
 void CinePISound::launchPendingRecordingStart()
@@ -1037,20 +955,18 @@ void CinePISound::launchPendingRecordingStart()
     }
 
     audio_capture_emits_markers_ = pending->emits_helper_markers;
-    audio_capture_path_ = pending->capture_path;
     audio_capture_started_ = !audio_capture_emits_markers_;
     if (!audio_capture_emits_markers_ && capturedAudioSampleRate <= 0)
         capturedAudioSampleRate = audioSampleRate;
 
-    console->info("Audio capture path active: {} (emits_start_markers {}, stop_idle_monitor_before_launch {})",
-                  audio_capture_path_,
-                  audio_capture_emits_markers_ ? "yes" : "no",
-                  pending->stop_monitoring_before_launch ? "yes" : "no");
     console->info("Audio capture helper started successfully (pid={})", pid);
     recording_ = true;
 }
 
 void CinePISound::record_stop() {
+    if(!canRecordAudio)
+        return;
+
     record_ = false;
     {
         std::lock_guard<std::mutex> lock(pending_audio_capture_mutex_);
@@ -1061,13 +977,7 @@ void CinePISound::record_stop() {
     }
     console->info("Sound recording stopped.");
 
-    bool shouldRestartMonitoring = false;
-    {
-        std::lock_guard<std::mutex> lock(audio_config_mutex_);
-        shouldRestartMonitoring = canRecordAudio && !audio_config_dirty_;
-    }
-
-    if (shouldRestartMonitoring) {
+    if (canRecordAudio) {
         startMonitoring();
     }
 }
@@ -1178,6 +1088,13 @@ void CinePISound::stopIdleVuMonitoring()
         monitor_vu_pid_ = -1;
     }
     monitoring_vu_ = false;
+
+    // Brief settle so the dsnoop shared-memory segment the idle monitor held is
+    // fully released before the recorder opens a new handle.  Without this, the
+    // recorder may attach to a partially-cleaned dsnoop state and inherit a
+    // pre-start backlog (intercept offset).  50 ms is negligible at record start
+    // and well under one video frame at any supported frame rate.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
 void CinePISound::startIdleVuMonitoring()
@@ -1277,8 +1194,6 @@ void CinePISound::soundThread() {
     init_udev();
 
     while (!abortThread_) {
-        refreshAudioConfigIfSettled(false, "udev settle");
-
         if (pid <= 0 && !recording_) {
             launchPendingRecordingStart();
         }
@@ -1344,27 +1259,23 @@ void CinePISound::soundThread() {
             auto finishRecordingAttempt = [this]() {
                 audio_capture_started_ = false;
                 audio_capture_emits_markers_ = true;
-                audio_capture_path_ = "unknown";
+                audio_capture_via_plain_arecord_ = false;
+                audio_capture_is_16bit_mic_ = false;
+                audio_capture_gain_db_ = 0.0;
                 vu_meter.fill(0);
                 clearRecorderVuMeter();
                 startMonitoring();
             };
 
-            std::ostringstream fn_oss;
-            fn_oss << options_->mediaDest << '/' << options_->folder << '/' << options_->folder << ".wav";
-            std::string filename = fn_oss.str();
-
             if (!audio_capture_started_ && audio_capture_emits_markers_) {
                 console->warn("Audio capture helper exited before capture actually started; continuing take without WAV");
-                std::error_code remove_ec;
-                if (std::filesystem::remove(filename, remove_ec))
-                    console->warn("Removed incomplete WAV after failed audio capture start: {}", filename);
-                else if (remove_ec)
-                    console->warn("Failed to remove incomplete WAV after failed audio capture start: {}",
-                                  remove_ec.message());
                 finishRecordingAttempt();
                 continue;
             }
+
+            std::ostringstream fn_oss;
+            fn_oss << options_->mediaDest << '/' << options_->folder << '/' << options_->folder << ".wav";
+            std::string filename = fn_oss.str();
 
             const auto wavSize = waitForStableFile(filename);
             if (!wavSize) {
@@ -1375,6 +1286,51 @@ void CinePISound::soundThread() {
             }
             console->debug("WAV ready for metadata update: {} bytes", *wavSize);
 
+            if (audio_capture_is_16bit_mic_ && std::abs(audio_capture_gain_db_) > 1e-6) {
+                std::ostringstream gainFilter;
+                gainFilter << "volume=" << std::fixed << std::setprecision(3)
+                           << audio_capture_gain_db_ << "dB";
+
+                std::ostringstream gainTmpOss;
+                gainTmpOss << options_->mediaDest << '/' << options_->folder << "/gain.wav";
+                const std::string gainTmp = gainTmpOss.str();
+
+                std::ostringstream gainCmd;
+                gainCmd << "ffmpeg -hide_banner -loglevel error -y"
+                        << " -i " << shellQuote(filename)
+                        << " -map 0:a:0"
+                        << " -af " << shellQuote(gainFilter.str())
+                        << " -c:a pcm_s16le"
+                        << " -ar " << audioSampleRate
+                        << " -ac " << audioChannels
+                        << ' ' << shellQuote(gainTmp);
+
+                std::string gainError;
+                const int gainStatus = run_with_stderr_capture(gainCmd.str(), gainError);
+                if (shellExitCode(gainStatus) != 0) {
+                    console->warn("Failed to apply mic_16bit software gain {} dB (rc={}): {}; keeping original WAV",
+                                  formatDecibels(audio_capture_gain_db_),
+                                  shellExitCode(gainStatus),
+                                  gainError.empty() ? "no stderr output" : gainError);
+                    std::error_code removeGainTmpEc;
+                    std::filesystem::remove(gainTmp, removeGainTmpEc);
+                } else {
+                    std::error_code renameGainEc;
+                    std::filesystem::rename(gainTmp, filename, renameGainEc);
+                    if (renameGainEc) {
+                        console->warn("Failed to replace WAV after mic_16bit software gain: {}; keeping original WAV",
+                                      renameGainEc.message());
+                        std::error_code removeGainTmpEc;
+                        std::filesystem::remove(gainTmp, removeGainTmpEc);
+                    } else {
+                        console->info("Applied mic_16bit software gain {} dB from settings before WAV metadata",
+                                      formatDecibels(audio_capture_gain_db_));
+                    }
+                }
+            }
+
+            // ADC clock correction ppm — applies on the helper capture path for any
+            // mic whose card matches the clock-correction database (16- or 24-bit).
             int64_t vts_start = 0, vts_end = 0;
             int64_t frames = app_->GetEncoder()->timestamps.size();
             if (frames > 0) {
@@ -1405,14 +1361,6 @@ void CinePISound::soundThread() {
                 ts_start);
             const bool have_audio_start_marker = audio_marker_ns != 0;
             const bool have_precise_audio_start_marker = ts_audio_start_realtime != 0;
-            const std::string audioCapturePath =
-                audio_capture_path_.empty() ? "unknown" : audio_capture_path_;
-            const std::string audioStartMarkerStatus =
-                have_precise_audio_start_marker
-                    ? "precise-realtime"
-                    : (have_audio_start_marker
-                           ? "estimated-buffer"
-                           : (audio_capture_emits_markers_ ? "missing-expected" : "not-emitted"));
             const int inputSampleRate =
                 capturedAudioSampleRate > 0 ? capturedAudioSampleRate : audioSampleRate;
 
@@ -1464,9 +1412,6 @@ void CinePISound::soundThread() {
             std::array<uint8_t, 8> metadataTimecode = encoderTimecode;
             std::array<uint16_t, 3> metadataDate = encoderDate;
             std::string metadataSource = "encoder";
-            bool havePlainArecordTimecodeOffset = false;
-            bool plainArecordTimecodeOffsetApplied = false;
-            int plainArecordTimecodeOffsetFrames = 0;
 
             if (have_precise_audio_start_marker) {
                 if (auto audioStartMetadata =
@@ -1524,43 +1469,41 @@ void CinePISound::soundThread() {
                 metadataDate = takeStartOriginationDate_;
                 if (takeStartFramerate_ > 0.0)
                     output_framerate = takeStartFramerate_;
-                metadataSource =
-                    audio_capture_emits_markers_ ? "take-start-fallback" : "plain-arecord-fallback";
+                metadataSource = "take-start-fallback";
+            }
 
-                const int configuredPlainArecordOffset =
-                    options_ ? options_->plain_arecord_timecode_offset_frames : 0;
-                if (audioCapturePath == "plain-arecord-mic16" &&
-                    configuredPlainArecordOffset != 0) {
-                    havePlainArecordTimecodeOffset = true;
-                    plainArecordTimecodeOffsetFrames = configuredPlainArecordOffset;
+            // Per-path WAV metadata timecode offset. 16-bit mics (helper or plain-arecord
+            // fallback) use plain_arecord_timecode_offset_frames (audio.16bit.timecode_offset_frames);
+            // 24-bit mics use audio_timecode_offset_frames (audio.24bit.timecode_offset_frames).
+            // Both only shift the embedded timecode — the PCM is never moved.
+            const bool is16bitPath = audio_capture_is_16bit_mic_;
+            const int configuredTimecodeOffset =
+                options_ ? (is16bitPath ? options_->plain_arecord_timecode_offset_frames
+                                        : options_->audio_timecode_offset_frames)
+                         : 0;
+            if (configuredTimecodeOffset != 0) {
+                ParsedWavMetadata offsetMetadata;
+                offsetMetadata.timecode = metadataTimecode;
+                offsetMetadata.originationDate = metadataDate;
+                offsetMetadata.framerate = output_framerate;
 
-                    ParsedWavMetadata plainArecordMetadata;
-                    plainArecordMetadata.timecode = metadataTimecode;
-                    plainArecordMetadata.originationDate = metadataDate;
-                    plainArecordMetadata.framerate = output_framerate;
-
-                    if (auto correctedMetadata =
-                            offsetMetadataFrames(plainArecordMetadata,
-                                                 configuredPlainArecordOffset)) {
-                        metadataTimecode = correctedMetadata->timecode;
-                        metadataDate = correctedMetadata->originationDate;
-                        output_framerate = correctedMetadata->framerate;
-                        plainArecordTimecodeOffsetApplied = true;
-                        console->info(
-                            "Applied plain arecord mic16 WAV metadata correction: {:+d} frames; PCM untouched",
-                            configuredPlainArecordOffset);
-                    } else {
-                        console->warn(
-                            "Could not apply plain arecord mic16 WAV metadata correction ({:+d} frames); using uncorrected take-start metadata",
-                            configuredPlainArecordOffset);
-                    }
+                const char *pathLabel = is16bitPath ? "mic_16bit" : "mic_24bit";
+                if (auto correctedMetadata =
+                        offsetMetadataFrames(offsetMetadata, configuredTimecodeOffset)) {
+                    metadataTimecode = correctedMetadata->timecode;
+                    metadataDate = correctedMetadata->originationDate;
+                    output_framerate = correctedMetadata->framerate;
+                    metadataSource += is16bitPath ? "+16bit-offset" : "+timecode-offset";
+                    console->info("Applied {} WAV metadata timecode offset: {:+d} frames; PCM timing unchanged",
+                                  pathLabel, configuredTimecodeOffset);
+                } else {
+                    console->warn("Could not apply {} WAV metadata timecode offset ({:+d} frames); using uncorrected metadata",
+                                  pathLabel, configuredTimecodeOffset);
                 }
             }
 
             if (!have_audio_start_marker) {
-                console->warn("No audio start marker received on capture path {} (marker status {}); writing WAV metadata from {} without touching PCM",
-                              audioCapturePath,
-                              audioStartMarkerStatus,
+                console->warn("No audio start marker received; writing WAV metadata from {} without touching PCM",
                               metadataSource);
             }
 
@@ -1582,9 +1525,9 @@ void CinePISound::soundThread() {
                 computeTimeReferenceSamples(metadataTimecode, outputSampleRate, output_framerate);
 
             ffmpeg_oss << "ffmpeg -hide_banner -loglevel error -y -i " << shellQuote(filename);
+            ffmpeg_oss << " -map 0:a:0";
+            ffmpeg_oss << " -c:a copy";
             ffmpeg_oss
-                       << " -map 0:a:0"
-                       << " -c:a copy"
                        << " -write_bext 1"
                        << " -metadata " << shellQuote("description=CinePI Description")
                        << " -metadata " << shellQuote("originator=" + options_->ucm.value_or("CinePI"))
@@ -1597,6 +1540,7 @@ void CinePISound::soundThread() {
 
             std::string ffmpeg_error;
             const int ffmpeg_status = run_with_stderr_capture(ffmpeg_oss.str(), ffmpeg_error);
+
             if (shellExitCode(ffmpeg_status) != 0) {
                 console->critical("ffmpeg WAV metadata write failed (rc={}): {}",
                                   shellExitCode(ffmpeg_status),
@@ -1617,24 +1561,17 @@ void CinePISound::soundThread() {
                 generateIXML(metadataTimecode,
                              output_framerate,
                              metadataSource,
-                             audioCapturePath,
-                             audioStartMarkerStatus,
                              have_audio_start_marker,
                              start_delta_seconds,
                              audioStartOffsetFrames,
-                             audioStartOffsetSamples,
-                             havePlainArecordTimecodeOffset,
-                             plainArecordTimecodeOffsetFrames,
-                             plainArecordTimecodeOffsetApplied);
+                             audioStartOffsetSamples);
             if (!appendIXMLChunk(filename, ixml)) {
                 console->critical("Failed to append iXML chunk to WAV");
             } else {
-                console->info("Attached WAV metadata without altering PCM: timecode {}, rate {}, source {}, capture path {}, marker status {}, audio start offset {:+.6f}s ({} frames, {} samples), BEXT + iXML",
+                console->info("Attached WAV metadata without altering PCM: timecode {}, rate {}, source {}, audio start offset {:+.6f}s ({} frames, {} samples), BEXT + iXML",
                               timecode_tag,
                               output_framerate,
                               metadataSource,
-                              audioCapturePath,
-                              audioStartMarkerStatus,
                               start_delta_seconds,
                               audioStartOffsetFrames,
                               audioStartOffsetSamples);
@@ -1659,10 +1596,17 @@ void CinePISound::soundThread() {
                 if ((action == "add" || action == "change") &&
                     device.find("card") != std::string::npos) {
                     console->critical("Action:{} | Device:{}", action, device);
-                    markAudioConfigDirty(action, device);
+                    detectRecordingDevices();
+                    parseHardwareParams();
                 } else if (action == "remove" && device.find("card") != std::string::npos) {
+                    stopMonitoring();
                     recording_ = false;
-                    markAudioConfigDirty(action, device);
+                    canRecordAudio = false;
+                    audioFormat = "";
+                    defaultDevice.clear();
+                    audioSampleRate = 0;
+                    audioChannels = 0;
+                    clearRecorderVuMeter();
                     console->critical("Sound card removed!");
                 }
                 udev_device_unref(udev_dev);
@@ -1683,15 +1627,10 @@ void CinePISound::resetTakeMetadata()
 std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
                                       double framerate,
                                       const std::string &timecodeSource,
-                                      const std::string &audioCapturePath,
-                                      const std::string &audioStartMarkerStatus,
                                       bool haveAudioStartOffset,
                                       double audioStartOffsetSeconds,
                                       int audioStartOffsetFrames,
-                                      long long audioStartOffsetSamples,
-                                      bool havePlainArecordTimecodeOffset,
-                                      int plainArecordTimecodeOffsetFrames,
-                                      bool plainArecordTimecodeOffsetApplied) const {
+                                      long long audioStartOffsetSamples) const {
     boost::property_tree::ptree tree;
 
     tree.put("BWFXML.IXML_VERSION", "1.5");
@@ -1709,20 +1648,12 @@ std::string CinePISound::generateIXML(const std::array<uint8_t, 8> &timecode,
     tree.put("BWFXML.SPEED.TIMECODE_RATE", tfps);
     tree.put("BWFXML.SPEED.TIMECODE_FLAG", "NDF");
     tree.put("BWFXML.CINEPI_TIMECODE_SOURCE", timecodeSource);
-    tree.put("BWFXML.CINEPI_AUDIO_CAPTURE_PATH", audioCapturePath);
-    tree.put("BWFXML.CINEPI_AUDIO_START_MARKER_STATUS", audioStartMarkerStatus);
     if (haveAudioStartOffset) {
         std::ostringstream offsetSeconds;
         offsetSeconds << std::showpos << std::fixed << std::setprecision(6) << audioStartOffsetSeconds;
         tree.put("BWFXML.CINEPI_AUDIO_START_OFFSET_SECONDS", offsetSeconds.str());
         tree.put("BWFXML.CINEPI_AUDIO_START_OFFSET_FRAMES", std::to_string(audioStartOffsetFrames));
         tree.put("BWFXML.CINEPI_AUDIO_START_OFFSET_SAMPLES", std::to_string(audioStartOffsetSamples));
-    }
-    if (havePlainArecordTimecodeOffset) {
-        tree.put("BWFXML.CINEPI_PLAIN_ARECORD_TIMECODE_OFFSET_FRAMES",
-                 std::to_string(plainArecordTimecodeOffsetFrames));
-        tree.put("BWFXML.CINEPI_PLAIN_ARECORD_TIMECODE_OFFSET_APPLIED",
-                 plainArecordTimecodeOffsetApplied ? "true" : "false");
     }
 
     boost::property_tree::xml_writer_settings<std::string> settings('\t', 1);

@@ -66,7 +66,7 @@
 	 { formats::R10_CSI2P, { "BGGR-10", 10, TIFF_BGGR, true, false } },
 	 { formats::R10, { "BGGR-10", 10, TIFF_BGGR, false, false } },
 	 // Currently not in the main libcamera branch
-	 { formats::R12_CSI2P, { "BGGR-12", 12, TIFF_BGGR, true } },
+	 { formats::R12_CSI2P, { "BGGR-12", 12, TIFF_BGGR, true, false } },
 	 { formats::R12, { "BGGR-12", 12, TIFF_BGGR, false, false } },
 		 { formats::R16, { "BGGR-16", 16, TIFF_BGGR, false, false } },
  

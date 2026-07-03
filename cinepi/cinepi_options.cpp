@@ -211,7 +211,11 @@ CinePiOptions::CinePiOptions()
                     "Nice level (-20..19) for disk workers")
                 ("plain-arecord-timecode-offset-frames",
                     value<int>()->default_value(0),
-                    "Frame offset to add to plain arecord WAV metadata timecode; PCM is unchanged");
+                    "Frame offset to add to plain arecord WAV metadata timecode; PCM is unchanged")
+                ("unique-camera-model",
+                    value<std::string>(),
+                    "Override the DNG UniqueCameraModel tag "
+                    "(default: \"cinepi\")");
         options_.add(cinepi_group);
 }
 
@@ -513,9 +517,33 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                 if (arg == "--plain-arecord-timecode-offset-frames") {
                         if (i + 1 >= argc)
                                 throw std::runtime_error("--plain-arecord-timecode-offset-frames requires a value");
-                        RawOptions::plain_arecord_timecode_offset_frames = parseFrameOffset(
-                                "--plain-arecord-timecode-offset-frames",
-                                argv[++i]);
+                        RawOptions::plain_arecord_timecode_offset_frames =
+                                parseFrameOffset("--plain-arecord-timecode-offset-frames", argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--audio-timecode-offset-frames=", 0) == 0) {
+                        RawOptions::audio_timecode_offset_frames = parseFrameOffset(
+                                "--audio-timecode-offset-frames",
+                                arg.substr(sizeof("--audio-timecode-offset-frames=") - 1));
+                        continue;
+                }
+                if (arg == "--audio-timecode-offset-frames") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--audio-timecode-offset-frames requires a value");
+                        RawOptions::audio_timecode_offset_frames =
+                                parseFrameOffset("--audio-timecode-offset-frames", argv[++i]);
+                        continue;
+                }
+
+                if (arg.rfind("--unique-camera-model=", 0) == 0) {
+                        RawOptions::ucm = arg.substr(sizeof("--unique-camera-model=") - 1);
+                        continue;
+                }
+                if (arg == "--unique-camera-model") {
+                        if (i + 1 >= argc)
+                                throw std::runtime_error("--unique-camera-model requires a value");
+                        RawOptions::ucm = argv[++i];
                         continue;
                 }
 

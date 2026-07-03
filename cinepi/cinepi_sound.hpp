@@ -59,15 +59,10 @@ private:
     std::string generateIXML(const std::array<uint8_t, 8>& timecode,
                              double framerate,
                              const std::string& timecodeSource,
-                             const std::string& audioCapturePath,
-                             const std::string& audioStartMarkerStatus,
                              bool haveAudioStartOffset,
                              double audioStartOffsetSeconds,
                              int audioStartOffsetFrames,
-                             long long audioStartOffsetSamples,
-                             bool havePlainArecordTimecodeOffset,
-                             int plainArecordTimecodeOffsetFrames,
-                             bool plainArecordTimecodeOffsetApplied) const;
+                             long long audioStartOffsetSamples) const;
     bool appendIXMLChunk(const std::string& wav_path, const std::string& xml_payload);
     void resetTakeMetadata();
     void publishMicSelection();
@@ -76,9 +71,6 @@ private:
     void clearRecorderVuMeter();
     std::vector<std::string> parseArecordAliases();
     void stopMonitoring();
-    void clearAudioConfig();
-    void markAudioConfigDirty(const std::string& action, const std::string& device);
-    bool refreshAudioConfigIfSettled(bool force, const std::string& reason);
     void launchPendingRecordingStart();
     void startMonitoring();
     void startPlaybackMonitoring();
@@ -90,7 +82,6 @@ private:
     struct PendingAudioCapture
     {
         std::string command;
-        std::string capture_path;
         bool stop_monitoring_before_launch = true;
         bool emits_helper_markers = true;
     };
@@ -112,10 +103,9 @@ private:
     bool record_;
     bool audio_capture_started_;
     bool audio_capture_emits_markers_ = true;
-    std::string audio_capture_path_ = "unknown";
-    bool audio_config_dirty_ = false;
-    std::chrono::steady_clock::time_point audio_config_dirty_at_{};
-    std::mutex audio_config_mutex_;
+    bool audio_capture_via_plain_arecord_ = false;
+    bool audio_capture_is_16bit_mic_ = false;
+    double audio_capture_gain_db_ = 0.0;
     std::mutex pending_audio_capture_mutex_;
     std::stringstream cmdStream;
     CinePIRecorder *app_;

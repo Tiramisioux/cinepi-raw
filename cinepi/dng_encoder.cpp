@@ -13,6 +13,7 @@
  #include <libcamera/formats.h>     // libcamera::formats::
  #include <cmath>
 #include <cstring>
+#include <cerrno>
  #include <stdexcept>
  #include <iomanip>
  
@@ -219,6 +220,39 @@ static inline void pack_row_16_to_12bit(const uint16_t *src,
     }
 }
 
+/* Unpack MIPI CSI-2 RAW12 (2 px in 3 bytes) to right-justified 16-bit (0..4095).
+ * VC4/Unicam delivers SBGGR12_CSI2P in this layout — verified against real Pi 4
+ * IMX477 captures (decoding as contiguous-12 instead gives a checkerboard/
+ * "wrong bit order" raw). Byte 2 holds the two low nibbles: the even pixel takes
+ * the low nibble, the odd pixel the high nibble. The output is right-justified so
+ * it feeds pack_row_12bit() (NOT pack_row_16_to_12bit, which drops 4 LSBs). */
+static inline void unpack_csi2_raw12(const uint8_t *src, uint16_t *dst, uint32_t width)
+{
+    for (uint32_t x = 0; x + 1 < width; x += 2)
+    {
+        const uint8_t b0 = src[0], b1 = src[1], b2 = src[2];
+        dst[x]     = (static_cast<uint16_t>(b0) << 4) |  (b2 & 0x0F);
+        dst[x + 1] = (static_cast<uint16_t>(b1) << 4) | ((b2 >> 4) & 0x0F);
+        src += 3;
+    }
+}
+
+/* Unpack MIPI CSI-2 RAW10 (4 px in 5 bytes) to right-justified 16-bit (0..1023).
+ * Byte 4 holds the four pixels' low 2 bits, first pixel in the lowest pair. Same
+ * MIPI convention as RAW12 above; feeds pack_10bit_data(). */
+static inline void unpack_csi2_raw10(const uint8_t *src, uint16_t *dst, uint32_t width)
+{
+    for (uint32_t x = 0; x + 3 < width; x += 4)
+    {
+        const uint8_t b0 = src[0], b1 = src[1], b2 = src[2], b3 = src[3], b4 = src[4];
+        dst[x]     = (static_cast<uint16_t>(b0) << 2) |  (b4 & 0x03);
+        dst[x + 1] = (static_cast<uint16_t>(b1) << 2) | ((b4 >> 2) & 0x03);
+        dst[x + 2] = (static_cast<uint16_t>(b2) << 2) | ((b4 >> 4) & 0x03);
+        dst[x + 3] = (static_cast<uint16_t>(b3) << 2) | ((b4 >> 6) & 0x03);
+        src += 5;
+    }
+}
+
 /*
  * PiSP COMP1 compressed Bayer decode.
  *
@@ -376,8 +410,9 @@ static void unpack_pisp_comp1_row_to_packed12(const uint8_t *src, uint8_t *dst, 
         uint16_t working[8] {};
         uint8_t packed[12] {};
         decode_pisp_comp1_block(src, working);
-        pack_row_16_to_12bit(working, packed, remaining);
-        std::memcpy(dst + (static_cast<size_t>(x) / 2u) * 3u, packed, (remaining * 12u + 7u) / 8u);
+        const uint32_t tail = std::min(remaining, 8u);
+        pack_row_16_to_12bit(working, packed, tail);
+        std::memcpy(dst + (static_cast<size_t>(x) / 2u) * 3u, packed, (tail * 12u + 7u) / 8u);
     }
 }
 
@@ -527,13 +562,35 @@ void DngEncoder::configureThreadContext(const std::string &baseName,
     std::vector<int> cpus_to_pin;
     if (affinity && !affinity->empty())
     {
-        if (affinity->size() >= total)
+        /* ── Audio-core isolation guard ───────────────────────────────────
+         * cinepi-audio-capture pins itself to the last online core at
+         * SCHED_FIFO priority 80 (see cinepi_audio_capture.cpp). DNG encode
+         * and disk workers must never share that core, or the USB-audio
+         * capture loop stalls and the WAV loses sync. Strip the audio core
+         * from any requested set here so a storage recorder profile can never
+         * place workers on it (a stale ext4 "2-3" on a 4-core Pi would).
+         * No-op when the audio core was not requested. Skipped on <=2 cores,
+         * where there is nothing to isolate. */
+        std::vector<int> safe_affinity;
+        const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        const int audio_core = (online_cpus > 2) ? static_cast<int>(online_cpus) - 1 : -1;
+        for (int cpu : *affinity)
+            if (cpu != audio_core)
+                safe_affinity.push_back(cpu);
+        if (safe_affinity.empty())   /* only the audio core was requested */
+            for (int cpu = 0; cpu < static_cast<int>(online_cpus) - 1; ++cpu)
+                safe_affinity.push_back(cpu);
+        if (console && audio_core >= 0 && safe_affinity.size() != affinity->size())
+            console->info("{}: excluded audio core {} from requested affinity",
+                          name, audio_core);
+
+        if (safe_affinity.size() >= total)
         {
-            cpus_to_pin.push_back((*affinity)[index % affinity->size()]);
+            cpus_to_pin.push_back(safe_affinity[index % safe_affinity.size()]);
         }
         else
         {
-            cpus_to_pin.assign(affinity->begin(), affinity->end());
+            cpus_to_pin.assign(safe_affinity.begin(), safe_affinity.end());
         }
 
         cpu_set_t cpu_mask;
@@ -605,6 +662,7 @@ void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const 
             options_ ? options_->folder : std::string()
         };
         encode_queue_.push(item);
+        frames_in_flight_.fetch_add(1, std::memory_order_relaxed);
         encode_cond_var_.notify_one();
     }
 }
@@ -732,9 +790,14 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
 
     /* ──  Static strings & misc  ──────────────────────────────── */
     dng_info.make       = "Raspberry Pi";
-    dng_info.model      = "SONY IMX585-AAQJ1";
+    /* Model = the attached sensor (libcamera properties::Model, falling back to
+     * the camera id), captured into options_->model in cinepi_raw.cpp. So the DNG
+     * carries the real sensor name even when cinepi-raw is run without Cinemate. */
+    dng_info.model      = (options_ && !options_->model.empty())
+                              ? options_->model
+                              : std::string("unknown sensor");
     dng_info.software   = "Libcamera;cinepi-raw";
-    dng_info.ucm        = "CinePi";
+    dng_info.ucm        = options_->ucm.value_or("cinepi");
     dng_info.serial     = getHwId();
     dng_info.compression = COMPRESSION_NONE;
 
@@ -793,7 +856,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                             [[maybe_unused]] size_t             losize,
                             const libcamera::ControlList       &metadata,
                             int64_t                             timestamp_us,
-                            uint64_t                            fn)
+                            int64_t                             tc_frame_count)
 {
     thread_local std::vector<uint8_t> rowBuf;
     thread_local std::vector<uint16_t> row16Buf;
@@ -853,18 +916,68 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     {
         const uint32_t rowPacked = (info.width * 12 + 7) / 8;   /* 1.5 B / px */
         rowBuf.resize(rowPacked);
+        if (bayer_format.packed)
+            row16Buf.resize(info.width);
 
         for (uint32_t y = 0; y < info.height; ++y)
         {
-            const uint16_t *src = reinterpret_cast<const uint16_t *>(
-                                    raw + y * info.stride);
+            const uint16_t *src;
+            if (bayer_format.packed)
+            {
+                /* CSI2-packed 12-bit (SBGGR12_CSI2P — the Pi 4 / VC4 'P' path):
+                 * the receiver delivers MIPI CSI-2 RAW12, so unpack to right-
+                 * justified 16-bit before re-packing to the contiguous 12-bit DNG
+                 * layout. (A verbatim copy or a uint16 reinterpret here gives the
+                 * garbled "wrong bit order" raw seen on Pi 4.) */
+                unpack_csi2_raw12(raw + y * info.stride, row16Buf.data(), info.width);
+                src = row16Buf.data();
+            }
+            else
+            {
+                /* Unpacked SBGGR12 (Pi 5 / PiSP 'U'): 16-bit samples, right-
+                 * justified in the low 12 bits. */
+                src = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
+            }
             pack_row_12bit(src, rowBuf.data(), info.width);
+            write_pod(buf, rowBuf.data(), rowPacked);
+        }
+    }
+    else if (dng_info.bits == 10)
+    {
+        const uint32_t rowPacked = (info.width * 10 + 7) / 8;   /* 1.25 B / px */
+        /* pack_10bit_data() writes 5 bytes per 4-pixel group; size the scratch
+         * row to the rounded-up group count so a width that is not a multiple of
+         * 4 cannot overflow it. For the standard 10-bit modes (mult-of-4 width)
+         * this equals rowPacked exactly. */
+        rowBuf.resize(((info.width + 3u) / 4u) * 5u);
+        if (bayer_format.packed)
+            row16Buf.resize(info.width);
+
+        for (uint32_t y = 0; y < info.height; ++y)
+        {
+            const uint16_t *src;
+            if (bayer_format.packed)
+            {
+                /* CSI2-packed 10-bit (SBGGR10_CSI2P — the Pi 4 / VC4 'P' path):
+                 * MIPI CSI-2 RAW10 → unpack to right-justified 16-bit, then
+                 * re-pack to the contiguous 10-bit DNG layout. (Same MIPI-vs-
+                 * contiguous fix as the 12-bit path above.) */
+                unpack_csi2_raw10(raw + y * info.stride, row16Buf.data(), info.width);
+                src = row16Buf.data();
+            }
+            else
+            {
+                /* Unpacked SBGGR10 (Pi 5 / PiSP 'U'): 16-bit samples, right-
+                 * justified in the low 10 bits. */
+                src = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
+            }
+            pack_10bit_data(src, rowBuf.data(), info.width);
             write_pod(buf, rowBuf.data(), rowPacked);
         }
     }
     else
     {
-        /* 10-, 14- or 16-bit → copy verbatim, one active row each */
+        /* 14- or 16-bit → copy verbatim, one active row each */
         const uint32_t rowBytes = (info.width * dng_info.bits + 7) / 8;
         for (uint32_t y = 0; y < info.height; ++y)
             write_pod(buf, raw + y * info.stride, rowBytes);
@@ -952,73 +1065,40 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(0xC614, TIFF_ASCII, ucm_tag_.size(), ucm_tag_.data());
 
     /* ▸ CinemaDNG tag 0xC764  –  FrameRate (SRATIONAL) */
-
-    // fallback: use CLI --framerate (same behaviour as old encoder)
+    // Use the configured frame rate. The FrameDuration metadata path that
+    // was here previously embedded the sensor's quantised register period
+    // (e.g. 25.011 for a 25 fps target) due to VMAX/HMAX rounding. With
+    // the IMX585 getBlanking patch the sensor delivers the nominal rate
+    // exactly, and using the configured value is correct for all sensors.
+    // The denominator of 1000 gives three decimal places of precision for
+    // fractional rates such as 23.976.
+    double fps = options_->framerate.value_or(DEFAULT_FRAMERATE);
     int32_t fpsRat[2] = {
-        static_cast<int32_t>(*options_->framerate + 0.5),   // numerator
-        1000                                                      // denominator
+        static_cast<int32_t>(std::round(fps * 1000)),  // e.g. 25000 for 25 fps
+        1000
     };
-
-    // preferred: per-frame value from libcamera metadata
-    if (auto fd = metadata.get(controls::FrameDuration); fd && *fd > 0)
-    {
-        double fps = 1e9 / static_cast<double>(*fd);              // ns → fps
-        fpsRat[0] = static_cast<int32_t>(fps + 0.5);       // numerator
-    }
 
     ifd.addEntry(0xC764, TIFF_SRATIONAL, 1, fpsRat);
 
 
     /* ------------------------------------------------------------------
-    *  Choose wall-clock if the controller supplied one, otherwise
-    *  fall back to the timestamp_us that came with the buffer.
-    * ------------------------------------------------------------------ */
+     *  Wall-clock timestamp — used only for TIFF DateTime tags below.
+     *  TC stepping is now done in encodeThread under encode_mutex_ using
+     *  each frame's own sensor timestamp; tc_frame_count is pre-computed
+     *  and passed in as a parameter.
+     * ------------------------------------------------------------------ */
     uint64_t ts_us = wallclock_ts_us_ ? wallclock_ts_us_   // µs since epoch
-                                    : timestamp_us;      // old path
+                                      : static_cast<uint64_t>(timestamp_us);
 
     struct timeval tv;
     tv.tv_sec  = ts_us / 1'000'000;
     tv.tv_usec = ts_us % 1'000'000;
 
     struct tm *lt = localtime(&tv.tv_sec);
-    int fps = fpsRat[0] / fpsRat[1];
-    int fps_int = (fps > 0) ? fps : 24;
 
-    /* ------------------------------------------------------------------
-     *  Timecode: capture wall-clock HH:MM:SS once at the first frame of
-     *  each clip (tc_origin_set_ cleared by resetFrameCount()).
-     *  Subsequent frames advance tc_frame_count_ by rounding the
-     *  inter-frame µs delta to the nearest frame period, so:
-     *    - jitter within ±½ frame always steps by 1 → no duplicates
-     *    - a gap ≥ 1.5× frame period rounds up → natural TC hole for
-     *      each dropped frame
-     * ------------------------------------------------------------------ */
-    if (!tc_origin_set_)
-    {
-        tc_last_ts_us_ = ts_us;
-        tc_frame_count_ = 0;
-        tc_start_hh_   = lt->tm_hour;
-        tc_start_mm_   = lt->tm_min;
-        tc_start_ss_   = lt->tm_sec;
-        tc_fps_        = fps_int;
-        tc_origin_set_ = true;
-    }
-    else
-    {
-        /* Round inter-frame delta to nearest frame count.
-         * Jitter within ±½ frame snaps to 1 (no duplicates).
-         * A gap ≥ 1.5× frame period rounds up, producing a TC hole
-         * for each dropped frame. */
-        uint64_t delta_us = ts_us - tc_last_ts_us_;
-        int64_t frames_elapsed = std::max(INT64_C(1),
-            static_cast<int64_t>(std::llround(
-                static_cast<double>(delta_us) * tc_fps_ / 1'000'000.0)));
-        tc_frame_count_ += frames_elapsed;
-        tc_last_ts_us_  = ts_us;
-    }
-
-    int ff  = static_cast<int>(tc_frame_count_ % tc_fps_);
-    int64_t total_s = tc_frame_count_ / tc_fps_;
+    /* tc_start_hh_/mm_/ss_ and tc_fps_ were set at clip origin in encodeThread. */
+    int ff  = static_cast<int>(tc_frame_count % tc_fps_);
+    int64_t total_s = tc_frame_count / tc_fps_;
     int ss  = static_cast<int>(total_s % 60);
     int mm  = static_cast<int>((total_s / 60) % 60);
     int hh  = static_cast<int>((total_s / 3600) % 24);
@@ -1080,6 +1160,70 @@ void DngEncoder::encodeThread(int num)
 
             encode_item = encode_queue_.front();
             encode_queue_.pop();
+
+            /* ── TC step: computed here, under encode_mutex_, so frames are
+             *    processed in FIFO order and each frame's own sensor timestamp
+             *    is used.  This eliminates the wallclock_ts_us_ shared-scalar
+             *    race that was producing phantom holes with >1 encode workers. */
+            if (!tc_origin_set_)
+            {
+                /* First frame of clip: capture wall-clock HH:MM:SS origin. */
+                int fps_int = 24;
+                /* libcamera FrameDuration is in MICROSECONDS (40000 µs @ 25fps),
+                 * so fps = 1e6 / fd.  Using 1e9 here gives 25000 (1000× too high):
+                 * raw_elapsed = round(40000 * 25000 / 1e6) = 1000 → ~999 phantom
+                 * holes per frame.  The pre-fix path derived this same value as
+                 * fpsRat[0]/fpsRat[1] = round(1e9/fd)/1000, i.e. exactly 1e6/fd. */
+                if (auto fd = encode_item.met.get(controls::FrameDuration); fd && *fd > 0)
+                    fps_int = static_cast<int>(1'000'000.0 / static_cast<double>(*fd) + 0.5);
+                if (fps_int <= 0) fps_int = 24;
+
+                /* Prefer wall-clock for the HH:MM:SS display origin; fall back
+                 * to sensor monotonic (small display-only error if not set yet). */
+                uint64_t origin_us = wallclock_ts_us_
+                                     ? wallclock_ts_us_
+                                     : static_cast<uint64_t>(encode_item.timestamp_us);
+                struct timeval tv { static_cast<time_t>(origin_us / 1'000'000ULL),
+                                    static_cast<suseconds_t>(origin_us % 1'000'000ULL) };
+                struct tm lt_val {};
+                localtime_r(&tv.tv_sec, &lt_val);
+
+                /* Sub-second frame offset: how many frames into the current
+                 * second did this clip start?  origin_us is a wall-clock µs
+                 * value, so origin_us % 1e6 is the fractional-second part.
+                 * Seeding tc_frame_count_ with this (instead of 0) gives
+                 * frame-accurate absolute TC alignment with external sources.
+                 * The carry propagation in dng_save() already handles
+                 * tc_frame_count_ ≥ tc_fps_ at the second boundary. */
+                uint64_t sub_us     = origin_us % 1'000'000ULL;
+                int64_t sub_frames  = static_cast<int64_t>(
+                    std::llround(static_cast<double>(sub_us) * fps_int / 1'000'000.0));
+                if (sub_frames >= fps_int) sub_frames = fps_int - 1; /* clamp at boundary */
+
+                tc_last_ts_us_  = encode_item.timestamp_us; /* now monotonic µs */
+                tc_frame_count_ = sub_frames;
+                tc_start_hh_    = lt_val.tm_hour;
+                tc_start_mm_    = lt_val.tm_min;
+                tc_start_ss_    = lt_val.tm_sec;
+                tc_fps_         = fps_int;
+                tc_origin_set_  = true;
+                encode_item.tc_frame_count = sub_frames;
+            }
+            else
+            {
+                /* Delta uses the per-frame sensor timestamp already in the queue.
+                 * No shared scalar, no phantom holes regardless of worker count. */
+                uint64_t delta_us = static_cast<uint64_t>(encode_item.timestamp_us)
+                                    - static_cast<uint64_t>(tc_last_ts_us_);
+                int64_t raw_elapsed = static_cast<int64_t>(std::llround(
+                    static_cast<double>(delta_us) * tc_fps_ / 1'000'000.0));
+                int64_t frames_elapsed = std::max(INT64_C(1), raw_elapsed);
+                tc_frame_count_ += frames_elapsed;
+                tc_last_ts_us_   = encode_item.timestamp_us; /* monotonic */
+                if (raw_elapsed >= 2)
+                    dropped_frames_ += raw_elapsed - 1;
+                encode_item.tc_frame_count = tc_frame_count_;
+            }
         }
 
         frames_ = encode_item.index;
@@ -1105,8 +1249,9 @@ void DngEncoder::encodeThread(int num)
                                BLOCK_SIZE,
                                dng_info.buffer_size) != 0)
             {
-                /* Allocation failed – release the reserved permit */
+                /* Allocation failed – release the reserved permit; frame is dropped */
                 perror("posix_memalign");
+                frames_in_flight_.fetch_sub(1, std::memory_order_relaxed);
                 {
                     std::lock_guard<std::mutex> lk(ram_mtx_);
                     if (ram_buffers_ > 0)
@@ -1122,17 +1267,48 @@ void DngEncoder::encodeThread(int num)
         /* ────────────────────────────────────────────────────── */
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        size_t tiff_size = dng_save(
-            num,
-            static_cast<const uint8_t *>(mem_buf),
-            static_cast<const uint8_t *>(encode_item.mem),
-            encode_item.info,
-            static_cast<const uint8_t *>(encode_item.lomem),
-            encode_item.loinfo,
-            encode_item.losize,
-            encode_item.met,
-            encode_item.timestamp_us,
-            encode_item.index);
+        size_t tiff_size = 0;
+        try
+        {
+            tiff_size = dng_save(
+                num,
+                static_cast<const uint8_t *>(mem_buf),
+                static_cast<const uint8_t *>(encode_item.mem),
+                encode_item.info,
+                static_cast<const uint8_t *>(encode_item.lomem),
+                encode_item.loinfo,
+                encode_item.losize,
+                encode_item.met,
+                encode_item.timestamp_us,
+                encode_item.tc_frame_count);
+        }
+        catch (const std::exception &e)
+        {
+            /* dng_save can throw (e.g. "Unsupported Bayer format", or bad_alloc).
+             * Drop this frame WITHOUT killing the encode thread: an uncaught
+             * throw here would leave frames_in_flight_ incremented forever and
+             * permanently jam the rec-gate (green stuck on, every future
+             * recording blocked). Mirror the alloc-fail drop cleanup, and also
+             * run the normal-path camera-buffer release tail so the libcamera
+             * encode_buffer_queue_ does not leak a buffer. */
+            console->error("Thread[{}] dng_save failed for frame {}: {} — frame dropped",
+                           num, encode_item.index, e.what());
+            frames_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+            if (mem_buf)
+                releasePooledBuffer(mem_buf);
+            {
+                std::lock_guard<std::mutex> lk(ram_mtx_);
+                if (ram_buffers_ > 0)
+                    --ram_buffers_;
+            }
+            ram_cv_.notify_one();
+            input_done_callback_(nullptr);
+            output_ready_callback_(encode_item.mem,
+                                   encode_item.size,
+                                   encode_item.timestamp_us,
+                                   true);
+            continue;
+        }
 
         /* queue for disk writer */
         {
@@ -1148,6 +1324,7 @@ void DngEncoder::encodeThread(int num)
 
             std::lock_guard<std::mutex> lock(disk_mutex_);
             disk_buffer_.push(std::move(item));
+            noteBufferDepth(static_cast<int>(disk_buffer_.size()));
             disk_cond_var_.notify_one();
         }
 
@@ -1214,13 +1391,35 @@ void DngEncoder::diskThread(int num)
 
             // Always use actual used size returned by dng_save
             ssize_t bytes_written = write(fd, disk_item.mem_buf, disk_item.size);
-            if (bytes_written < 0 || static_cast<size_t>(bytes_written) != disk_item.size) {
+            bool write_ok = (bytes_written >= 0 &&
+                             static_cast<size_t>(bytes_written) == disk_item.size);
+            if (!write_ok) {
+                int werr = errno;
+                write_failures_.fetch_add(1, std::memory_order_relaxed);
                 perror("Error writing to file");
+                console->error("DNG write FAILED ({}): wrote {} of {} bytes - {}",
+                               filename, bytes_written, disk_item.size, strerror(werr));
             }
-            close(fd);
+            // close() can surface deferred write-back errors that write() did
+            // not report (common on FUSE/ntfs-3g and network filesystems).
+            // Count those too, but only when the write itself looked OK so a
+            // single lost frame is not counted twice.
+            if (close(fd) != 0 && write_ok) {
+                int cerr = errno;
+                write_failures_.fetch_add(1, std::memory_order_relaxed);
+                console->error("DNG write FAILED on close ({}) - {}",
+                               filename, strerror(cerr));
+            }
         } else {
+            int oerr = errno;
+            write_failures_.fetch_add(1, std::memory_order_relaxed);
             perror("Failed to open file for writing");
+            console->error("DNG write FAILED to open ({}) - {}",
+                           filename, strerror(oerr));
         }
+
+        // Frame fully handled (written or errored) — release in-flight count
+        frames_in_flight_.fetch_sub(1, std::memory_order_relaxed);
 
         // Clean up
         releasePooledBuffer(static_cast<uint8_t *>(disk_item.mem_buf));
@@ -1235,25 +1434,6 @@ void DngEncoder::diskThread(int num)
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
         console->debug("Thread[{}] {} Time taken for the disk io: {} milliseconds", num, disk_item.index, duration);
-    }
-}
-
-void DngEncoder::clearPool()
-{
-    // 1) Drain any pending disk items (free their mem_bufs)
-    {
-        std::lock_guard<std::mutex> lock(disk_mutex_);
-        while (!disk_buffer_.empty()) {
-            auto &item = disk_buffer_.front();
-            releasePooledBuffer(static_cast<uint8_t *>(item.mem_buf));
-            // return permit
-            {
-                std::lock_guard<std::mutex> lk(ram_mtx_);
-                if (ram_buffers_ > 0) --ram_buffers_;
-            }
-            disk_buffer_.pop();
-        }
-        ram_cv_.notify_all();
     }
 }
 

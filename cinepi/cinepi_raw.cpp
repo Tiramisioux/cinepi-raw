@@ -172,7 +172,18 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		int trigger = controller.triggerRec();
 
         if (trigger > 0) {                       // recording just started
-			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
+            // Nothing is dropped here.  The previous take's buffered frames
+            // (encode_queue_ awaiting compression and disk_buffer_ awaiting
+            // write) are left to finish flushing to their own clip folder, so
+            // no recorded frame is lost.  Cinemate blocks the rec trigger while
+            // the green is_writing_buf flush is in progress, so by the time a
+            // start edge reaches us the RAM buffer has already drained and the
+            // new take begins with free buffers.
+            // Use the sensor-derived wall-clock set by process() for this
+            // frame so the folder FXX equals llround(sub_us × fps / 1e6),
+            // which is exactly how the DNG TC origin sub_frames is computed.
+            uint64_t wall_ts_us = app.GetEncoder()->getWallClockTimestampUs();
+			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber(), wall_ts_us);
             if (controller.folderOpen)
                 sound.record_start();
             app.GetEncoder()->resetFrameCount(); // folder already open
@@ -191,13 +202,11 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		{
 			if (app.GetEncoder()->buffer_full())
 			{
-				if (justStarted)
-				{
-					// first frame after you hit Record: clear and go on
-					app.GetEncoder()->clearPool();
-					console->warn("RAM pool was full at start — cleared and continuing");
-				}
-				else
+				// Buffer still full at the first frame of a new take — the
+				// previous take's frames had not finished draining yet.  Let
+				// the first frame through (justStarted); only a steady-state
+				// take that fills RAM should stop here.
+				if (!justStarted)
 				{
 					controller.setRecording(false);
 					console->warn("RAM pool exhausted — recording stopped");

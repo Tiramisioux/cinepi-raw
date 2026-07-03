@@ -63,4 +63,5 @@ struct RawOptions : public VideoOptions
     std::optional<int> disk_nice;
 
     int plain_arecord_timecode_offset_frames { 0 };
+    int audio_timecode_offset_frames { 0 };
 };

@@ -164,6 +164,27 @@ void CinePIController::sync(){
     else
             redis_->set(CONTROL_KEY_ZOOM, std::to_string(options_->Zoom()));
 
+    // ── Frame-rate phase-lock config (write defaults if the keys are absent) ──
+    if (auto v = redis_->get(CONTROL_KEY_PHASE_LOCK); v && !v->empty()) {
+        try { phaseLockEnabled_.store(std::stoi(*v) != 0); } catch (...) {}
+    } else {
+        redis_->set(CONTROL_KEY_PHASE_LOCK, "0");
+    }
+    if (auto v = redis_->get(CONTROL_KEY_PLL_KP); v && !v->empty()) {
+        try { pllParams_.kp = std::stod(*v); } catch (...) {}
+    } else {
+        redis_->set(CONTROL_KEY_PLL_KP, std::to_string(pllParams_.kp));
+    }
+    if (auto v = redis_->get(CONTROL_KEY_PLL_KI); v && !v->empty()) {
+        try { pllParams_.ki = std::stod(*v); } catch (...) {}
+    } else {
+        redis_->set(CONTROL_KEY_PLL_KI, std::to_string(pllParams_.ki));
+    }
+    if (auto v = redis_->get(CONTROL_KEY_PLL_DEADBAND); v && !v->empty()) {
+        try { pllParams_.deadbandUs = std::stod(*v); } catch (...) {}
+    } else {
+        redis_->set(CONTROL_KEY_PLL_DEADBAND, std::to_string(pllParams_.deadbandUs));
+    }
 
     console->critical(14);
 
@@ -259,10 +280,15 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     data["framerate"]  = completed_request->framerate;
     data["colorTemp"]  = info.colorTemp;
     data["focus"]      = info.focus;
-    data["frameCount"]   = app_->GetEncoder()->getFrameCount();
-    data["tcFrameCount"] = static_cast<Json::Int64>(app_->GetEncoder()->getTcFrameCount());
-    data["bufferSize"]   = app_->GetEncoder()->bufferSize();
+    data["frameCount"]    = app_->GetEncoder()->getFrameCount();
+    data["tcFrameCount"]  = static_cast<Json::Int64>(app_->GetEncoder()->getTcFrameCount());
+    data["droppedFrames"] = static_cast<Json::Int64>(app_->GetEncoder()->getDroppedFrames());
+    data["writeFailures"]   = static_cast<Json::Int64>(app_->GetEncoder()->getWriteFailures());
+    data["bufferSize"]      = app_->GetEncoder()->bufferSize();
+    data["bufferSizeMax"]   = app_->GetEncoder()->bufferSizeMaxAndReset();
+    data["framesInFlight"]  = static_cast<Json::Int64>(app_->GetEncoder()->getFramesInFlight());
     data["timestamp"]  = static_cast<Json::Int64>(epoch_ns);   // ← TOD ns
+    data["cameraPort"] = options_->CamPort();                  // cam0 / cam1 — disambiguates the shared cp_stats channel
     redis_->publish(CHANNEL_STATS, data.toStyledString());
 
     /* cache per-camera timestamp key (TOD ns) */
@@ -294,6 +320,13 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
 
     const char *tc_key = (options_->CamPort() == "cam1") ? "tc_cam1" : "tc_cam0";
     redis_->set(tc_key, tc.str());
+
+    /* ────────────────────────────────────────────────────────────── */
+    /*  5. Closed-loop frame-rate phase lock. References the Pi wall    */
+    /*     clock (FrameWallClock = the audio clock, computed above).    */
+    /*     No-op unless enabled; suppressed on the --sync client.       */
+    /* ────────────────────────────────────────────────────────────── */
+    updatePhaseLock(static_cast<int64_t>(epoch_ns));
 }
 
 
@@ -504,6 +537,21 @@ void CinePIController::mainThread(){
                 app_->SetControls(cl);
             }
         }},
+        { CONTROL_KEY_PHASE_LOCK, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                try { phaseLockEnabled_.store(std::stoi(*r) != 0); } catch (...) {}
+                console->info("Frame-rate phase lock {}", phaseLockEnabled_.load() ? "ENABLED" : "disabled");
+            }
+        }},
+        { CONTROL_KEY_PLL_KP, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) { try { pllParams_.kp = std::stod(*r); } catch (...) {} }
+        }},
+        { CONTROL_KEY_PLL_KI, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) { try { pllParams_.ki = std::stod(*r); } catch (...) {} }
+        }},
+        { CONTROL_KEY_PLL_DEADBAND, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) { try { pllParams_.deadbandUs = std::stod(*r); } catch (...) {} }
+        }},
         { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
             cameraInit_ = true;
             buffer_size_sent_ = false;
@@ -623,5 +671,60 @@ void CinePIController::mainThread(){
         } catch (const Error &err) {
             // Handle exceptions.
         }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Closed-loop frame-rate phase lock                                  */
+/*                                                                     */
+/*  Integral controller on accumulated phase error, measured against   */
+/*  the Pi wall clock (FrameWallClock, de-jittered, = the audio clock). */
+/*  Output is FrameDurationLimits; the                                  */
+/*  integer-VBLANK quantisation downstream turns the smoothly-varying   */
+/*  request into a first-order sigma-delta dither between two adjacent  */
+/*  lines, so the *average* recorded cadence equals the operator's      */
+/*  nominal fps exactly — beating the ~half-line (~125 ppm) floor of a  */
+/*  single fixed correction factor. VBLANK-only: never touches HMAX, so */
+/*  the 4K line-length failure mode cannot recur. Closed-loop, so it    */
+/*  idles harmlessly if the sensor is already on target.                */
+/*                                                                     */
+/*  Role: this is the single absolute disciplinarian. It runs on a lone */
+/*  sensor (--sync off) and on the dual master (--sync server), but is   */
+/*  suppressed on the --sync client, where rpi.sync owns the VBLANK to   */
+/*  hold the relative A->B genlock. Inferred from options_->sync.        */
+/* ------------------------------------------------------------------ */
+void CinePIController::updatePhaseLock(int64_t refTsNs)
+{
+    /* I/O lives here; the control law is the pure phaseLockStep() in
+     * phase_lock_core.hpp (unit-tested in tests/phase_lock_core_test.cpp).
+     *
+     * Target = operator's NOMINAL fps (fps_user), read each frame so an fps change
+     * re-arms the lock. The reference clock is the Pi wall clock (FrameWallClock),
+     * passed in as refTsNs by process(). The --sync client role suppresses the
+     * lock so libcamera rpi.sync owns that sensor's VBLANK on a genlock rig. */
+    double target = pllState_.targetFps;
+    if (auto v = redis_->get("fps_user"); v && !v->empty()) {
+        try { target = std::stod(*v); } catch (...) {}
+    }
+
+    const bool roleClient = (options_->sync == 2);
+    cinepi::PhaseLockResult res = cinepi::phaseLockStep(
+        pllState_, pllParams_, phaseLockEnabled_.load(), roleClient,
+        is_recording_, target, refTsNs);
+
+    /* Push FrameDurationLimits only on an integer-us change — this is where the
+     * integer-VBLANK quantisation downstream becomes the sigma-delta dither. */
+    if (res.setControls) {
+        long int dv[2] = { res.durUs, res.durUs };
+        libcamera::Span<const long int, 2> range(dv, 2);
+        libcamera::ControlList cl;
+        cl.set(libcamera::controls::FrameDurationLimits, range);
+        app_->SetControls(cl);
+    }
+
+    /* Telemetry for the test harness (only when the servo actually ran). */
+    if (res.servoRan) {
+        redis_->set("pll_phase_err_us", std::to_string(std::lround(res.phaseErrUs)));
+        redis_->set("pll_req_dur_us", std::to_string(res.durUs));
     }
 }

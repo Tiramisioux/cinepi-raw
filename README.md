@@ -20,9 +20,10 @@ sudo apt install -y python-pip git python3-jinja2 ffmpeg
 ## Install libcamera
 
 ```shell
-git clone https://github.com/raspberrypi/libcamera && \
-sudo find ~/libcamera -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod +x {} \; && \
+git clone https://github.com/Tiramisioux/libcamera && \
 cd libcamera && \
+git checkout cinemate && \
+sudo find ~/libcamera -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod +x {} \; && \
 sudo meson setup build --buildtype=release \
   -Dpipelines=rpi/vc4,rpi/pisp \
   -Dipas=rpi/vc4,rpi/pisp \
@@ -33,7 +34,7 @@ sudo meson setup build --buildtype=release \
   -Dcam=disabled \
   -Dqcam=disabled \
   -Ddocumentation=disabled \
-  -Dpycamera=enabled && \
+  -Dpycamera=disabled && \
 sudo ninja -C build install && \
 cd
 ```
@@ -105,6 +106,37 @@ then
 ```bash
 cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0 
 ```
+
+### Choosing the `--mode` packing (`U` vs `P`) per Pi model
+
+`--mode` is `WIDTH:HEIGHT:BIT_DEPTH:PACKING`. The last field selects the camera-stream pixel format:
+
+| Token | Meaning | libcamera format (12-bit) |
+|-------|---------|---------------------------|
+| `U`   | **U**npacked — one 16-bit sample per pixel | `SBGGR12` |
+| `P`   | **P**acked — CSI-2 packed (smaller, less DMA/CMA) | `SBGGR12_CSI2P` |
+
+Pick the token by camera receiver, **not** by sensor:
+
+| Pi model | Receiver | Recommended packing | Why |
+|----------|----------|---------------------|-----|
+| Pi 5 / CM5 | PiSP (`rp1-cfe`) | `U` | Plenty of bandwidth/CMA; an unpacked stream is simplest. A `P` request is delivered as PiSP `COMP1` and decoded by the DNG encoder. |
+| Pi 4 / Pi 400 / CM4 | VC4/Unicam (`unicam`) | `P` | Packed CSI-2 uses ~1.33× less DMA/CMA at 12-bit (~1.6× at 10-bit), which the high-fps modes need on the smaller Pi 4 CMA pool. |
+
+The DNG encoder produces a correct DNG for **both** `U` and `P` at 10- and 12-bit, so the choice is about bandwidth/CMA, not correctness. (Earlier builds only handled the unpacked stream and emitted a garbled "wrong bit order" raw when fed a `P` stream on Pi 4 — that is fixed: the encoder now branches on the actual packed/unpacked format.)
+
+Manual examples (IMX477 on `cam0`):
+
+```bash
+# Pi 4 / VC4 — packed; Pi 4 also skips --tuning-file
+cinepi-raw --mode 2028:1080:12:P --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --hdmi-port 1 --cam-port cam0
+
+# Pi 5 / PiSP — unpacked, with the PiSP tuning file
+cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0
+```
+
+When launched by CineMate this is automatic: the packing token is data-driven from `resources/sensors.json` (`packing_by_platform`) and resolved against the detected Pi model, so you normally never set it by hand.
+
 # CineMate fork
 
 _Adapted to libcamera 0.5 / rpicam-apps 1.0.7._
@@ -125,6 +157,56 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--disk-affinity <list>`  | `auto`  | Pin disk workers to the specified CPU list. |
 | `--encode-nice <int>`     | `auto`  | Nice level for encode workers (`-20` = highest priority, `19` = lowest). |
 | `--disk-nice <int>`       | `auto`  | Nice level applied to disk workers. |
+| `--plain-arecord-timecode-offset-frames <int>` | `0` | Frame offset added to the 16-bit plain `arecord` WAV metadata timecode. PCM is not shifted. |
+| `--audio-timecode-offset-frames <int>` | `0` | Frame offset added to the 24-bit USB-capture WAV metadata timecode. PCM is not shifted. |
+| `--unique-camera-model <string>` | `"cinepi"` | Override the `UniqueCameraModel` DNG tag embedded in recorded frames. Changing to `Blackmagic Pocket Cinema Camera 4K` enables ISO settings to clips in DaVinci Resolve. |
+
+### WAV timecode offset (`--audio-timecode-offset-frames`)
+
+A USB capture path can land a fixed number of frames early or late relative to video even after clock correction (analog/buffering latency that is constant across takes). `--audio-timecode-offset-frames` nudges the **WAV metadata timecode** by a whole number of frames to compensate. Only the embedded BWF/iXML timecode is shifted — the PCM samples are never moved.
+
+- This flag covers the **24-bit USB capture (helper) path**. The 16-bit plain-`arecord` path has its own `--plain-arecord-timecode-offset-frames`.
+- **Sign convention:** a **positive** offset moves the timecode later, so audio lands later on the NLE timeline — use a positive value when the sound is *early*. A negative value moves it earlier.
+- Independent of clock correction; both can be active at once.
+- Like the clock-correction flag, Cinemate sets this automatically from `audio.timecode_offset_frames` in `settings.json`; pass it manually only when running `cinepi-raw` directly.
+
+When non-zero, `cinepi-raw` logs after each take:
+
+```
+Applied 24-bit USB capture WAV metadata timecode offset: +2 frames; PCM timing unchanged
+```
+
+## Frame-rate phase lock
+
+Off by default (`fps_phase_lock` Redis key). A closed-loop servo that holds the
+recorded frame cadence on the operator's nominal fps, so audio and video stay in
+sync across long takes.
+
+**How it differs from stock cinepi-raw:** stock cinepi-raw sets one
+`FrameDurationLimits` per fps change and lets the sensor free-run, so a small
+fixed quantisation/crystal offset between the requested rate and what the sensor
+actually delivers accumulates over a take. The phase lock measures and corrects
+every frame instead.
+
+**How it works:** each frame in `process()` it compares the accumulated frame
+phase (from the monotonic `SensorTimestamp`) against the ideal `n / fps` and trims
+`FrameDurationLimits` with a PI servo. The integer-VBLANK quantisation downstream
+is dithered (first-order sigma-delta) so the *average* rate is exact. It is
+VBLANK-only (never touches line length) and pre-converges during preview, so a
+clip is locked from the first frame.
+
+**What it means for sync:** the video cadence tracks the Pi clock — the same clock
+the audio is captured against — so A/V no longer drift apart over long takes; the
+residual is a bounded sub-frame offset, not an accumulating drift.
+
+Gains are tunable live via `pll_kp` / `pll_ki` / `pll_deadband_us`. On a
+multi-camera `--sync` genlock rig it is safe to leave enabled: cinepi-raw infers
+its role from `--sync` and runs the absolute Pi-clock discipline only on the
+master (`--sync` off or `server`). The `--sync` client self-suppresses the lock
+so libcamera's rpi.sync owns that sensor's VBLANK and holds the relative A→B
+genlock — the lock never shares a sensor's VBLANK with rpi.sync, which is the
+conflict the client gate prevents. If you would rather keep the master strictly
+constant-rate, disable the lock and discipline the sync server's rate instead.
 
 ## Manual DNG encoder
 

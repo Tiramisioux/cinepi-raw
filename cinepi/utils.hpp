@@ -23,8 +23,9 @@ bool is_mounted(const char *mount_point);
 // -----------------------------------------------------------------------------
 bool  disk_mounted(const RawOptions *opt);
 void  generate_filename(RawOptions *opt, unsigned int clip,
-                        const libcamera::ControlList &metadata = libcamera::ControlList());
-bool  create_clip_folder (RawOptions *opt, unsigned int clip);
+                        const libcamera::ControlList &metadata = libcamera::ControlList(),
+                        uint64_t ts_us = 0);
+bool  create_clip_folder (RawOptions *opt, unsigned int clip, uint64_t ts_us = 0);
 bool  create_stills_folder(RawOptions *opt, unsigned int stills);
 
 // -----------------------------------------------------------------------------
@@ -41,9 +42,9 @@ inline void generate_filename(CinePiOptions *opt, unsigned int clip,
     generate_filename(static_cast<RawOptions *>(opt), clip, metadata);
 }
 
-inline bool create_clip_folder(CinePiOptions *opt, unsigned int clip)
+inline bool create_clip_folder(CinePiOptions *opt, unsigned int clip, uint64_t ts_us = 0)
 {
-    return create_clip_folder(static_cast<RawOptions *>(opt), clip);
+    return create_clip_folder(static_cast<RawOptions *>(opt), clip, ts_us);
 }
 
 inline bool create_stills_folder(CinePiOptions *opt, unsigned int stills)
