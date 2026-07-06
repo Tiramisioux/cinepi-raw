@@ -1306,11 +1306,18 @@ void RPiCamApp::previewThread()
 				LOG(2, "Preview window has quit");
 				msg_queue_.Post(Msg(MsgType::Quit));
 			}
-			preview_->Show(fd, span, info);
+			// Retain the buffer reference BEFORE Show(). NullPreview (--nopreview)
+			// invokes done_callback_(fd) synchronously inside Show(), so if we
+			// inserted afterwards previewDoneCallback() would not find the fd and
+			// would throw "missing fd", spamming "Preview frame failed" every
+			// frame on the multi-mode secondary. DRM/EGL defer the callback to
+			// last_fd_ (already in the map), so inserting earlier is harmless for
+			// them. On Show() failure the reference is dropped again below.
 			{
 				std::lock_guard<std::mutex> lock(preview_mutex_);
 				preview_completed_requests_[fd] = std::move(item.completed_request);
 			}
+			preview_->Show(fd, span, info);
 			preview_frames_displayed_++;
 			if (!options_->info_text.empty())
 			{
