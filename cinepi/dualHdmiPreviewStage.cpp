@@ -26,6 +26,8 @@
 #include <memory>
 #include <string>
 
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
@@ -409,6 +411,13 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 	uint8_t *dst = canvas_span_.data();
 	unsigned int ds = canvas_info_.stride;
 
+	// The canvas is a cached dma-heap buffer, so bracket the CPU writes with
+	// DMA_BUF_IOCTL_SYNC — otherwise the display controller reads stale cache
+	// lines and the preview is pure static. Mirrors core BufferWriteSync.
+	struct dma_buf_sync sync = {};
+	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
+	::ioctl(canvas_fd_.get(), DMA_BUF_IOCTL_SYNC, &sync);
+
 	// Neutral black (Y=16, Cb/Cr=128) so an unfilled pane looks blank.
 	std::memset(dst, 16, static_cast<size_t>(ds) * pane_h);
 	std::memset(dst + static_cast<size_t>(ds) * pane_h, 128, canvas_span_.size() - static_cast<size_t>(ds) * pane_h);
@@ -439,6 +448,9 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 	drawWhiteFrame(dst, ds, ch, 0, pane_w, pane_h, t);
 	if (panes == 2)
 		drawWhiteFrame(dst, ds, ch, pane_w, pane_w, pane_h, t);
+
+	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+	::ioctl(canvas_fd_.get(), DMA_BUF_IOCTL_SYNC, &sync);
 
 	drm_->Show(canvas_fd_.get(), canvas_span_, canvas_info_);
 }
