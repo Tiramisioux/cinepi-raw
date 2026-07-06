@@ -21,7 +21,6 @@
  * future hardware); it is deliberately isolated to this file.
  */
 
-#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -432,9 +431,10 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 	}
 
 	// White frame around each pane. In `both` mode the two inner edges meet at
-	// the centre, forming the dividing line between the feeds.
-	unsigned int t = std::max(2u, pane_h / 180u);
-	t &= ~1u; // keep even for chroma subsampling
+	// the centre, forming the dividing line between the feeds. Thickness matches
+	// the single-sensor GUI outline (PREVIEW_GUIDE_OUTLINE_WIDTH = 2); kept even
+	// for chroma subsampling.
+	constexpr unsigned int t = 2;
 	unsigned int ch = canvas_info_.height;
 	drawWhiteFrame(dst, ds, ch, 0, pane_w, pane_h, t);
 	if (panes == 2)
