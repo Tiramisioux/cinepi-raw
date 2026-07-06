@@ -1,0 +1,353 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/*
+ * dualHdmiPreviewStage.cpp - side-by-side HDMI preview for a two-sensor rig.
+ *
+ * Background: the on-camera HDMI preview is drawn by libcamera's DRM preview,
+ * and DRM *master* is exclusive per GPU. Two independent cinepi-raw processes
+ * (one per sensor) therefore cannot both draw to the display - the second is
+ * forced to --nopreview. This stage works around that without any core change:
+ *
+ *   - The SECONDARY instance publishes its lores YUV420 frame (tightly packed)
+ *     into a small System-V shared-memory segment. It never touches DRM.
+ *   - The PRIMARY instance owns the DRM preview directly (both cores run with
+ *     --nopreview in dual mode, so nothing races for master), reads the latest
+ *     secondary frame from shared memory, composites the two lores images
+ *     side-by-side into one YUV420 canvas, and shows that canvas via DRM.
+ *
+ * Single-sensor operation is unaffected: cinemate only wires this stage in when
+ * it detects two sensors; with one sensor the normal core `-p` preview runs.
+ *
+ * This is a first, hardware-untested cut (the 2-sensor beam-splitter rig is
+ * future hardware); it is deliberately isolated to this file.
+ */
+
+#include <chrono>
+#include <cstring>
+#include <memory>
+#include <string>
+
+#include <sys/ipc.h>
+#include <sys/mman.h>
+#include <sys/shm.h>
+
+#include <libcamera/stream.h>
+
+#include "core/buffer_sync.hpp"
+#include "core/dma_heaps.hpp"
+#include "core/frame_info.hpp"
+#include "core/rpicam_app.hpp"
+#include "core/stream_info.hpp"
+#include "post_processing_stages/post_processing_stage.hpp"
+#include "preview/preview.hpp"
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+
+// The DRM preview factory is defined in preview/drm_preview.cpp. We call it
+// directly (rather than make_preview()) because in dual mode the core preview
+// is --nopreview, which would otherwise hand us a null preview.
+Preview *make_drm_preview(Options const *options);
+
+using Stream = libcamera::Stream;
+
+namespace
+{
+// Upper bound for a single lores pane (covers anamorphic 720p-tall panes).
+constexpr unsigned int kMaxPaneW = 1920;
+constexpr unsigned int kMaxPaneH = 1088;
+constexpr size_t kMaxPaneBytes = static_cast<size_t>(kMaxPaneW) * kMaxPaneH * 3 / 2;
+
+// Fixed key so primary and secondary meet on the same segment. "CIND".
+constexpr key_t kShareKey = 0x43494E44;
+
+// Tightly packed (stride == width) YUV420 frame published by the secondary.
+struct DualPreviewShare
+{
+	volatile uint32_t seq;   // bumped after each full write; 0 == no frame yet
+	uint32_t width;
+	uint32_t height;
+	uint8_t data[kMaxPaneBytes];
+};
+} // namespace
+
+#define NAME "dualHdmiPreview"
+
+class dualHdmiPreviewStage : public PostProcessingStage
+{
+public:
+	dualHdmiPreviewStage(RPiCamApp *app);
+	~dualHdmiPreviewStage();
+
+	char const *Name() const override;
+	void Read(boost::property_tree::ptree const &params) override;
+	void Configure() override;
+	bool Process(CompletedRequestPtr &completed_request) override;
+	void Teardown() override;
+
+private:
+	bool attachShare();
+	Stream *previewStream(StreamInfo &info) const;
+	void publishSecondary(uint8_t const *y, StreamInfo const &info);
+	void composeAndShow(uint8_t const *y, StreamInfo const &info);
+	bool ensureCanvas(unsigned int pane_w, unsigned int pane_h,
+					  std::optional<libcamera::ColorSpace> const &cs);
+
+	std::shared_ptr<spdlog::logger> console;
+
+	bool primary_ = true;
+
+	// Shared-memory publish channel (both roles attach; primary reads,
+	// secondary writes).
+	int shm_id_ = -1;
+	DualPreviewShare *share_ = nullptr;
+	uint32_t last_seen_seq_ = 0;
+
+	// Primary-only DRM output + composite canvas.
+	std::unique_ptr<Preview> drm_;
+	DmaHeap dma_heap_;
+	libcamera::UniqueFD canvas_fd_;
+	libcamera::Span<uint8_t> canvas_span_;
+	StreamInfo canvas_info_;
+};
+
+char const *dualHdmiPreviewStage::Name() const
+{
+	return NAME;
+}
+
+dualHdmiPreviewStage::dualHdmiPreviewStage(RPiCamApp *app) : PostProcessingStage(app)
+{
+	console = spdlog::get(NAME);
+	if (!console)
+		console = spdlog::stdout_color_mt(NAME);
+}
+
+dualHdmiPreviewStage::~dualHdmiPreviewStage()
+{
+	if (share_)
+		shmdt(share_);
+}
+
+void dualHdmiPreviewStage::Read(boost::property_tree::ptree const &params)
+{
+	std::string role = params.get<std::string>("role", "primary");
+	primary_ = (role != "secondary");
+}
+
+// Attach (creating if needed) the shared publish segment. Idempotent.
+bool dualHdmiPreviewStage::attachShare()
+{
+	if (share_)
+		return true;
+
+	shm_id_ = shmget(kShareKey, sizeof(DualPreviewShare), IPC_CREAT | 0600);
+	if (shm_id_ < 0)
+	{
+		console->error("shmget failed for dual-preview share");
+		return false;
+	}
+	void *p = shmat(shm_id_, nullptr, 0);
+	if (p == reinterpret_cast<void *>(-1))
+	{
+		console->error("shmat failed for dual-preview share");
+		share_ = nullptr;
+		return false;
+	}
+	share_ = static_cast<DualPreviewShare *>(p);
+	return true;
+}
+
+Stream *dualHdmiPreviewStage::previewStream(StreamInfo &info) const
+{
+	// Prefer the low-res stream for a cheap composite; fall back to main.
+	Stream *s = app_->LoresStream(&info);
+	if (!s)
+		s = app_->GetMainStream();
+	if (s)
+		info = app_->GetStreamInfo(s);
+	return s;
+}
+
+void dualHdmiPreviewStage::Configure()
+{
+	attachShare();
+
+	if (primary_)
+	{
+		if (share_)
+		{
+			// Reset the channel so a stale frame from a previous run isn't
+			// composited before the secondary has published anything new.
+			share_->seq = 0;
+			last_seen_seq_ = 0;
+		}
+		try
+		{
+			drm_.reset(make_drm_preview(app_->GetOptions()));
+			// make_drm_preview() calls done_callback_ on the previous fd; give
+			// it a no-op so the persistent canvas fd doesn't trip bad_function.
+			if (drm_)
+				drm_->SetDoneCallback([](int) {});
+		}
+		catch (std::exception const &e)
+		{
+			console->error("dual HDMI preview: DRM unavailable ({})", e.what());
+			drm_.reset();
+		}
+	}
+	else if (!share_)
+	{
+		console->warn("dual HDMI preview secondary has no share segment; right pane will be blank");
+	}
+}
+
+bool dualHdmiPreviewStage::ensureCanvas(unsigned int pane_w, unsigned int pane_h,
+										std::optional<libcamera::ColorSpace> const &cs)
+{
+	unsigned int cw = pane_w * 2, ch = pane_h;
+	if (canvas_fd_.isValid() && canvas_info_.width == cw && canvas_info_.height == ch)
+		return true;
+
+	// (Re)allocate the side-by-side canvas as a dmabuf DRM can import.
+	if (canvas_span_.data())
+	{
+		munmap(canvas_span_.data(), canvas_span_.size());
+		canvas_span_ = {};
+	}
+	canvas_fd_ = {};
+
+	size_t size = static_cast<size_t>(cw) * ch * 3 / 2;
+	libcamera::UniqueFD fd = dma_heap_.alloc("dual-hdmi-canvas", size);
+	if (!fd.isValid())
+	{
+		console->error("dual HDMI preview: canvas dma-heap alloc failed");
+		return false;
+	}
+	void *mem = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd.get(), 0);
+	if (mem == MAP_FAILED)
+	{
+		console->error("dual HDMI preview: canvas mmap failed");
+		return false;
+	}
+	canvas_fd_ = std::move(fd);
+	canvas_span_ = libcamera::Span<uint8_t>(static_cast<uint8_t *>(mem), size);
+
+	canvas_info_ = StreamInfo();
+	canvas_info_.width = cw;
+	canvas_info_.height = ch;
+	canvas_info_.stride = cw; // tightly packed
+	canvas_info_.colour_space = cs;
+	return true;
+}
+
+// Copy a padded lores YUV420 pane into a tightly packed destination laid out as
+// [Y(dst_stride*h)][U(dst_stride/2*h/2)][V...], writing at column x_off.
+static void blitYUV420(uint8_t const *src, unsigned int src_stride, unsigned int w, unsigned int h,
+					   uint8_t *dst, unsigned int dst_stride, unsigned int x_off)
+{
+	uint8_t const *sY = src;
+	uint8_t const *sU = sY + static_cast<size_t>(src_stride) * h;
+	uint8_t const *sV = sU + static_cast<size_t>(src_stride / 2) * (h / 2);
+
+	uint8_t *dY = dst;
+	uint8_t *dU = dY + static_cast<size_t>(dst_stride) * h;
+	uint8_t *dV = dU + static_cast<size_t>(dst_stride / 2) * (h / 2);
+
+	for (unsigned int r = 0; r < h; ++r)
+		std::memcpy(dY + static_cast<size_t>(r) * dst_stride + x_off, sY + static_cast<size_t>(r) * src_stride, w);
+
+	unsigned int cw = w / 2, ch = h / 2;
+	unsigned int cx = x_off / 2;
+	for (unsigned int r = 0; r < ch; ++r)
+	{
+		std::memcpy(dU + static_cast<size_t>(r) * (dst_stride / 2) + cx,
+					sU + static_cast<size_t>(r) * (src_stride / 2), cw);
+		std::memcpy(dV + static_cast<size_t>(r) * (dst_stride / 2) + cx,
+					sV + static_cast<size_t>(r) * (src_stride / 2), cw);
+	}
+}
+
+void dualHdmiPreviewStage::publishSecondary(uint8_t const *y, StreamInfo const &info)
+{
+	if (!share_)
+		return;
+	if (static_cast<size_t>(info.width) * info.height * 3 / 2 > kMaxPaneBytes)
+		return; // too large for the channel; drop rather than overrun
+
+	// Write tightly packed (stride == width) so the primary can blit directly.
+	blitYUV420(y, info.stride, info.width, info.height, share_->data, info.width, 0);
+	share_->width = info.width;
+	share_->height = info.height;
+	__sync_synchronize();
+	share_->seq = share_->seq + 1;
+}
+
+void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &info)
+{
+	if (!drm_)
+		return;
+
+	unsigned int pane_w = info.width, pane_h = info.height;
+	if (!ensureCanvas(pane_w, pane_h, info.colour_space))
+		return;
+
+	uint8_t *dst = canvas_span_.data();
+	unsigned int ds = canvas_info_.stride;
+
+	// Neutral black (Y=16, Cb/Cr=128) so an unpublished right pane looks blank.
+	std::memset(dst, 16, static_cast<size_t>(ds) * pane_h);
+	std::memset(dst + static_cast<size_t>(ds) * pane_h, 128, canvas_span_.size() - static_cast<size_t>(ds) * pane_h);
+
+	// Left pane: this (primary) sensor.
+	blitYUV420(y, info.stride, pane_w, pane_h, dst, ds, 0);
+
+	// Right pane: latest secondary frame, if published and dimension-matched.
+	if (share_ && share_->seq != 0 && share_->width == pane_w && share_->height == pane_h)
+	{
+		last_seen_seq_ = share_->seq;
+		blitYUV420(share_->data, pane_w /*tightly packed*/, pane_w, pane_h, dst, ds, pane_w);
+	}
+
+	drm_->Show(canvas_fd_.get(), canvas_span_, canvas_info_);
+}
+
+bool dualHdmiPreviewStage::Process(CompletedRequestPtr &completed_request)
+{
+	StreamInfo info;
+	Stream *stream = previewStream(info);
+	if (!stream)
+		return false;
+
+	auto it = completed_request->buffers.find(stream);
+	if (it == completed_request->buffers.end() || !it->second)
+		return false;
+
+	BufferReadSync r(app_, it->second);
+	libcamera::Span<uint8_t> buffer = r.Get()[0];
+	uint8_t const *y = buffer.data();
+
+	if (primary_)
+		composeAndShow(y, info);
+	else
+		publishSecondary(y, info);
+
+	return false;
+}
+
+void dualHdmiPreviewStage::Teardown()
+{
+	drm_.reset();
+	if (canvas_span_.data())
+	{
+		munmap(canvas_span_.data(), canvas_span_.size());
+		canvas_span_ = {};
+	}
+	canvas_fd_ = {};
+}
+
+static PostProcessingStage *Create(RPiCamApp *app)
+{
+	return new dualHdmiPreviewStage(app);
+}
+
+static RegisterStage reg(NAME, &Create);
