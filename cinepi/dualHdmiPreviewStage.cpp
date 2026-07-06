@@ -30,6 +30,7 @@
 #include <sys/mman.h>
 #include <sys/shm.h>
 
+#include <libcamera/formats.h>
 #include <libcamera/stream.h>
 
 #include "core/buffer_sync.hpp"
@@ -39,6 +40,8 @@
 #include "core/stream_info.hpp"
 #include "post_processing_stages/post_processing_stage.hpp"
 #include "preview/preview.hpp"
+
+#include <sw/redis++/redis++.h>
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -59,6 +62,16 @@ constexpr size_t kMaxPaneBytes = static_cast<size_t>(kMaxPaneW) * kMaxPaneH * 3 
 
 // Fixed key so primary and secondary meet on the same segment. "CIND".
 constexpr key_t kShareKey = 0x43494E44;
+
+// Live preview source, settable at runtime via cinemate's `set preview`
+// command (Redis key hdmi_preview_source): both feeds, cam0 only, cam1 only.
+enum class PreviewMode { Both, Cam0, Cam1 };
+
+// Only the primary reads Redis, and only for a preview toggle, so re-reading
+// every frame is wasteful; poll every N frames instead (~0.5 s at 30 fps).
+constexpr unsigned int kModePollFrames = 15;
+constexpr char const *kRedisUrl = "redis://127.0.0.1:6379/0";
+constexpr char const *kModeKey = "hdmi_preview_source";
 
 // Tightly packed (stride == width) YUV420 frame published by the secondary.
 struct DualPreviewShare
@@ -89,12 +102,18 @@ private:
 	Stream *previewStream(StreamInfo &info) const;
 	void publishSecondary(uint8_t const *y, StreamInfo const &info);
 	void composeAndShow(uint8_t const *y, StreamInfo const &info);
-	bool ensureCanvas(unsigned int pane_w, unsigned int pane_h,
+	bool ensureCanvas(unsigned int pane_w, unsigned int pane_h, unsigned int panes,
 					  std::optional<libcamera::ColorSpace> const &cs);
+	void refreshMode();
 
 	std::shared_ptr<spdlog::logger> console;
 
 	bool primary_ = true;
+
+	// Live preview-source selection (primary only).
+	std::unique_ptr<sw::redis::Redis> redis_;
+	PreviewMode mode_ = PreviewMode::Both;
+	unsigned int frame_count_ = 0;
 
 	// Shared-memory publish channel (both roles attach; primary reads,
 	// secondary writes).
@@ -194,6 +213,17 @@ void dualHdmiPreviewStage::Configure()
 			console->error("dual HDMI preview: DRM unavailable ({})", e.what());
 			drm_.reset();
 		}
+		try
+		{
+			redis_ = std::make_unique<sw::redis::Redis>(kRedisUrl);
+			refreshMode();
+		}
+		catch (std::exception const &e)
+		{
+			console->warn("dual HDMI preview: Redis unavailable ({}); defaulting to both", e.what());
+			redis_.reset();
+			mode_ = PreviewMode::Both;
+		}
 	}
 	else if (!share_)
 	{
@@ -201,14 +231,53 @@ void dualHdmiPreviewStage::Configure()
 	}
 }
 
-bool dualHdmiPreviewStage::ensureCanvas(unsigned int pane_w, unsigned int pane_h,
+// Poll the live preview-source key. Accepts cam0/cam1/both plus a few aliases.
+void dualHdmiPreviewStage::refreshMode()
+{
+	if (!redis_)
+		return;
+	PreviewMode next = mode_;
+	try
+	{
+		auto v = redis_->get(kModeKey);
+		if (v && !v->empty())
+		{
+			std::string s = *v;
+			if (s == "cam0" || s == "0" || s == "a")
+				next = PreviewMode::Cam0;
+			else if (s == "cam1" || s == "1" || s == "b")
+				next = PreviewMode::Cam1;
+			else
+				next = PreviewMode::Both; // both / cam0+cam1 / anything else
+		}
+	}
+	catch (std::exception const &)
+	{
+		return; // transient Redis error: keep the current mode
+	}
+	if (next != mode_)
+	{
+		mode_ = next;
+		console->info("dual HDMI preview source -> {}",
+					  mode_ == PreviewMode::Cam0 ? "cam0" : mode_ == PreviewMode::Cam1 ? "cam1" : "both");
+	}
+}
+
+bool dualHdmiPreviewStage::ensureCanvas(unsigned int pane_w, unsigned int pane_h, unsigned int panes,
 										std::optional<libcamera::ColorSpace> const &cs)
 {
-	unsigned int cw = pane_w * 2, ch = pane_h;
+	unsigned int cw = pane_w * panes, ch = pane_h;
 	if (canvas_fd_.isValid() && canvas_info_.width == cw && canvas_info_.height == ch)
 		return true;
 
-	// (Re)allocate the side-by-side canvas as a dmabuf DRM can import.
+	// Dimensions changed (mode toggle or first frame). DrmPreview caches
+	// imported buffers by fd, and the dma-heap can hand back the fd number we
+	// are about to free, so drop its cache first to force a clean re-import of
+	// the new canvas rather than reusing a stale framebuffer mapping.
+	if (canvas_span_.data() && drm_)
+		drm_->Reset();
+
+	// (Re)allocate the canvas as a dmabuf DRM can import.
 	if (canvas_span_.data())
 	{
 		munmap(canvas_span_.data(), canvas_span_.size());
@@ -287,25 +356,45 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 	if (!drm_)
 		return;
 
+	if (++frame_count_ % kModePollFrames == 0)
+		refreshMode();
+
 	unsigned int pane_w = info.width, pane_h = info.height;
-	if (!ensureCanvas(pane_w, pane_h, info.colour_space))
+	bool have_secondary =
+		share_ && share_->seq != 0 && share_->width == pane_w && share_->height == pane_h;
+
+	// Resolve the requested source; fall back to cam0 if cam1 is requested but
+	// the secondary hasn't published a frame yet, so the monitor isn't blank.
+	PreviewMode mode = mode_;
+	if (mode == PreviewMode::Cam1 && !have_secondary)
+		mode = PreviewMode::Cam0;
+
+	unsigned int panes = (mode == PreviewMode::Both) ? 2 : 1;
+	if (!ensureCanvas(pane_w, pane_h, panes, info.colour_space))
 		return;
 
 	uint8_t *dst = canvas_span_.data();
 	unsigned int ds = canvas_info_.stride;
 
-	// Neutral black (Y=16, Cb/Cr=128) so an unpublished right pane looks blank.
+	// Neutral black (Y=16, Cb/Cr=128) so an unfilled pane looks blank.
 	std::memset(dst, 16, static_cast<size_t>(ds) * pane_h);
 	std::memset(dst + static_cast<size_t>(ds) * pane_h, 128, canvas_span_.size() - static_cast<size_t>(ds) * pane_h);
 
-	// Left pane: this (primary) sensor.
-	blitYUV420(y, info.stride, pane_w, pane_h, dst, ds, 0);
-
-	// Right pane: latest secondary frame, if published and dimension-matched.
-	if (share_ && share_->seq != 0 && share_->width == pane_w && share_->height == pane_h)
+	if (mode == PreviewMode::Cam1)
 	{
+		// cam1 fullscreen: the secondary's frame (tightly packed) fills the pane.
 		last_seen_seq_ = share_->seq;
-		blitYUV420(share_->data, pane_w /*tightly packed*/, pane_w, pane_h, dst, ds, pane_w);
+		blitYUV420(share_->data, pane_w, pane_w, pane_h, dst, ds, 0);
+	}
+	else
+	{
+		// cam0 fullscreen or both: our own frame occupies the first pane.
+		blitYUV420(y, info.stride, pane_w, pane_h, dst, ds, 0);
+		if (mode == PreviewMode::Both && have_secondary)
+		{
+			last_seen_seq_ = share_->seq;
+			blitYUV420(share_->data, pane_w /*tightly packed*/, pane_w, pane_h, dst, ds, pane_w);
+		}
 	}
 
 	drm_->Show(canvas_fd_.get(), canvas_span_, canvas_info_);
@@ -317,6 +406,19 @@ bool dualHdmiPreviewStage::Process(CompletedRequestPtr &completed_request)
 	Stream *stream = previewStream(info);
 	if (!stream)
 		return false;
+
+	// We composite planar YUV420 directly; cinemate always configures the
+	// lores stream as YUV420, but guard anyway rather than render garbage.
+	if (info.pixel_format != libcamera::formats::YUV420)
+	{
+		static bool warned = false;
+		if (!warned)
+		{
+			warned = true;
+			console->warn("dual HDMI preview: preview stream is not YUV420; disabled");
+		}
+		return false;
+	}
 
 	auto it = completed_request->buffers.find(stream);
 	if (it == completed_request->buffers.end() || !it->second)
