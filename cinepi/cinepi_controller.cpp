@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <ctime>
 #include <iomanip>
 #include <sstream>
 
@@ -245,22 +246,34 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     }
     else
     {
-        /* Derive once-per-run offset between MONOTONIC and REALTIME */
-        using clk_sys  = std::chrono::system_clock;
-
-        static bool     have_offset   = false;
-        static uint64_t boot0_ns      = 0;               // first sensor ts (ns)
-        static int64_t  epoch0_ns     = 0;               // wall clock at that moment
+        /*
+         * FrameWallClock is unavailable on this build, so map the sensor
+         * timestamp (info.ts, CLOCK_BOOTTIME ns) to Unix-epoch ns ourselves.
+         *
+         * The CLOCK_BOOTTIME→CLOCK_REALTIME offset is a system-wide constant,
+         * so sample both clocks back-to-back ONCE and cache their difference.
+         * Do NOT anchor epoch time to a frame's arrival: that folds this
+         * process's frame-handling latency into the offset, and because cam0
+         * (sync server) and cam1 (sync client) handle their first frame at
+         * different instants they end up with different constants — the
+         * "one frame ahead/behind" seen across hardware-synced sensors. A pure
+         * clock offset is identical in every process, so synced frames (which
+         * share the same sensor timestamp) get identical time-codes.
+         */
+        static bool    have_offset      = false;
+        static int64_t boot_to_epoch_ns = 0;             // REALTIME − BOOTTIME
 
         if (!have_offset)
         {
-            boot0_ns  = info.ts;
-            epoch0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             clk_sys::now().time_since_epoch())
-                             .count();
+            struct timespec bt {}, rt {};
+            clock_gettime(CLOCK_BOOTTIME, &bt);
+            clock_gettime(CLOCK_REALTIME, &rt);
+            int64_t boot_now = static_cast<int64_t>(bt.tv_sec) * 1'000'000'000LL + bt.tv_nsec;
+            int64_t real_now = static_cast<int64_t>(rt.tv_sec) * 1'000'000'000LL + rt.tv_nsec;
+            boot_to_epoch_ns = real_now - boot_now;
             have_offset = true;
         }
-        epoch_ns = epoch0_ns + (info.ts - boot0_ns);
+        epoch_ns = static_cast<uint64_t>(static_cast<int64_t>(info.ts) + boot_to_epoch_ns);
     }
 
     /* ────────────────────────────────────────────────────────────── */
