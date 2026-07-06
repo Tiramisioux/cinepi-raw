@@ -123,11 +123,15 @@ private:
 	DualPreviewShare *share_ = nullptr;
 	uint32_t last_seen_seq_ = 0;
 
-	// Primary-only DRM output + composite canvas.
+	// Primary-only DRM output + double-buffered composite canvas. We compose
+	// into the back buffer while the display scans out the front one, then swap
+	// on Show() — otherwise the display catches a half-composed buffer (drifting
+	// black bands).
 	std::unique_ptr<Preview> drm_;
 	DmaHeap dma_heap_;
-	libcamera::UniqueFD canvas_fd_;
-	libcamera::Span<uint8_t> canvas_span_;
+	libcamera::UniqueFD canvas_fd_[2];
+	libcamera::Span<uint8_t> canvas_span_[2];
+	unsigned int canvas_index_ = 0;
 	StreamInfo canvas_info_;
 };
 
@@ -269,39 +273,43 @@ bool dualHdmiPreviewStage::ensureCanvas(unsigned int pane_w, unsigned int pane_h
 										std::optional<libcamera::ColorSpace> const &cs)
 {
 	unsigned int cw = pane_w * panes, ch = pane_h;
-	if (canvas_fd_.isValid() && canvas_info_.width == cw && canvas_info_.height == ch)
+	if (canvas_fd_[0].isValid() && canvas_info_.width == cw && canvas_info_.height == ch)
 		return true;
 
 	// Dimensions changed (mode toggle or first frame). DrmPreview caches
-	// imported buffers by fd, and the dma-heap can hand back the fd number we
+	// imported buffers by fd, and the dma-heap can hand back an fd number we
 	// are about to free, so drop its cache first to force a clean re-import of
 	// the new canvas rather than reusing a stale framebuffer mapping.
-	if (canvas_span_.data() && drm_)
+	if (canvas_span_[0].data() && drm_)
 		drm_->Reset();
 
-	// (Re)allocate the canvas as a dmabuf DRM can import.
-	if (canvas_span_.data())
-	{
-		munmap(canvas_span_.data(), canvas_span_.size());
-		canvas_span_ = {};
-	}
-	canvas_fd_ = {};
-
+	// (Re)allocate both canvas buffers as dmabufs DRM can import.
 	size_t size = static_cast<size_t>(cw) * ch * 3 / 2;
-	libcamera::UniqueFD fd = dma_heap_.alloc("dual-hdmi-canvas", size);
-	if (!fd.isValid())
+	for (unsigned int i = 0; i < 2; ++i)
 	{
-		console->error("dual HDMI preview: canvas dma-heap alloc failed");
-		return false;
+		if (canvas_span_[i].data())
+		{
+			munmap(canvas_span_[i].data(), canvas_span_[i].size());
+			canvas_span_[i] = {};
+		}
+		canvas_fd_[i] = {};
+
+		libcamera::UniqueFD fd = dma_heap_.alloc("dual-hdmi-canvas", size);
+		if (!fd.isValid())
+		{
+			console->error("dual HDMI preview: canvas dma-heap alloc failed");
+			return false;
+		}
+		void *mem = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd.get(), 0);
+		if (mem == MAP_FAILED)
+		{
+			console->error("dual HDMI preview: canvas mmap failed");
+			return false;
+		}
+		canvas_fd_[i] = std::move(fd);
+		canvas_span_[i] = libcamera::Span<uint8_t>(static_cast<uint8_t *>(mem), size);
 	}
-	void *mem = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd.get(), 0);
-	if (mem == MAP_FAILED)
-	{
-		console->error("dual HDMI preview: canvas mmap failed");
-		return false;
-	}
-	canvas_fd_ = std::move(fd);
-	canvas_span_ = libcamera::Span<uint8_t>(static_cast<uint8_t *>(mem), size);
+	canvas_index_ = 0;
 
 	canvas_info_ = StreamInfo();
 	canvas_info_.width = cw;
@@ -408,7 +416,9 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 	if (!ensureCanvas(pane_w, pane_h, panes, info.colour_space))
 		return;
 
-	uint8_t *dst = canvas_span_.data();
+	// Compose into the back buffer; the display is scanning out the other one.
+	unsigned int idx = canvas_index_;
+	uint8_t *dst = canvas_span_[idx].data();
 	unsigned int ds = canvas_info_.stride;
 
 	// The canvas is a cached dma-heap buffer, so bracket the CPU writes with
@@ -416,11 +426,11 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 	// lines and the preview is pure static. Mirrors core BufferWriteSync.
 	struct dma_buf_sync sync = {};
 	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
-	::ioctl(canvas_fd_.get(), DMA_BUF_IOCTL_SYNC, &sync);
+	::ioctl(canvas_fd_[idx].get(), DMA_BUF_IOCTL_SYNC, &sync);
 
 	// Neutral black (Y=16, Cb/Cr=128) so an unfilled pane looks blank.
 	std::memset(dst, 16, static_cast<size_t>(ds) * pane_h);
-	std::memset(dst + static_cast<size_t>(ds) * pane_h, 128, canvas_span_.size() - static_cast<size_t>(ds) * pane_h);
+	std::memset(dst + static_cast<size_t>(ds) * pane_h, 128, canvas_span_[idx].size() - static_cast<size_t>(ds) * pane_h);
 
 	if (mode == PreviewMode::Cam1)
 	{
@@ -450,9 +460,10 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 		drawWhiteFrame(dst, ds, ch, pane_w, pane_w, pane_h, t);
 
 	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
-	::ioctl(canvas_fd_.get(), DMA_BUF_IOCTL_SYNC, &sync);
+	::ioctl(canvas_fd_[idx].get(), DMA_BUF_IOCTL_SYNC, &sync);
 
-	drm_->Show(canvas_fd_.get(), canvas_span_, canvas_info_);
+	drm_->Show(canvas_fd_[idx].get(), canvas_span_[idx], canvas_info_);
+	canvas_index_ ^= 1; // next frame composes into the other buffer
 }
 
 bool dualHdmiPreviewStage::Process(CompletedRequestPtr &completed_request)
@@ -494,12 +505,15 @@ bool dualHdmiPreviewStage::Process(CompletedRequestPtr &completed_request)
 void dualHdmiPreviewStage::Teardown()
 {
 	drm_.reset();
-	if (canvas_span_.data())
+	for (unsigned int i = 0; i < 2; ++i)
 	{
-		munmap(canvas_span_.data(), canvas_span_.size());
-		canvas_span_ = {};
+		if (canvas_span_[i].data())
+		{
+			munmap(canvas_span_[i].data(), canvas_span_[i].size());
+			canvas_span_[i] = {};
+		}
+		canvas_fd_[i] = {};
 	}
-	canvas_fd_ = {};
 }
 
 static PostProcessingStage *Create(RPiCamApp *app)
