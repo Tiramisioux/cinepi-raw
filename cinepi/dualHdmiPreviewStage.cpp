@@ -21,6 +21,7 @@
  * future hardware); it is deliberately isolated to this file.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -336,6 +337,39 @@ static void blitYUV420(uint8_t const *src, unsigned int src_stride, unsigned int
 	}
 }
 
+// Fill a rect of the tightly packed YUV420 canvas with a solid luma value and
+// neutral chroma (128). All coordinates/sizes must be even. canvas_h is the
+// full canvas height (Y rows), needed to locate the U/V planes.
+static void fillLumaRect(uint8_t *dst, unsigned int ds, unsigned int canvas_h,
+						 unsigned int x, unsigned int y, unsigned int w, unsigned int h, uint8_t yval)
+{
+	uint8_t *Y = dst;
+	uint8_t *U = dst + static_cast<size_t>(ds) * canvas_h;
+	uint8_t *V = U + static_cast<size_t>(ds / 2) * (canvas_h / 2);
+	for (unsigned int r = 0; r < h; ++r)
+		std::memset(Y + static_cast<size_t>(y + r) * ds + x, yval, w);
+	unsigned int cx = x / 2, cy = y / 2, cw = w / 2, chh = h / 2;
+	for (unsigned int r = 0; r < chh; ++r)
+	{
+		std::memset(U + static_cast<size_t>(cy + r) * (ds / 2) + cx, 128, cw);
+		std::memset(V + static_cast<size_t>(cy + r) * (ds / 2) + cx, 128, cw);
+	}
+}
+
+// Draw a hollow white rectangle (frame) of thickness t around a pane. Adjacent
+// pane frames in `both` mode share the centre edge, which reads as the divider.
+static void drawWhiteFrame(uint8_t *dst, unsigned int ds, unsigned int canvas_h,
+						   unsigned int x0, unsigned int w, unsigned int h, unsigned int t)
+{
+	constexpr uint8_t kWhite = 235; // broadcast white, avoids full-range clipping
+	if (t == 0 || 2 * t >= h || 2 * t >= w)
+		return;
+	fillLumaRect(dst, ds, canvas_h, x0, 0, w, t, kWhite);          // top
+	fillLumaRect(dst, ds, canvas_h, x0, h - t, w, t, kWhite);      // bottom
+	fillLumaRect(dst, ds, canvas_h, x0, 0, t, h, kWhite);          // left
+	fillLumaRect(dst, ds, canvas_h, x0 + w - t, 0, t, h, kWhite);  // right
+}
+
 void dualHdmiPreviewStage::publishSecondary(uint8_t const *y, StreamInfo const &info)
 {
 	if (!share_)
@@ -396,6 +430,15 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 			blitYUV420(share_->data, pane_w /*tightly packed*/, pane_w, pane_h, dst, ds, pane_w);
 		}
 	}
+
+	// White frame around each pane. In `both` mode the two inner edges meet at
+	// the centre, forming the dividing line between the feeds.
+	unsigned int t = std::max(2u, pane_h / 180u);
+	t &= ~1u; // keep even for chroma subsampling
+	unsigned int ch = canvas_info_.height;
+	drawWhiteFrame(dst, ds, ch, 0, pane_w, pane_h, t);
+	if (panes == 2)
+		drawWhiteFrame(dst, ds, ch, pane_w, pane_w, pane_h, t);
 
 	drm_->Show(canvas_fd_.get(), canvas_span_, canvas_info_);
 }
