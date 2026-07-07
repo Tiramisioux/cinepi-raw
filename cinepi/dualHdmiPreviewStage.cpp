@@ -66,8 +66,9 @@ constexpr size_t kMaxPaneBytes = static_cast<size_t>(kMaxPaneW) * kMaxPaneH * 3 
 constexpr key_t kShareKey = 0x43494E44;
 
 // Live preview source, settable at runtime via cinemate's `set preview`
-// command (Redis key hdmi_preview_source): both feeds, cam0 only, cam1 only.
-enum class PreviewMode { Both, Cam0, Cam1 };
+// command (Redis key hdmi_preview_source): both feeds side-by-side, cam0 only,
+// cam1 only, or picture-in-picture (one sensor full, the other a corner inset).
+enum class PreviewMode { Both, Cam0, Cam1, PipCam0, PipCam1 };
 
 // Only the primary reads Redis, and only for a preview toggle, so re-reading
 // every frame is wasteful; poll every N frames instead (~0.5 s at 30 fps).
@@ -111,6 +112,12 @@ private:
 	std::shared_ptr<spdlog::logger> console;
 
 	bool primary_ = true;
+
+	// Picture-in-picture inset geometry, from settings.json preview.pip via the
+	// post-process file. scale/margin are fractions of the main pane.
+	float pip_scale_ = 0.28f;
+	float pip_margin_ = 0.03f;
+	std::string pip_corner_ = "lower_right";
 
 	// Live preview-source selection (primary only).
 	std::unique_ptr<sw::redis::Redis> redis_;
@@ -157,6 +164,9 @@ void dualHdmiPreviewStage::Read(boost::property_tree::ptree const &params)
 {
 	std::string role = params.get<std::string>("role", "primary");
 	primary_ = (role != "secondary");
+	pip_scale_ = params.get<float>("pipScale", 0.28f);
+	pip_margin_ = params.get<float>("pipMargin", 0.03f);
+	pip_corner_ = params.get<std::string>("pipCorner", "lower_right");
 }
 
 // Attach (creating if needed) the shared publish segment. Idempotent.
@@ -253,6 +263,10 @@ void dualHdmiPreviewStage::refreshMode()
 				next = PreviewMode::Cam0;
 			else if (s == "cam1" || s == "1" || s == "b")
 				next = PreviewMode::Cam1;
+			else if (s == "pip_cam0" || s == "pip0" || s == "pip")
+				next = PreviewMode::PipCam0;
+			else if (s == "pip_cam1" || s == "pip1")
+				next = PreviewMode::PipCam1;
 			else
 				next = PreviewMode::Both; // both / cam0+cam1 / anything else
 		}
@@ -264,8 +278,12 @@ void dualHdmiPreviewStage::refreshMode()
 	if (next != mode_)
 	{
 		mode_ = next;
-		console->info("dual HDMI preview source -> {}",
-					  mode_ == PreviewMode::Cam0 ? "cam0" : mode_ == PreviewMode::Cam1 ? "cam1" : "both");
+		char const *name = mode_ == PreviewMode::Cam0	  ? "cam0"
+						   : mode_ == PreviewMode::Cam1	  ? "cam1"
+						   : mode_ == PreviewMode::PipCam0 ? "pip_cam0"
+						   : mode_ == PreviewMode::PipCam1 ? "pip_cam1"
+														  : "both";
+		console->info("dual HDMI preview source -> {}", name);
 	}
 }
 
@@ -365,18 +383,71 @@ static void fillLumaRect(uint8_t *dst, unsigned int ds, unsigned int canvas_h,
 	}
 }
 
-// Draw a hollow white rectangle (frame) of thickness t around a pane. Adjacent
-// pane frames in `both` mode share the centre edge, which reads as the divider.
+// Draw a hollow white rectangle (frame) of thickness t around a pane rooted at
+// (x0, y0). Adjacent pane frames in `both` mode share the centre edge, which
+// reads as the divider; the pip inset reuses this with a non-zero y0.
 static void drawWhiteFrame(uint8_t *dst, unsigned int ds, unsigned int canvas_h,
-						   unsigned int x0, unsigned int w, unsigned int h, unsigned int t)
+						   unsigned int x0, unsigned int y0, unsigned int w, unsigned int h, unsigned int t)
 {
 	constexpr uint8_t kWhite = 235; // broadcast white, avoids full-range clipping
 	if (t == 0 || 2 * t >= h || 2 * t >= w)
 		return;
-	fillLumaRect(dst, ds, canvas_h, x0, 0, w, t, kWhite);          // top
-	fillLumaRect(dst, ds, canvas_h, x0, h - t, w, t, kWhite);      // bottom
-	fillLumaRect(dst, ds, canvas_h, x0, 0, t, h, kWhite);          // left
-	fillLumaRect(dst, ds, canvas_h, x0 + w - t, 0, t, h, kWhite);  // right
+	fillLumaRect(dst, ds, canvas_h, x0, y0, w, t, kWhite);             // top
+	fillLumaRect(dst, ds, canvas_h, x0, y0 + h - t, w, t, kWhite);     // bottom
+	fillLumaRect(dst, ds, canvas_h, x0, y0, t, h, kWhite);             // left
+	fillLumaRect(dst, ds, canvas_h, x0 + w - t, y0, t, h, kWhite);     // right
+}
+
+// Nearest-neighbour downscale of a YUV420 source (stride src_stride) into a
+// tightly packed YUV420 canvas rect at (x_off, y_off), size dst_w x dst_h. All
+// of x_off/y_off/dst_w/dst_h must be even (chroma subsampling). canvas_h is the
+// full canvas Y height (to locate the U/V planes). Used for the pip inset.
+static void blitYUV420Scaled(uint8_t const *src, unsigned int src_stride,
+							 unsigned int src_w, unsigned int src_h,
+							 uint8_t *dst, unsigned int dst_stride, unsigned int canvas_h,
+							 unsigned int x_off, unsigned int y_off,
+							 unsigned int dst_w, unsigned int dst_h)
+{
+	if (dst_w == 0 || dst_h == 0)
+		return;
+
+	uint8_t const *sY = src;
+	uint8_t const *sU = sY + static_cast<size_t>(src_stride) * src_h;
+	uint8_t const *sV = sU + static_cast<size_t>(src_stride / 2) * (src_h / 2);
+
+	uint8_t *dY = dst;
+	uint8_t *dU = dY + static_cast<size_t>(dst_stride) * canvas_h;
+	uint8_t *dV = dU + static_cast<size_t>(dst_stride / 2) * (canvas_h / 2);
+
+	// Y plane.
+	for (unsigned int r = 0; r < dst_h; ++r)
+	{
+		unsigned int sr = r * src_h / dst_h;
+		uint8_t const *srow = sY + static_cast<size_t>(sr) * src_stride;
+		uint8_t *drow = dY + static_cast<size_t>(y_off + r) * dst_stride + x_off;
+		for (unsigned int c = 0; c < dst_w; ++c)
+			drow[c] = srow[c * src_w / dst_w];
+	}
+
+	// Chroma planes (half resolution in both axes).
+	unsigned int cdw = dst_w / 2, cdh = dst_h / 2;
+	unsigned int csw = src_w / 2, csh = src_h / 2;
+	unsigned int cds = dst_stride / 2, css = src_stride / 2;
+	unsigned int cxoff = x_off / 2, cyoff = y_off / 2;
+	for (unsigned int r = 0; r < cdh; ++r)
+	{
+		unsigned int sr = r * csh / cdh;
+		uint8_t const *sUrow = sU + static_cast<size_t>(sr) * css;
+		uint8_t const *sVrow = sV + static_cast<size_t>(sr) * css;
+		uint8_t *dUrow = dU + static_cast<size_t>(cyoff + r) * cds + cxoff;
+		uint8_t *dVrow = dV + static_cast<size_t>(cyoff + r) * cds + cxoff;
+		for (unsigned int c = 0; c < cdw; ++c)
+		{
+			unsigned int sc = c * csw / cdw;
+			dUrow[c] = sUrow[sc];
+			dVrow[c] = sVrow[sc];
+		}
+	}
 }
 
 void dualHdmiPreviewStage::publishSecondary(uint8_t const *y, StreamInfo const &info)
@@ -411,6 +482,10 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 	PreviewMode mode = mode_;
 	if (mode == PreviewMode::Cam1 && !have_secondary)
 		mode = PreviewMode::Cam0;
+	// Pip needs the secondary frame (as the inset for cam0-main, as the main
+	// image for cam1-main); until it arrives, fall back to cam0 fullscreen.
+	if ((mode == PreviewMode::PipCam0 || mode == PreviewMode::PipCam1) && !have_secondary)
+		mode = PreviewMode::Cam0;
 
 	unsigned int panes = (mode == PreviewMode::Both) ? 2 : 1;
 	if (!ensureCanvas(pane_w, pane_h, panes, info.colour_space))
@@ -438,6 +513,45 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 		last_seen_seq_ = share_->seq;
 		blitYUV420(share_->data, pane_w, pane_w, pane_h, dst, ds, 0);
 	}
+	else if (mode == PreviewMode::PipCam0 || mode == PreviewMode::PipCam1)
+	{
+		// One sensor fills the pane; the other is a small corner inset.
+		//   PipCam0 → cam0 (own frame) main, cam1 (secondary) inset.
+		//   PipCam1 → cam1 (secondary) main, cam0 (own frame) inset.
+		// have_secondary is guaranteed here (else we fell back to Cam0 above).
+		last_seen_seq_ = share_->seq;
+		uint8_t const *main_src, *inset_src;
+		unsigned int main_stride, inset_stride;
+		if (mode == PreviewMode::PipCam0)
+		{
+			main_src = y;             main_stride = info.stride; // cam0
+			inset_src = share_->data; inset_stride = pane_w;     // cam1 (tightly packed)
+		}
+		else
+		{
+			main_src = share_->data;  main_stride = pane_w;      // cam1 (tightly packed)
+			inset_src = y;            inset_stride = info.stride; // cam0
+		}
+		blitYUV420(main_src, main_stride, pane_w, pane_h, dst, ds, 0);
+
+		// Inset size/margin are fractions of the main pane; keep everything even
+		// for chroma subsampling.
+		unsigned int iw = static_cast<unsigned int>(pane_w * pip_scale_) & ~1u;
+		unsigned int ih = static_cast<unsigned int>(pane_h * pip_scale_) & ~1u;
+		unsigned int mx = static_cast<unsigned int>(pane_w * pip_margin_) & ~1u;
+		unsigned int my = static_cast<unsigned int>(pane_h * pip_margin_) & ~1u;
+		if (iw >= 2 && ih >= 2 && iw + 2 * mx < pane_w && ih + 2 * my < pane_h)
+		{
+			bool right = pip_corner_.find("right") != std::string::npos;
+			bool lower = pip_corner_.find("lower") != std::string::npos ||
+						 pip_corner_.find("bottom") != std::string::npos;
+			unsigned int ix = (right ? (pane_w - iw - mx) : mx) & ~1u;
+			unsigned int iy = (lower ? (pane_h - ih - my) : my) & ~1u;
+			blitYUV420Scaled(inset_src, inset_stride, pane_w, pane_h,
+							 dst, ds, canvas_info_.height, ix, iy, iw, ih);
+			drawWhiteFrame(dst, ds, canvas_info_.height, ix, iy, iw, ih, 2);
+		}
+	}
 	else
 	{
 		// cam0 fullscreen or both: our own frame occupies the first pane.
@@ -455,9 +569,9 @@ void dualHdmiPreviewStage::composeAndShow(uint8_t const *y, StreamInfo const &in
 	// for chroma subsampling.
 	constexpr unsigned int t = 2;
 	unsigned int ch = canvas_info_.height;
-	drawWhiteFrame(dst, ds, ch, 0, pane_w, pane_h, t);
+	drawWhiteFrame(dst, ds, ch, 0, 0, pane_w, pane_h, t);
 	if (panes == 2)
-		drawWhiteFrame(dst, ds, ch, pane_w, pane_w, pane_h, t);
+		drawWhiteFrame(dst, ds, ch, pane_w, 0, pane_w, pane_h, t);
 
 	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
 	::ioctl(canvas_fd_[idx].get(), DMA_BUF_IOCTL_SYNC, &sync);
