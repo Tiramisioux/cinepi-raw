@@ -26,6 +26,7 @@ sources = [
   'dng_encoder.cpp',
   'sharedContextStage.cpp',
   'mjpegPreviewStage.cpp',
+  'dualHdmiPreviewStage.cpp',
   'cinepi_controller.cpp',
   'cinepi_sound.cpp',
   'cinepi_state.cpp',

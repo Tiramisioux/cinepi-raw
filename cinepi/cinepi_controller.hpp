@@ -131,6 +131,29 @@ class CinePIController : public CinePIState
             return cameraInit_.exchange(false);
         }
 
+    // ── Dual-sensor record gate ─────────────────────────────────────────────
+    // Which sensor(s) record the current take is published by cinemate in the
+    // Redis key `record_cams` (tokens: "cam0", "cam1", "cam0+cam1", "both").
+    // Each cinepi-raw instance records only when its own --cam-port is selected;
+    // the others keep previewing (and stay genlocked) but open no clip folder.
+    // Absent/empty key → both record, i.e. the pre-gate behaviour, so a
+    // single-sensor rig and any older cinemate are unaffected.
+    bool recordCamsIncludesSelf()
+    {
+        const std::string port = options_->CamPort();
+        if (port.empty())
+            return true;                         // unlabelled single camera
+        auto v = redis_->get("record_cams");
+        if (!v || v->empty())
+            return true;                         // legacy: no gate published
+        const std::string &sel = *v;
+        if (sel == "both")
+            return true;
+        // "cam0" is never a substring of "cam1", so a plain find is safe and
+        // matches "cam0+cam1" for either port.
+        return sel.find(port) != std::string::npos;
+    }
+
     int triggerRec()
     {
         /* ── 0.  Bail out early if no medium mounted. ──────────────────────── */
@@ -145,6 +168,11 @@ class CinePIController : public CinePIState
 
             if (state > 0)                          /* ↑ start */
             {
+                if (!recordCamsIncludesSelf())      // this sensor sits the take out
+                {
+                    baseline_flag_ = 1;             // stay in sync with shared flag
+                    return 0;
+                }
                 // Folder creation is handled by cinepi_raw.cpp after this
                 // returns, using the sensor-derived wall-clock timestamp so
                 // the folder FXX matches the DNG TC origin exactly.
@@ -176,7 +204,7 @@ class CinePIController : public CinePIState
             baseline_flag_ = rec_flag;
             first_call     = false;
 
-            if (rec_flag && !is_recording_)         // already rolling → join
+            if (rec_flag && !is_recording_ && recordCamsIncludesSelf())  // already rolling → join
             {
                 setRecording(true);
                 is_recording_ = true;
@@ -192,6 +220,8 @@ class CinePIController : public CinePIState
 
             if (rec_flag && !is_recording_)         /* rising edge → start */
             {
+                if (!recordCamsIncludesSelf())      // not this sensor's take
+                    return 0;                       // baseline already synced above
                 console->info("Safety-net started recording (late-join).");
                 setRecording(true);
                 is_recording_ = true;
