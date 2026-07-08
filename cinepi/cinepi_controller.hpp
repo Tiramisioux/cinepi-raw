@@ -238,6 +238,25 @@ class CinePIController : public CinePIState
             }
         }
 
+        /* ── 3.  Policy B: join-only live record gate. ─────────────────────
+         * While a take is already rolling (is_recording high, baseline synced),
+         * a sensor that sat the start out may JOIN back-to-back when the operator
+         * switches the on-camera preview to a view that includes it — cinemate
+         * republishes record_cams live, and we pick it up here on the next frame.
+         * The +1 lands in cinepi_raw.cpp's start path, opening a fresh clip folder
+         * stamped with THIS frame's wall-clock, so the joining sensor's clip is
+         * seamless from the switch instant. Join-only: we never drop a sensor
+         * mid-take here — leaving a take is only ever via the shared stop edge.
+         * The `!is_recording_` guard short-circuits before the Redis read on the
+         * already-recording sensor, so this adds no per-frame cost there.        */
+        if (rec_flag && baseline_flag_ && !is_recording_ && recordCamsIncludesSelf())
+        {
+            console->info("Gate opened mid-take → joining back-to-back.");
+            setRecording(true);
+            is_recording_ = true;
+            return +1;
+        }
+
         return 0;                                   // steady state, nothing to do
     }
 
