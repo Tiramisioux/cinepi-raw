@@ -125,6 +125,10 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 				controller.announceReady(key);          // store one-shot flag
 			}
 
+			// Snapshot the validated sensor-mode bit depth for the encoder's
+			// 16-bit keep-full-depth decision; options->mode itself stays
+			// redis-mutable and must not be read at setup_encoder time.
+			app.GetEncoder()->setSensorModeBitDepth(options->mode.bit_depth);
 			app.GetEncoder()->reset_encoder();
 			controller.process_stream_info(cfg);
 

@@ -722,33 +722,22 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.black_level_repeat_dim[0] = 2;
     dng_info.black_level_repeat_dim[1] = 2;
 
-    /* By default we pack 16-bit streams to 12-bit unless user said --keep16 */
-    write12bit_ = (bf.bits == 16) && !options_->keep16;
+    /* On PiSP every raw stream arrives as a 16-bit container. SDR sensor modes
+     * (<=12 significant bits, MSB-aligned) pack down to 12-bit DNGs by default;
+     * dropping the 4 padding LSBs is lossless there. A true 16-bit sensor mode
+     * (imx585 ClearHDR SRGGB16, sensor mode bit depth 16) carries real data in
+     * all 16 bits, so it always keeps full depth; --keep16 forces full depth
+     * for the SDR case too. The bit depth comes from the snapshot taken at
+     * reconfigure time, not options_->mode (which the redis thread mutates).
+     * BlackLevel is computed per-frame in dng_save() from SensorBlackLevels,
+     * scaled to the output white level. */
+    write12bit_ = (bf.bits == 16) && !options_->keep16 &&
+                  sensor_mode_bit_depth_ != 16;
 
     if (write12bit_) {
         dng_info.bits  = 12;
         dng_info.white = (1u << 12) - 1u;
-
-        /* rescale black levels already in the array */
-        for (float &bl : dng_info.black_levels)
-            bl = bl * dng_info.white / 65535.f;
     }
-    else {
-        dng_info.white = (1u << dng_info.bits) - 1u;   // 65 535 for true 16-bit
-    }
-
-
-    for (float &bl : dng_info.black_levels)          // already filled earlier
-    bl = bl * dng_info.white / 65535.f;          // 16-bit → 12-bit scale
-
-
-    /* ──  Black-level defaults (16-bit = 256 DN)  ─────────────── */
-    std::fill(std::begin(dng_info.black_levels),
-              std::end(dng_info.black_levels),
-              256.f);
-
-    if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
-        std::copy(bl->begin(), bl->end(), dng_info.black_levels);
 
     /* ──  White-balance gains & CCM  ──────────────────────────── */
     std::fill(std::begin(dng_info.NEUTRAL), std::end(dng_info.NEUTRAL), 1.f);
@@ -1004,7 +993,15 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         }
     }
     else
-        std::fill(std::begin(black), std::end(black), 256);
+    {
+        /* No SensorBlackLevels metadata: assume the common Pi pedestal of 4096
+         * in the 16-bit domain (upstream rpicam-apps uses 4096 >> (16 - bits))
+         * and scale it to the output white level like the metadata path above:
+         * 256 for 12-bit output, 4096 for 16-bit. */
+        const uint16_t fallback =
+            static_cast<uint16_t>(4096.f * dng_info.white / 65535.f + 0.5f);
+        std::fill(std::begin(black), std::end(black), fallback);
+    }
 
     /* ──  4.  Prepare matrices  ───────────────────────────────── */
     int32_t matrixXY[18]; encode_rational_array(dng_info.CAM_XYZ, 9, matrixXY);

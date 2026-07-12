@@ -117,6 +117,14 @@ static libcamera::PixelFormat mode_to_pixel_format(Mode const &mode)
 		{ Mode(0, 0, 10, true), libcamera::formats::SBGGR10_CSI2P },
 		{ Mode(0, 0, 12, false), libcamera::formats::SBGGR12 },
 		{ Mode(0, 0, 12, true), libcamera::formats::SBGGR12_CSI2P },
+		// 16-bit sensor modes (imx585 ClearHDR SRGGB16). No CSI2-packed 16-bit
+		// format exists, and a packed request makes PiSP negotiate COMP1
+		// compressed raw, which libcamera's 16-bit endian swap then corrupts
+		// (the swap assumes 2 bytes/pixel). Unpacked is the only usable 16-bit
+		// path, so both U and P map to it. Without these entries a 16-bit mode
+		// fell through to the SBGGR12_CSI2P default below and hit exactly that.
+		{ Mode(0, 0, 16, false), libcamera::formats::SBGGR16 },
+		{ Mode(0, 0, 16, true), libcamera::formats::SBGGR16 },
 	};
 
 	auto it = std::find_if(table.begin(), table.end(), [&mode] (auto &m) { return mode.bit_depth == m.first.bit_depth && mode.packed == m.first.packed; });

@@ -30,6 +30,13 @@ public:
 	/* NEW – let the controller push µs-since-epoch for each frame */
     void setWallClockTimestamp(uint64_t us);   // µs since 1970-01-01
 
+	/* Sensor-mode bit depth, snapshotted on the event-loop thread right after
+	 * ConfigureVideo/selectMode synced options->mode to the real sensor mode.
+	 * setup_encoder keys its 16-bit keep-full-depth decision off this instead
+	 * of reading options_->mode.bit_depth live, which the redis subscriber
+	 * thread mutates (a stale value could leak into a mid-reconfigure take). */
+	void setSensorModeBitDepth(unsigned int bits) { sensor_mode_bit_depth_ = bits; }
+
 	// Encode the given buffer.
 	void EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us) override;
 	void EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const &info, size_t losize, void *lomem, StreamInfo const &loinfo, int64_t timestamp_us, CompletedRequest::ControlList const &metadata);
@@ -197,13 +204,13 @@ private:
                                      const std::optional<int> &nice_value);
 
         bool encoder_initialized_;
+        unsigned int sensor_mode_bit_depth_ = 0;
 	struct DngInfo
 {
 	uint8_t bits;
 
 	uint32_t white;
 	float black;
-	float black_levels[4];
 
 	float NEUTRAL[3];
 	float ANALOGBALANCE[3];

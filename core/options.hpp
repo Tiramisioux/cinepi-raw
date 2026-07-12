@@ -99,7 +99,6 @@ struct Options
         Options()
         : set_default_lens_position(false), af_on_capture(false),
                 hdmi_port(-1),                    /* ‑1 = let DRM decide   */
-                keep16(false),                           // ← NEW default
                 options_("Valid options are", 120, 80), app_(nullptr)
 	{
 		using namespace boost::program_options;
@@ -298,8 +297,6 @@ struct Options
 	*   0 = HDMI‑0  (RPi “main”)
 	*   1 = HDMI‑1  (RPi “aux”)  */
 	int hdmi_port;
-
-	bool keep16;          ///< store RAW as full 16-bit DNG, skip down-pack
 
 	virtual bool Parse(int argc, char *argv[]);
 	virtual void Print() const;

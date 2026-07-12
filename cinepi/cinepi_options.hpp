@@ -29,7 +29,6 @@ public:
     const std::string &CamPort()        const { return camPort; }
     int                HdmiPort()       const { return hdmi_port; }
     bool               SameHdmi()       const { return same_hdmi; }
-    bool               Keep16()         const { return keep16;   }
 
     // digital zoom for preview and low-res streams
     float Zoom()        const { return zoom_factor; }
@@ -47,7 +46,6 @@ private:
     /* CinePi-specific flags */
     std::string  camPort;                       // e.g. "cam0"
     bool         same_hdmi    = false;
-    bool         keep16       = false;
     int          hdmi_port    = -1;
 
     std::vector<std::array<float,4>> scaler_crops_rects;
