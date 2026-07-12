@@ -107,8 +107,12 @@ static int xioctl(int fd, unsigned long ctl, void *arg)
 static bool set_subdev_hdr_ctrl(int en)
 {
 	bool changed = false;
-	// Currently this does not exist in libcamera, so go directly to V4L2
-	// XXX it's not obvious which v4l2-subdev to use for which camera!
+	// Currently this does not exist in libcamera, so go directly to V4L2.
+	// Sensor-agnostic probe: only the camera sensor subdev exposes
+	// V4L2_CID_WIDE_DYNAMIC_RANGE (imx708 stock HDR, imx585 ClearHDR), so we walk
+	// every /dev/v4l-subdevN and set it wherever the control exists. This locates the
+	// imx585 subdev with no sensor-name filter (it is /dev/v4l-subdev2 on the
+	// single-sensor Pi) and covers imx708 identically.
 	for (int i = 0; i < 8; i++)
 	{
 		std::string dev("/dev/v4l-subdev");
@@ -208,7 +212,10 @@ bool Options::Parse(int argc, char *argv[])
 	if (camera < cameras.size())
 	{
 		const std::string cam_id = *cameras[camera]->properties().get(libcamera::properties::Model);
-		if ((hdr == "sensor" || hdr == "auto") && cam_id == "imx708")
+		// imx708 = stock Pi HDR; imx585 = ClearHDR (driver-level merge, wide_dynamic_range=1
+		// surfaces the SRGGB16 linear + SRGGB12_CSI2P CCMP modes). set_subdev_hdr_ctrl probes
+		// each subdev for the control, so listing the sensor here is the only gate needed.
+		if ((hdr == "sensor" || hdr == "auto") && (cam_id == "imx708" || cam_id == "imx585"))
 		{
 			// Turn on sensor HDR.  Reset the camera manager if we have switched the value of the control.
 			if (set_subdev_hdr_ctrl(1))
