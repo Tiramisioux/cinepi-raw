@@ -65,3 +65,11 @@ phase_lock_core_test = executable('phase_lock_core_test',
            include_directories : [include_directories('..')],
            install : false)
 test('phase_lock_core', phase_lock_core_test)
+
+# Unit tests for the pure DNG pixel pack/unpack helpers. No libcamera deps — it
+# includes only cinepi/dng_pack.hpp. Run with `meson test`.
+dng_pack_test = executable('dng_pack_test',
+           '../tests/dng_pack_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('dng_pack', dng_pack_test)
