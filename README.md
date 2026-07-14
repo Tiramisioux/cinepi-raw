@@ -208,6 +208,64 @@ genlock — the lock never shares a sensor's VBLANK with rpi.sync, which is the
 conflict the client gate prevents. If you would rather keep the master strictly
 constant-rate, disable the lock and discipline the sync server's rate instead.
 
+## IMX585 ClearHDR (16-bit HDR)
+
+ClearHDR is the imx585's on-sensor single-frame HDR: the sensor merges a
+high-gain and a low-gain readout internally and outputs one 16-bit linear
+Bayer frame. cinepi-raw records it as true 16-bit DNGs (BlackLevel 3200,
+WhiteLevel 65535, no compression, no linearization table needed).
+
+Requirements:
+
+| Piece | Needed | Why |
+|---|---|---|
+| Kernel | ≥ 6.12.93+rpt | older `rp1-cfe` kernel drivers corrupt 16-bit CSI-2 capture (fixed mid-2025: "Avoid unpack operation for 16-bit formats") |
+| Sensor driver | Tiramisioux `imx585-v4l2-driver`, branch `6.12.y` | exposes `wide_dynamic_range` and the 16-bit modes (3856×2180, 1928×1090) |
+| libcamera | Tiramisioux `libcamera`, branch `cinemate` | 16-bit endian swap, gated off compressed formats |
+| Exposure | manual only | ISP statistics are invalid at 16-bit — AGC/AWB cannot run |
+
+Start with the `--hdr sensor` flag and a 16-bit unpacked mode:
+
+```bash
+cinepi-raw --camera 0 --mode 3856:2180:16:U --width 1920 --height 1080 \
+  --lores-width 1280 --lores-height 720 --hdr sensor
+```
+
+The log should show `Selected sensor format: 3856x2180-SRGGB16_1X16` and
+`Selected CFE format: 3856x2180-RG16`. Behaviour changes while ClearHDR is on:
+
+- frame rate halves (≈ 21.9 fps max at 3856×2180)
+- analogue gain caps at code 80 (≈ 15.8×, ISO 1580 in CineMate terms)
+- each 3856×2180 DNG is ≈ 16.9 MB (plan storage bandwidth: 15 fps ≈ 252 MB/s)
+- set exposure and colour gains manually via Redis (`iso`, `shutter_s`/`shutter_a`, `cg_rb`)
+
+### Live ClearHDR knobs (Redis)
+
+The merge behaviour is tunable while streaming. Each key maps to a custom
+V4L2 control on the sensor; publish the key name on `cp_controls` after
+setting it:
+
+| Redis key | Sensor control | Range | What it does |
+|---|---|---|---|
+| `hdr_threshold` | HDR Data Selection Threshold | `"low,high"`, each 0–4095 | raw levels that steer the per-pixel hand-off from the high-gain to the low-gain readout in the merge |
+| `hdr_blend` | HDR Data Blending Mode | 0–8 | how the two readouts are mixed across the transition zone (0 = HG 1/2 + LG 1/2, per the driver menu) |
+| `hdr_gain_adder` | HDR Gain Adder | 0–5 | digital gain applied to the low-gain path in the merge (menu index; driver default 2 = +12 dB) — shifts where the blend knee lands in the output range |
+
+```bash
+redis-cli set hdr_blend 2 && redis-cli publish cp_controls hdr_blend
+redis-cli set hdr_threshold "500,3000" && redis-cli publish cp_controls hdr_threshold
+```
+
+Toggling ClearHDR itself (`wide_dynamic_range`) changes the sensor's mode
+list, so it stays a launch flag — restart cinepi-raw to switch between SDR
+and HDR. CineMate builds HDR profiles and CLI commands on top of these keys
+(see the CineMate docs, *ClearHDR* page).
+
+Known behaviour: highlights near the merge hand-off can render magenta in
+flat greys — that zone is where the readouts converge, and white balance
+pushes red/blue above green there. Tune `hdr_threshold`/`hdr_blend` for the
+scene, or grade it out; it is not a capture defect.
+
 ## Manual DNG encoder
 
 - Manual writing of DNG tags. 
