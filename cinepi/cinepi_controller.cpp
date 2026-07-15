@@ -229,48 +229,39 @@ void CinePIController::sync(){
             redis_->set(CONTROL_KEY_ZOOM, std::to_string(options_->Zoom()));
 
     // ── imx585 ClearHDR knobs: apply any persisted values at startup, so a
-    //    profile selected before this process launched (CineMate `hdr profile`)
-    //    takes effect without an extra pub/sub round-trip. ──
-    if (auto v = redis_->get(CONTROL_KEY_HDR_THRESHOLD); v && !v->empty()) {
-        unsigned low = 0, high = 0;
-        if (sscanf(v->c_str(), "%u,%u", &low, &high) == 2) {
-            uint16_t pair[2] = { (uint16_t)std::min(low, 4095u),
-                                 (uint16_t)std::min(high, 4095u) };
-            if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
-                console->info("ClearHDR data-selection threshold restored to {},{}", pair[0], pair[1]);
+    //    profile selected before this process launched (CineMate `set hdr
+    //    profile`) takes effect without an extra pub/sub round-trip.
+    //
+    //    Gate on ClearHDR being ON. These are HDR-only sensor controls, and the
+    //    gain adder writes EXP_GAIN (0x3081). The driver's common_regs reset
+    //    EXP_GAIN to 0 for every mode and only common_clearHDR_mode raises it to
+    //    +12 dB, so re-applying a persisted hdr_gain_adder here in an SDR launch
+    //    would override that reset and boost SDR by up to +29 dB (magenta shadow
+    //    noise). When HDR is off we leave the sensor's normal-mode defaults be.
+    if (options_->hdr == "sensor" || options_->hdr == "auto") {
+        if (auto v = redis_->get(CONTROL_KEY_HDR_THRESHOLD); v && !v->empty()) {
+            unsigned low = 0, high = 0;
+            if (sscanf(v->c_str(), "%u,%u", &low, &high) == 2) {
+                uint16_t pair[2] = { (uint16_t)std::min(low, 4095u),
+                                     (uint16_t)std::min(high, 4095u) };
+                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
+                    console->info("ClearHDR data-selection threshold restored to {},{}", pair[0], pair[1]);
+            }
         }
-    }
-    if (auto v = redis_->get(CONTROL_KEY_HDR_BLEND); v && !v->empty()) {
-        try {
-            int val = std::clamp(std::stoi(*v), 0, 8);
-            if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_BK, val, nullptr))
-                console->info("ClearHDR blending mode restored to {}", val);
-        } catch (...) {}
-    }
-    if (auto v = redis_->get(CONTROL_KEY_HDR_GAIN_ADDER); v && !v->empty()) {
-        try {
-            int val = std::clamp(std::stoi(*v), 0, 5);
-            if (set_imx585_hdr_ctrl(IMX585_CID_HDR_GAIN_ADDER, val, nullptr))
-                console->info("ClearHDR gain adder restored to menu index {}", val);
-        } catch (...) {}
-    }
-
-    // ── imx585 ClearHDR knobs: re-apply persisted values at startup so a
-    //    profile selected before this process launched takes effect (the
-    //    live-change path is the pub/sub handlers further down).
-    if (auto v = redis_->get(CONTROL_KEY_HDR_THRESHOLD); v && !v->empty()) {
-        unsigned low = 0, high = 0;
-        if (sscanf(v->c_str(), "%u,%u", &low, &high) == 2) {
-            uint16_t pair[2] = { (uint16_t)std::min(low, 4095u),
-                                 (uint16_t)std::min(high, 4095u) };
-            set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair);
+        if (auto v = redis_->get(CONTROL_KEY_HDR_BLEND); v && !v->empty()) {
+            try {
+                int val = std::clamp(std::stoi(*v), 0, 8);
+                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_BK, val, nullptr))
+                    console->info("ClearHDR blending mode restored to {}", val);
+            } catch (...) {}
         }
-    }
-    if (auto v = redis_->get(CONTROL_KEY_HDR_BLEND); v && !v->empty()) {
-        try { set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_BK, std::clamp(std::stoi(*v), 0, 8), nullptr); } catch (...) {}
-    }
-    if (auto v = redis_->get(CONTROL_KEY_HDR_GAIN_ADDER); v && !v->empty()) {
-        try { set_imx585_hdr_ctrl(IMX585_CID_HDR_GAIN_ADDER, std::clamp(std::stoi(*v), 0, 5), nullptr); } catch (...) {}
+        if (auto v = redis_->get(CONTROL_KEY_HDR_GAIN_ADDER); v && !v->empty()) {
+            try {
+                int val = std::clamp(std::stoi(*v), 0, 5);
+                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_GAIN_ADDER, val, nullptr))
+                    console->info("ClearHDR gain adder restored to menu index {}", val);
+            } catch (...) {}
+        }
     }
 
     // ── Frame-rate phase-lock config (write defaults if the keys are absent) ──
