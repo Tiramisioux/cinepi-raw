@@ -116,26 +116,25 @@ cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 -
 | `U`   | **U**npacked — one 16-bit sample per pixel | `SBGGR12` |
 | `P`   | **P**acked — CSI-2 packed (smaller, less DMA/CMA) | `SBGGR12_CSI2P` |
 
-Pick the token by camera receiver, **not** by sensor:
+Both tokens produce correct DNGs at 10- and 12-bit — the encoder handles unpacked, packed and PiSP-compressed streams. Pick the token for your Pi model:
 
-| Pi model | Receiver | Recommended packing | Why |
-|----------|----------|---------------------|-----|
-| Pi 5 / CM5 | PiSP (`rp1-cfe`) | `U` | Plenty of bandwidth/CMA; an unpacked stream is simplest. A `P` request is delivered as PiSP `COMP1` and decoded by the DNG encoder. |
-| Pi 4 / Pi 400 / CM4 | VC4/Unicam (`unicam`) | `P` | Packed CSI-2 uses ~1.33× less DMA/CMA at 12-bit (~1.6× at 10-bit), which the high-fps modes need on the smaller Pi 4 CMA pool. |
-
-The DNG encoder produces a correct DNG for **both** `U` and `P` at 10- and 12-bit, so the choice is about bandwidth/CMA, not correctness. (Earlier builds only handled the unpacked stream and emitted a garbled "wrong bit order" raw when fed a `P` stream on Pi 4 — that is fixed: the encoder now branches on the actual packed/unpacked format.)
-
-Manual examples (IMX477 on `cam0`):
+**Pi 5 / CM5 — use `U`, with the PiSP tuning file:**
 
 ```bash
-# Pi 4 / VC4 — packed; Pi 4 also skips --tuning-file
-cinepi-raw --mode 2028:1080:12:P --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --hdmi-port 1 --cam-port cam0
-
-# Pi 5 / PiSP — unpacked, with the PiSP tuning file
 cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0
 ```
 
-When launched by CineMate this is automatic: the packing token is data-driven from `resources/sensors.json` (`packing_by_platform`) and resolved against the detected Pi model, so you normally never set it by hand.
+The PiSP front end has bandwidth and CMA to spare, so the simple unpacked stream is the right default. (A `P` request also works on Pi 5: PiSP delivers it as `COMP1` and the DNG encoder decodes it.)
+
+**Pi 4 / Pi 400 / CM4 — use `P`, and leave `--tuning-file` out:**
+
+```bash
+cinepi-raw --mode 2028:1080:12:P --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --hdmi-port 1 --cam-port cam0
+```
+
+Packed CSI-2 fits ~1.33× more 12-bit frames into the Pi 4's smaller DMA/CMA pool (~1.6× at 10-bit), which the high-fps modes need. Pi 4 uses the VC4/Unicam receiver with its built-in tuning, so the `--tuning-file` flag stays out.
+
+When launched by CineMate all of this is automatic: the packing token comes from `resources/sensors.json` (`packing_by_platform`) resolved against the detected Pi model.
 
 # CineMate fork
 
@@ -150,6 +149,7 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--cam-port <string>`     | `""`    | Physical camera port to use (e.g. `cam0` or `cam1`). |
 | `--hdmi-port <int>`       | `-1`    | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
 | `--same-hdmi`             | `false` | Force both CinePi apps (capture & controller) to share the same HDMI output. |
+| `--hdr sensor`            | off     | Enable on-sensor HDR before start-up (imx708 stock HDR, imx585 ClearHDR). Changes the sensor's mode list and halves ClearHDR frame rates — see [IMX585 ClearHDR](#imx585-clearhdr-16-bit-hdr). |
 | `--keep16`                | `false` | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit SDR streams. True 16-bit sensor modes (e.g. imx585 ClearHDR, `--mode W:H:16:U`) always write 16-bit DNGs regardless of this flag. |
 | `--encode-workers <n>`    | `2`     | Number of DNG encode worker threads to spawn (min. `1`). |
 | `--disk-workers <n>`      | `8`     | Number of disk writer threads used for flushing DNGs (min. `1`). |
@@ -207,64 +207,6 @@ so libcamera's rpi.sync owns that sensor's VBLANK and holds the relative A→B
 genlock — the lock never shares a sensor's VBLANK with rpi.sync, which is the
 conflict the client gate prevents. If you would rather keep the master strictly
 constant-rate, disable the lock and discipline the sync server's rate instead.
-
-## IMX585 ClearHDR (16-bit HDR)
-
-ClearHDR is the imx585's on-sensor single-frame HDR: the sensor merges a
-high-gain and a low-gain readout internally and outputs one 16-bit linear
-Bayer frame. cinepi-raw records it as true 16-bit DNGs (BlackLevel 3200,
-WhiteLevel 65535, no compression, no linearization table needed).
-
-Requirements:
-
-| Piece | Needed | Why |
-|---|---|---|
-| Kernel | ≥ 6.12.93+rpt | older `rp1-cfe` kernel drivers corrupt 16-bit CSI-2 capture (fixed mid-2025: "Avoid unpack operation for 16-bit formats") |
-| Sensor driver | Tiramisioux `imx585-v4l2-driver`, branch `6.12.y` | exposes `wide_dynamic_range` and the 16-bit modes (3856×2180, 1928×1090) |
-| libcamera | Tiramisioux `libcamera`, branch `cinemate` | 16-bit endian swap, gated off compressed formats |
-| Exposure | manual only | ISP statistics are invalid at 16-bit — AGC/AWB cannot run |
-
-Start with the `--hdr sensor` flag and a 16-bit unpacked mode:
-
-```bash
-cinepi-raw --camera 0 --mode 3856:2180:16:U --width 1920 --height 1080 \
-  --lores-width 1280 --lores-height 720 --hdr sensor
-```
-
-The log should show `Selected sensor format: 3856x2180-SRGGB16_1X16` and
-`Selected CFE format: 3856x2180-RG16`. Behaviour changes while ClearHDR is on:
-
-- frame rate halves (≈ 21.9 fps max at 3856×2180)
-- analogue gain caps at code 80 (≈ 15.8×, ISO 1580 in CineMate terms)
-- each 3856×2180 DNG is ≈ 16.9 MB (plan storage bandwidth: 15 fps ≈ 252 MB/s)
-- set exposure and colour gains manually via Redis (`iso`, `shutter_s`/`shutter_a`, `cg_rb`)
-
-### Live ClearHDR knobs (Redis)
-
-The merge behaviour is tunable while streaming. Each key maps to a custom
-V4L2 control on the sensor; publish the key name on `cp_controls` after
-setting it:
-
-| Redis key | Sensor control | Range | What it does |
-|---|---|---|---|
-| `hdr_threshold` | HDR Data Selection Threshold | `"low,high"`, each 0–4095 | raw levels that steer the per-pixel hand-off from the high-gain to the low-gain readout in the merge |
-| `hdr_blend` | HDR Data Blending Mode | 0–8 | how the two readouts are mixed across the transition zone (0 = HG 1/2 + LG 1/2, per the driver menu) |
-| `hdr_gain_adder` | HDR Gain Adder | 0–5 | digital gain applied to the low-gain path in the merge (menu index; driver default 2 = +12 dB) — shifts where the blend knee lands in the output range |
-
-```bash
-redis-cli set hdr_blend 2 && redis-cli publish cp_controls hdr_blend
-redis-cli set hdr_threshold "500,3000" && redis-cli publish cp_controls hdr_threshold
-```
-
-Toggling ClearHDR itself (`wide_dynamic_range`) changes the sensor's mode
-list, so it stays a launch flag — restart cinepi-raw to switch between SDR
-and HDR. CineMate builds HDR profiles and CLI commands on top of these keys
-(see the CineMate docs, *ClearHDR* page).
-
-Known behaviour: highlights near the merge hand-off can render magenta in
-flat greys — that zone is where the readouts converge, and white balance
-pushes red/blue above green there. Tune `hdr_threshold`/`hdr_blend` for the
-scene, or grade it out; it is not a capture defect.
 
 ## Manual DNG encoder
 
@@ -377,3 +319,83 @@ SET zoom 1.5
 PUBLISH cp_controls zoom
 ```
 CinemaDNGs always contain the entire sensor.
+
+## IMX585 ClearHDR (16-bit HDR)
+
+ClearHDR is the imx585's on-sensor single-frame HDR: the sensor merges a
+high-gain and a low-gain readout internally and outputs one 16-bit linear
+Bayer frame. cinepi-raw records it as true 16-bit DNGs (BlackLevel 3200,
+WhiteLevel 65535, no compression, no linearization table needed).
+
+Requirements:
+
+| Piece | Needed | Why |
+|---|---|---|
+| Kernel | ≥ 6.12.93+rpt | older `rp1-cfe` kernel drivers corrupt 16-bit CSI-2 capture (fixed mid-2025: "Avoid unpack operation for 16-bit formats") |
+| Sensor driver | Tiramisioux `imx585-v4l2-driver`, branch `6.12.y` | exposes `wide_dynamic_range` and the 16-bit modes (3856×2180, 1928×1090) |
+| libcamera | Tiramisioux `libcamera`, branch `cinemate` | 16-bit endian swap, gated off compressed formats |
+| Exposure | manual only | ISP statistics are invalid at 16-bit — AGC/AWB cannot run |
+
+Start with the `--hdr sensor` flag and a 16-bit unpacked mode:
+
+```bash
+cinepi-raw --camera 0 --mode 3856:2180:16:U --width 1920 --height 1080 \
+  --lores-width 1280 --lores-height 720 --hdr sensor
+```
+
+The log should show `Selected sensor format: 3856x2180-SRGGB16_1X16` and
+`Selected CFE format: 3856x2180-RG16`. Behaviour changes while ClearHDR is on:
+
+- frame rate halves (≈ 21.9 fps max at 3856×2180 on a stock RP1 clock; ≈ 33.4 fps 4K / 37.5 fps 2K with the RP1 overclock — see the CineMate docs, *Overclocking* page)
+- analogue gain caps at code 80 (≈ 15.8×, ISO 1580 in CineMate terms)
+- each 3856×2180 DNG is ≈ 16.9 MB (plan storage bandwidth: 15 fps ≈ 252 MB/s)
+- set exposure and colour gains manually via Redis (`iso`, `shutter_s`/`shutter_a`, `cg_rb`)
+
+### Live ClearHDR knobs (Redis)
+
+The merge behaviour is tunable while streaming. Each key maps to a custom
+V4L2 control on the sensor; publish the key name on `cp_controls` after
+setting it:
+
+| Redis key | Sensor control | Range | What it does |
+|---|---|---|---|
+| `hdr_threshold` | HDR Data Selection Threshold | `"low,high"`, each 0–4095 | raw levels that steer the per-pixel hand-off from the high-gain to the low-gain readout in the merge |
+| `hdr_blend` | HDR Data Blending Mode | 0–8 | how the two readouts are mixed across the transition zone (0 = HG 1/2 + LG 1/2, per the driver menu) |
+| `hdr_gain_adder` | HDR Gain Adder | 0–5 | digital gain applied to the low-gain path in the merge (menu index; driver default 2 = +12 dB) — shifts where the blend knee lands in the output range |
+
+```bash
+redis-cli set hdr_blend 2 && redis-cli publish cp_controls hdr_blend
+redis-cli set hdr_threshold "500,3000" && redis-cli publish cp_controls hdr_threshold
+```
+
+Toggling ClearHDR itself (`wide_dynamic_range`) changes the sensor's mode
+list, so it stays a launch flag — restart cinepi-raw to switch between SDR
+and HDR. CineMate builds HDR profiles and CLI commands on top of these keys
+(see the CineMate docs, *ClearHDR* page).
+
+Known behaviour: highlights near the merge hand-off can render magenta in
+flat greys — that zone is where the readouts converge, and white balance
+pushes red/blue above green there. Tune `hdr_threshold`/`hdr_blend` for the
+scene, or grade it out; it is not a capture defect.
+
+### Setting the knobs with v4l2-ctl (no Redis)
+
+The knobs are ordinary V4L2 controls on the sensor subdevice, so any shell can
+set them while cinepi-raw runs. Find the subdevice once, then set controls by
+name:
+
+```bash
+# find the imx585 subdevice (usually /dev/v4l-subdev2)
+for s in /dev/v4l-subdev*; do
+  v4l2-ctl -d "$s" --list-ctrls 2>/dev/null | grep -q wide_dynamic_range && echo "$s"
+done
+
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_data_selection_threshold=500,3000
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_data_blending_mode=2
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_gain_adder_db=1
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl wide_dynamic_range=1   # ClearHDR on — restart cinepi-raw afterwards
+v4l2-ctl -d /dev/v4l-subdev2 --list-ctrls-menus                # inspect ranges and menu entries
+```
+
+`wide_dynamic_range` changes the sensor's mode list, so flip it before
+launching (or relaunch after). The three knob controls apply live.
