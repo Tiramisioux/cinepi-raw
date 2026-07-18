@@ -155,7 +155,6 @@ detectCamPort(RPiCamApp *app, unsigned int selected_index)
 CinePiOptions::CinePiOptions()
         : RawOptions()
         , same_hdmi(false)
-        , keep16(false)
         , hdmi_port(-1)
 {
         /* --------------------------------------------------------------
@@ -415,7 +414,22 @@ bool CinePiOptions::Parse(int argc, char *argv[])
 
                 /* same-hdmi / keep16 -------------------------------------- */
                 if (arg == "--same-hdmi") { same_hdmi = true; continue; }
-                if (arg == "--keep16")    { keep16    = true; continue; }
+                /* Qualified: RawOptions::keep16 is the member the DNG encoder
+                 * reads. A private CinePiOptions::keep16 used to shadow it here,
+                 * which made --keep16 a silent no-op. Accepts the bare flag and
+                 * the documented value forms: --keep16 true|false, --keep16=... */
+                if (arg == "--keep16" || arg.rfind("--keep16=", 0) == 0) {
+                        std::string v;
+                        if (arg.rfind("--keep16=", 0) == 0)
+                                v = arg.substr(sizeof("--keep16=") - 1);
+                        else if (i + 1 < argc) {
+                                std::string next = argv[i + 1];
+                                if (next == "true" || next == "false" || next == "1" || next == "0")
+                                        v = argv[++i];
+                        }
+                        RawOptions::keep16 = v.empty() || (v != "false" && v != "0");
+                        continue;
+                }
 
                 if (arg.rfind("--zoom=", 0) == 0) {
                         SetZoom(std::stof(arg.substr(sizeof("--zoom=") - 1)));

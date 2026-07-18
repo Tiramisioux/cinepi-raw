@@ -8,6 +8,8 @@
 #ifndef CINEPI_RECORDER_HPP
 #define CINEPI_RECORDER_HPP
 
+#include <optional>
+
 #include "core/rpicam_app.hpp"
 #include "core/stream_info.hpp"
 //#include "raw_options.hpp"
@@ -49,25 +51,36 @@ public:
 
 		if(!encoder_->initialized()){
 			libcamera::StreamConfiguration const &cfg = stream->configuration();
-			libcamera::StreamConfiguration const &lo_cfg = lostream->configuration();
-			encoder_->setup_encoder(cfg, lo_cfg, completed_request->metadata);
+			/* Lores is optional: a standalone launch without --lores-width/height
+			 * has no lores stream, and the DNG writer is raw-only (no embedded
+			 * thumbnail). Never dereference a null stream here — this used to
+			 * segfault at the first recorded frame. */
+			static const libcamera::StreamConfiguration empty_lo_cfg;
+			encoder_->setup_encoder(cfg, lostream ? lostream->configuration() : empty_lo_cfg,
+						completed_request->metadata);
 		}
 
 		StreamInfo info = GetStreamInfo(stream);
-		StreamInfo loinfo = GetStreamInfo(lostream);
+		StreamInfo loinfo = lostream ? GetStreamInfo(lostream) : StreamInfo();
 
 		FrameBuffer *buffer = completed_request->buffers[stream];
 		BufferWriteSync w(this, completed_request->buffers[stream]);
 		const std::vector<libcamera::Span<uint8_t>> mem = w.Get();
 
-		BufferReadSync r2(this, completed_request->buffers[lostream]);
-		const std::vector<libcamera::Span<uint8_t>> lomem = r2.Get();
-		
+		std::optional<BufferReadSync> r2;
+		size_t losize = 0;
+		void *lodata = nullptr;
+		if (lostream) {
+			r2.emplace(this, completed_request->buffers[lostream]);
+			const std::vector<libcamera::Span<uint8_t>> &lomem = r2->Get();
+			if (!lomem[0].data())
+				throw std::runtime_error("no buffer to encode, thumbnail");
+			losize = lomem[0].size();
+			lodata = (void *)lomem[0].data();
+		}
+
 		if (!mem[0].data())
 			throw std::runtime_error("no buffer to encode");
-
-		if (!lomem[0].data())
-			throw std::runtime_error("no buffer to encode, thumbnail");
 			
 		auto ts = completed_request->metadata.get(controls::SensorTimestamp);
 		int64_t timestamp_ns = ts ? *ts : buffer->metadata().timestamp;
@@ -88,7 +101,7 @@ public:
 			std::lock_guard<std::mutex> lock(encode_buffer_queue_mutex_);
 			encode_buffer_queue_.push(completed_request); // creates a new reference
 		}
-		encoder_->EncodeBuffer2(buffer->planes()[0].fd.get(), mem[0].size(), (void *)mem[0].data(), info, lomem[0].size(), (void *)lomem[0].data(), loinfo, timestamp_ns / 1000, completed_request->metadata);
+		encoder_->EncodeBuffer2(buffer->planes()[0].fd.get(), mem[0].size(), (void *)mem[0].data(), info, losize, lodata, loinfo, timestamp_ns / 1000, completed_request->metadata);
 	}
 	// RawOptions *GetOptions() const { return static_cast<RawOptions *>(options_.get()); }
 	

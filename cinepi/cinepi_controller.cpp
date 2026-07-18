@@ -2,9 +2,15 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/videodev2.h>
 
 using namespace std;
 using namespace std::chrono;
@@ -18,6 +24,63 @@ using namespace std::chrono;
 #define CP_DEF_COMPRESS 0
 #define CP_DEF_THUMBNAIL 1
 #define CP_DEF_THUMBNAIL_SIZE 3
+
+/* ── imx585 ClearHDR live knobs ─────────────────────────────────────────────
+ * The knobs are custom V4L2 controls on the sensor subdev; their IDs mirror
+ * imx585.c (Tiramisioux imx585-v4l2-driver, 6.12.y). They are plain sensor
+ * register controls, so they apply live while streaming. Only the ClearHDR
+ * enable itself (wide_dynamic_range, set via --hdr sensor at launch) changes
+ * the sensor's mode list and therefore needs a process restart.
+ */
+static constexpr uint32_t IMX585_CID_BASE           = V4L2_CID_USER_BASE + 0x2000;
+static constexpr uint32_t IMX585_CID_HDR_DATASEL_TH = IMX585_CID_BASE + 0; /* u16[2], 0..4095 */
+static constexpr uint32_t IMX585_CID_HDR_DATASEL_BK = IMX585_CID_BASE + 1; /* menu, 0..8 */
+static constexpr uint32_t IMX585_CID_HDR_GAIN_ADDER = IMX585_CID_BASE + 5; /* menu, 0..5 */
+
+/* Probe /dev/v4l-subdevN for the sensor that exposes the ClearHDR controls. */
+static int open_imx585_subdev()
+{
+    for (int i = 0; i < 16; i++) {
+        std::string dev = "/dev/v4l-subdev" + std::to_string(i);
+        int fd = open(dev.c_str(), O_RDWR, 0);
+        if (fd < 0)
+            continue;
+        struct v4l2_query_ext_ctrl q = {};
+        q.id = IMX585_CID_HDR_DATASEL_TH;
+        if (!ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &q))
+            return fd;
+        close(fd);
+    }
+    return -1;
+}
+
+/* Set one ClearHDR control: a u16 pair when `pair` is non-null, else `value`. */
+static bool set_imx585_hdr_ctrl(uint32_t id, int32_t value, const uint16_t *pair)
+{
+    int fd = open_imx585_subdev();
+    if (fd < 0)
+        return false;
+
+    uint16_t buf[2];
+    struct v4l2_ext_control c = {};
+    c.id = id;
+    if (pair) {
+        buf[0] = pair[0];
+        buf[1] = pair[1];
+        c.size = sizeof(buf);
+        c.p_u16 = buf;
+    } else {
+        c.value = value;
+    }
+
+    struct v4l2_ext_controls ctrls = {};
+    ctrls.which = V4L2_CTRL_WHICH_CUR_VAL;
+    ctrls.count = 1;
+    ctrls.controls = &c;
+    bool ok = !ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls);
+    close(fd);
+    return ok;
+}
 
 void CinePIController::sync(){
     // getAllKeysAndValuesFromRedis();
@@ -164,6 +227,42 @@ void CinePIController::sync(){
             options_->SetZoom(std::stof(*zoom_str));
     else
             redis_->set(CONTROL_KEY_ZOOM, std::to_string(options_->Zoom()));
+
+    // ── imx585 ClearHDR knobs: apply any persisted values at startup, so a
+    //    profile selected before this process launched (CineMate `set hdr
+    //    profile`) takes effect without an extra pub/sub round-trip.
+    //
+    //    Gate on ClearHDR being ON. These are HDR-only sensor controls, and the
+    //    gain adder writes EXP_GAIN (0x3081). The driver's common_regs reset
+    //    EXP_GAIN to 0 for every mode and only common_clearHDR_mode raises it to
+    //    +12 dB, so re-applying a persisted hdr_gain_adder here in an SDR launch
+    //    would override that reset and boost SDR by up to +29 dB (magenta shadow
+    //    noise). When HDR is off we leave the sensor's normal-mode defaults be.
+    if (options_->hdr == "sensor" || options_->hdr == "auto") {
+        if (auto v = redis_->get(CONTROL_KEY_HDR_THRESHOLD); v && !v->empty()) {
+            unsigned low = 0, high = 0;
+            if (sscanf(v->c_str(), "%u,%u", &low, &high) == 2) {
+                uint16_t pair[2] = { (uint16_t)std::min(low, 4095u),
+                                     (uint16_t)std::min(high, 4095u) };
+                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
+                    console->info("ClearHDR data-selection threshold restored to {},{}", pair[0], pair[1]);
+            }
+        }
+        if (auto v = redis_->get(CONTROL_KEY_HDR_BLEND); v && !v->empty()) {
+            try {
+                int val = std::clamp(std::stoi(*v), 0, 8);
+                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_BK, val, nullptr))
+                    console->info("ClearHDR blending mode restored to {}", val);
+            } catch (...) {}
+        }
+        if (auto v = redis_->get(CONTROL_KEY_HDR_GAIN_ADDER); v && !v->empty()) {
+            try {
+                int val = std::clamp(std::stoi(*v), 0, 5);
+                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_GAIN_ADDER, val, nullptr))
+                    console->info("ClearHDR gain adder restored to menu index {}", val);
+            } catch (...) {}
+        }
+    }
 
     // ── Frame-rate phase-lock config (write defaults if the keys are absent) ──
     if (auto v = redis_->get(CONTROL_KEY_PHASE_LOCK); v && !v->empty()) {
@@ -564,6 +663,43 @@ void CinePIController::mainThread(){
         }},
         { CONTROL_KEY_PLL_DEADBAND, [this](const std::optional<std::string>& r) {
             if(r && !r->empty()) { try { pllParams_.deadbandUs = std::stod(*r); } catch (...) {} }
+        }},
+        { CONTROL_KEY_HDR_THRESHOLD, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                unsigned low = 0, high = 0;
+                if (sscanf(r->c_str(), "%u,%u", &low, &high) == 2) {
+                    uint16_t pair[2] = { (uint16_t)std::min(low, 4095u),
+                                         (uint16_t)std::min(high, 4095u) };
+                    if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
+                        console->info("ClearHDR data-selection threshold set to {},{}", pair[0], pair[1]);
+                    else
+                        console->warn("ClearHDR threshold: no imx585 ClearHDR subdev control found");
+                } else {
+                    console->warn("ClearHDR threshold: expected \"low,high\" (0..4095), got '{}'", *r);
+                }
+            }
+        }},
+        { CONTROL_KEY_HDR_BLEND, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                try {
+                    int v = std::clamp(std::stoi(*r), 0, 8);
+                    if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_BK, v, nullptr))
+                        console->info("ClearHDR blending mode set to {}", v);
+                    else
+                        console->warn("ClearHDR blend: no imx585 ClearHDR subdev control found");
+                } catch (...) {}
+            }
+        }},
+        { CONTROL_KEY_HDR_GAIN_ADDER, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                try {
+                    int v = std::clamp(std::stoi(*r), 0, 5);
+                    if (set_imx585_hdr_ctrl(IMX585_CID_HDR_GAIN_ADDER, v, nullptr))
+                        console->info("ClearHDR gain adder set to menu index {}", v);
+                    else
+                        console->warn("ClearHDR gain adder: no imx585 ClearHDR subdev control found");
+                } catch (...) {}
+            }
         }},
         { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
             cameraInit_ = true;
