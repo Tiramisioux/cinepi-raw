@@ -45,7 +45,6 @@ public:
 private:
     /* CinePi-specific flags */
     std::string  camPort;                       // e.g. "cam0"
-    bool         same_hdmi    = false;
     int          hdmi_port    = -1;
 
     std::vector<std::array<float,4>> scaler_crops_rects;

@@ -154,7 +154,6 @@ detectCamPort(RPiCamApp *app, unsigned int selected_index)
 
 CinePiOptions::CinePiOptions()
         : RawOptions()
-        , same_hdmi(false)
         , hdmi_port(-1)
 {
         /* --------------------------------------------------------------

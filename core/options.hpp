@@ -297,6 +297,8 @@ struct Options
 	*   0 = HDMI‑0  (RPi “main”)
 	*   1 = HDMI‑1  (RPi “aux”)  */
 	int hdmi_port;
+	// Mirror the DRM preview on the second active HDMI connector (--same-hdmi).
+	bool same_hdmi = false;
 
 	virtual bool Parse(int argc, char *argv[]);
 	virtual void Print() const;

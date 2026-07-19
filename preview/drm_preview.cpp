@@ -79,6 +79,15 @@ private:
 
 	std::optional<uint32_t> forced_connector_;
 
+	/* Dual-output clone (--same-hdmi): mirror the preview on the second
+	 * active HDMI connector's already-configured CRTC. 0 = off/unavailable. */
+	void findCloneOutput();
+	uint32_t crtcId2_ = 0;
+	int crtcIdx2_ = -1;
+	uint32_t planeId2_ = 0;
+	unsigned int screen2_width_ = 0, screen2_height_ = 0;
+	bool clone_warned_ = false;
+
 	/* Re-create CRTC/plane mapping for the connector in `conId_`.
 	Returns true on success, false if the connector is unusable
 	(disconnected, no CRTC available, …).                        */
@@ -452,7 +461,94 @@ static void setup_colour_space(int fd, int plane_id, std::optional<libcamera::Co
 
 	drm_set_property(fd, plane_id, "COLOR_ENCODING", encoding);
 	drm_set_property(fd, plane_id, "COLOR_RANGE", range);
+
+	if (options_->same_hdmi)
+		findCloneOutput();
 }
+
+void DrmPreview::findCloneOutput()
+{
+	crtcId2_ = 0;
+	planeId2_ = 0;
+	crtcIdx2_ = -1;
+
+	drmModeRes *res = drmModeGetResources(drmfd_);
+	if (!res)
+		return;
+	for (int i = 0; i < res->count_connectors && !crtcId2_; i++)
+	{
+		drmModeConnector *con = drmModeGetConnector(drmfd_, res->connectors[i]);
+		if (!con)
+			continue;
+		if (con->connector_id != static_cast<uint32_t>(conId_) &&
+			con->connection == DRM_MODE_CONNECTED && con->encoder_id)
+		{
+			drmModeEncoder *enc = drmModeGetEncoder(drmfd_, con->encoder_id);
+			if (enc && enc->crtc_id && enc->crtc_id != crtcId_)
+			{
+				drmModeCrtc *crtc = drmModeGetCrtc(drmfd_, enc->crtc_id);
+				if (crtc && crtc->mode_valid && crtc->width && crtc->height)
+				{
+					crtcId2_ = enc->crtc_id;
+					screen2_width_ = crtc->width;
+					screen2_height_ = crtc->height;
+					for (int k = 0; k < res->count_crtcs; k++)
+						if (res->crtcs[k] == crtcId2_)
+							crtcIdx2_ = k;
+				}
+				if (crtc)
+					drmModeFreeCrtc(crtc);
+			}
+			if (enc)
+				drmModeFreeEncoder(enc);
+		}
+		drmModeFreeConnector(con);
+	}
+	drmModeFreeResources(res);
+
+	if (!crtcId2_ || crtcIdx2_ < 0)
+	{
+		LOG(1, "--same-hdmi: no second active HDMI connector; clone disabled");
+		crtcId2_ = 0;
+		return;
+	}
+
+	/* An overlay plane for the clone CRTC — same format, never the primary's plane. */
+	drmModePlaneResPtr planes = drmModeGetPlaneResources(drmfd_);
+	if (!planes)
+	{
+		crtcId2_ = 0;
+		return;
+	}
+	for (unsigned int i = 0; i < planes->count_planes && !planeId2_; ++i)
+	{
+		drmModePlanePtr plane = drmModeGetPlane(drmfd_, planes->planes[i]);
+		if (!plane)
+			continue;
+		if (planes->planes[i] != planeId_ && (plane->possible_crtcs & (1u << crtcIdx2_)))
+		{
+			for (unsigned int j = 0; j < plane->count_formats; ++j)
+			{
+				if (plane->formats[j] == out_fourcc_)
+				{
+					planeId2_ = planes->planes[i];
+					break;
+				}
+			}
+		}
+		drmModeFreePlane(plane);
+	}
+	drmModeFreePlaneResources(planes);
+
+	if (!planeId2_)
+	{
+		LOG(1, "--same-hdmi: no spare plane for the second output; clone disabled");
+		crtcId2_ = 0;
+	}
+	else
+		LOG(1, "--same-hdmi: cloning preview to CRTC " << crtcId2_ << " plane " << planeId2_);
+}
+
 
 void DrmPreview::makeBuffer(int fd, size_t size, StreamInfo const &info, Buffer &buffer)
 {
@@ -495,6 +591,24 @@ void DrmPreview::Show(int fd, libcamera::Span<uint8_t> span, StreamInfo const &i
 	if (drmModeSetPlane(drmfd_, planeId_, crtcId_, buffer.fb_handle, 0, x_off + x_, y_off + y_, w, h, 0, 0,
 						buffer.info.width << 16, buffer.info.height << 16))
 		throw std::runtime_error("drmModeSetPlane failed: " + std::string(ERRSTR));
+
+	/* Dual output: commit the same framebuffer (preview + GUI) to the second
+	 * HDMI connector's CRTC, letterboxed for that screen. Non-fatal. */
+	if (crtcId2_ && planeId2_)
+	{
+		unsigned int w2 = screen2_width_, h2 = screen2_height_, x2 = 0, y2 = 0;
+		if (info.width * screen2_height_ > screen2_width_ * info.height)
+			h2 = screen2_width_ * info.height / info.width, y2 = (screen2_height_ - h2) / 2;
+		else
+			w2 = screen2_height_ * info.width / info.height, x2 = (screen2_width_ - w2) / 2;
+		if (drmModeSetPlane(drmfd_, planeId2_, crtcId2_, buffer.fb_handle, 0, x2, y2, w2, h2, 0, 0,
+							buffer.info.width << 16, buffer.info.height << 16) && !clone_warned_)
+		{
+			LOG(1, "--same-hdmi: clone SetPlane failed; disabling clone");
+			clone_warned_ = true;
+			crtcId2_ = 0;
+		}
+	}
 	if (last_fd_ >= 0)
 		done_callback_(last_fd_);
 	last_fd_ = fd;
