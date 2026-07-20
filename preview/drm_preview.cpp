@@ -461,9 +461,6 @@ static void setup_colour_space(int fd, int plane_id, std::optional<libcamera::Co
 
 	drm_set_property(fd, plane_id, "COLOR_ENCODING", encoding);
 	drm_set_property(fd, plane_id, "COLOR_RANGE", range);
-
-	if (options_->same_hdmi)
-		findCloneOutput();
 }
 
 void DrmPreview::findCloneOutput()
@@ -557,6 +554,9 @@ void DrmPreview::makeBuffer(int fd, size_t size, StreamInfo const &info, Buffer 
 		first_time_ = false;
 
 		setup_colour_space(drmfd_, planeId_, info.colour_space);
+
+		if (options_->same_hdmi)
+			findCloneOutput();
 	}
 
 	buffer.fd = fd;
