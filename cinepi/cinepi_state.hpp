@@ -47,7 +47,8 @@
 
 // ── imx585 ClearHDR live knobs (custom V4L2 sensor controls; applied while
 //    streaming — only wide_dynamic_range itself needs a process restart) ──
-#define CONTROL_KEY_HDR_THRESHOLD "hdr_threshold"   // "low,high" 0..4095 — HG→LG data-selection thresholds
+#define CONTROL_KEY_HDR_THRESHOLD_LOW "hdr_threshold_low"   // 0..4095 — HG→LG data-selection threshold, low
+#define CONTROL_KEY_HDR_THRESHOLD_HIGH "hdr_threshold_high" // 0..4095 — HG→LG data-selection threshold, high
 #define CONTROL_KEY_HDR_BLEND "hdr_blend"           // 0..8 — HG/LG blending mode (driver menu index)
 #define CONTROL_KEY_HDR_GAIN_ADDER "hdr_gain_adder" // 0..5 — LG gain adder menu index (default 2 = +12 dB)
 

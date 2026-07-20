@@ -359,13 +359,19 @@ setting it:
 
 | Redis key | Sensor control | Range | What it does |
 |---|---|---|---|
-| `hdr_threshold` | HDR Data Selection Threshold | `"low,high"`, each 0–4095 | raw levels that steer the per-pixel hand-off from the high-gain to the low-gain readout in the merge |
+| `hdr_threshold_low` | HDR Data Selection Threshold, low side | 0–4095 | raw level below which the sensor reads pure high-gain |
+| `hdr_threshold_high` | HDR Data Selection Threshold, high side | 0–4095 | raw level above which the sensor reads pure low-gain |
 | `hdr_blend` | HDR Data Blending Mode | 0–8 | how the two readouts are mixed across the transition zone (0 = HG 1/2 + LG 1/2, per the driver menu) |
 | `hdr_gain_adder` | HDR Gain Adder | 0–5 | digital gain applied to the low-gain path in the merge (menu index; driver default 2 = +12 dB) — shifts where the blend knee lands in the output range |
 
+`hdr_threshold_low`/`hdr_threshold_high` are two Redis keys, but the sensor
+control (`IMX585_CID_HDR_DATASEL_TH`) is a single hardware `u16[2]` pair —
+cinepi-raw reads both keys and writes them together whichever one changes.
+
 ```bash
 redis-cli set hdr_blend 2 && redis-cli publish cp_controls hdr_blend
-redis-cli set hdr_threshold "500,3000" && redis-cli publish cp_controls hdr_threshold
+redis-cli set hdr_threshold_low 500 && redis-cli publish cp_controls hdr_threshold_low
+redis-cli set hdr_threshold_high 3000 && redis-cli publish cp_controls hdr_threshold_high
 ```
 
 Toggling ClearHDR itself (`wide_dynamic_range`) changes the sensor's mode
@@ -375,8 +381,8 @@ and HDR. CineMate builds HDR profiles and CLI commands on top of these keys
 
 Known behaviour: highlights near the merge hand-off can render magenta in
 flat greys — that zone is where the readouts converge, and white balance
-pushes red/blue above green there. Tune `hdr_threshold`/`hdr_blend` for the
-scene, or grade it out; it is not a capture defect.
+pushes red/blue above green there. Tune `hdr_threshold_low`/`hdr_threshold_high`/`hdr_blend`
+for the scene, or grade it out; it is not a capture defect.
 
 ### Setting the knobs with v4l2-ctl (no Redis)
 
