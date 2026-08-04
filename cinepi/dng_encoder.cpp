@@ -139,19 +139,8 @@ void pack_8bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
     }
 }
 
-void pack_10bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
-    // 5 bytes can hold 4 10-bit pixels
-    // Every iteration of the loop processes 4 pixels (40 bits)
-    for (size_t i = 0; i < num_pixels; i += 4) {
-        dst[0] = src[i] >> 2;                               // Highest 8 bits of pixel 1
-        dst[1] = (src[i] << 6) | (src[i + 1] >> 4);         // Lowest 2 bits of pixel 1 + highest 6 bits of pixel 2
-        dst[2] = (src[i + 1] << 4) | (src[i + 2] >> 6);     // Lowest 4 bits of pixel 2 + highest 4 bits of pixel 3
-        dst[3] = (src[i + 2] << 2) | (src[i + 3] >> 8);     // Lowest 6 bits of pixel 3 + highest 2 bits of pixel 4
-        dst[4] = src[i + 3];                                // Lowest 8 bits of pixel 4
-
-        dst += 5; // Move to the next 5 bytes
-    }
-}
+/* The live 10-bit packer moved to cinepi/dng_pack.hpp as pack_row_10bit() so it
+ * can be unit-tested (tests/dng_pack_test.cpp). */
 
 void pack_12bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
     // 3 bytes can hold 2 12-bit pixels
@@ -186,7 +175,7 @@ void pack_14bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
 #include <vector>   // one new header
 
 /* Pure DNG pixel pack/unpack helpers (pack_row_12bit, pack_row_16_to_12bit,
- * unpack_csi2_raw12/raw10, PiSP COMP1 decode) live in a standalone header so
+ * pack_row_10bit, unpack_csi2_raw12/raw10, PiSP COMP1 decode) live in a header so
  * they can be unit-tested without libcamera. See tests/dng_pack_test.cpp. */
 #include "cinepi/dng_pack.hpp"
 
@@ -708,7 +697,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     else if (dng_info.bits == 10)
     {
         const uint32_t rowPacked = (info.width * 10 + 7) / 8;   /* 1.25 B / px */
-        /* pack_10bit_data() writes 5 bytes per 4-pixel group; size the scratch
+        /* pack_row_10bit() writes 5 bytes per 4-pixel group; size the scratch
          * row to the rounded-up group count so a width that is not a multiple of
          * 4 cannot overflow it. For the standard 10-bit modes (mult-of-4 width)
          * this equals rowPacked exactly. */
@@ -734,7 +723,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                  * justified in the low 10 bits. */
                 src = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
             }
-            pack_10bit_data(src, rowBuf.data(), info.width);
+            pack_row_10bit(src, rowBuf.data(), info.width);
             write_pod(buf, rowBuf.data(), rowPacked);
         }
     }

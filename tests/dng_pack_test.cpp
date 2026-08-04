@@ -9,7 +9,8 @@
 // These helpers were extracted verbatim from dng_encoder.cpp. Every expected
 // vector below was derived BY HAND from the function bodies (not by running the
 // code) so the test is an independent check of the byte math, tier by tier:
-//   Tier 1 — contiguous 12-bit packers (pack_row_16_to_12bit, pack_row_12bit)
+//   Tier 1 — contiguous packers  (pack_row_16_to_12bit, pack_row_12bit,
+//                                 pack_row_10bit)
 //   Tier 2 — MIPI CSI-2 unpackers      (unpack_csi2_raw12, unpack_csi2_raw10)
 //   Tier 3 — PiSP COMP1 decode         (unpack_pisp_comp1_row_to_16 / _packed12)
 
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <vector>
 
 // ── tiny test harness (same shape as phase_lock_core_test.cpp) ───────────────
@@ -142,6 +144,143 @@ static void test_pack_row_12bit() {
     }
 }
 
+// The inverse of pack_row_10bit lives HERE rather than in dng_pack.hpp: every
+// function in that header has a production caller, and nothing in cinepi-raw
+// ever decodes a contiguous-10 DNG row. Keeping it test-local also makes the
+// round-trip an INDEPENDENT check — it walks the 40-bit MSB-first stream one bit
+// at a time, straight from the DNG layout, instead of re-using the packer's
+// shift algebra. (unpack_csi2_raw10 in the header is NOT this inverse: that
+// decodes the MIPI layout, which parks the low bits in a shared trailing byte.)
+static void unpack_row_10bit(const uint8_t *src, uint16_t *dst, uint32_t width) {
+    for (uint32_t x = 0; x < width; ++x) {
+        uint16_t v = 0;
+        for (size_t b = 0; b < 10; ++b) {
+            const size_t p = static_cast<size_t>(x) * 10 + b;   // MSB-first bit index
+            v = static_cast<uint16_t>((v << 1) | ((src[p >> 3] >> (7 - (p & 7))) & 1));
+        }
+        dst[x] = v;
+    }
+}
+
+// pack_10bit_data() exactly as it stood in dng_encoder.cpp before Pass 2 moved
+// it. Kept only to prove the moved packer is byte-identical on the multiple-of-4
+// widths every real 10-bit sensor mode uses (1332, 1456, 3936, 5568).
+static void pack_row_10bit_premove(const uint16_t *src, uint8_t *dst, size_t num_pixels) {
+    for (size_t i = 0; i < num_pixels; i += 4) {
+        dst[0] = src[i] >> 2;
+        dst[1] = (src[i] << 6) | (src[i + 1] >> 4);
+        dst[2] = (src[i + 1] << 4) | (src[i + 2] >> 6);
+        dst[3] = (src[i + 2] << 2) | (src[i + 3] >> 8);
+        dst[4] = src[i + 3];
+        dst += 5;
+    }
+}
+
+// pack_row_10bit: right-justified 10-bit in, contiguous MSB-first 4px/5B out.
+static void test_pack_row_10bit() {
+    std::printf("test_pack_row_10bit\n");
+    // Anchor, derived by hand from the 40-bit stream:
+    //   3FF 000 155 2AA = 1111111111 0000000000 0101010101 1010101010
+    //   regrouped by 8  = 11111111 11000000 00000101 01010110 10101010
+    {
+        const uint16_t src[4] = { 0x3FF, 0x000, 0x155, 0x2AA };
+        const uint8_t  exp[5] = { 0xFF, 0xC0, 0x05, 0x56, 0xAA };
+        uint8_t dst[5] = {0};
+        pack_row_10bit(src, dst, 4);
+        CHECK(bytes_equal("anchor 3FF,000,155,2AA", dst, exp, 5), "pack10 anchor group");
+    }
+    // all-max (40 set bits) and all-zero.
+    {
+        const uint16_t f[4]  = { 0x3FF, 0x3FF, 0x3FF, 0x3FF };
+        const uint8_t  ef[5] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        uint8_t df[5] = {0};
+        pack_row_10bit(f, df, 4);
+        CHECK(bytes_equal("max", df, ef, 5), "pack10 all-max -> 40 set bits");
+
+        const uint16_t z[4]  = { 0, 0, 0, 0 };
+        const uint8_t  ez[5] = { 0, 0, 0, 0, 0 };
+        uint8_t dz[5] = {0xEE,0xEE,0xEE,0xEE,0xEE};
+        pack_row_10bit(z, dz, 4);
+        CHECK(bytes_equal("zero", dz, ez, 5), "pack10 all-zero");
+    }
+    // width=8 -> two independent 5-byte groups. Second group by hand:
+    //   001 002 3FE 200 = 0000000001 0000000010 1111111110 1000000000
+    //                   = 00000000 01000000 00101111 11111010 00000000
+    {
+        const uint16_t src[8]  = { 0x3FF, 0x000, 0x155, 0x2AA,
+                                   0x001, 0x002, 0x3FE, 0x200 };
+        const uint8_t  exp[10] = { 0xFF, 0xC0, 0x05, 0x56, 0xAA,
+                                   0x00, 0x40, 0x2F, 0xFA, 0x00 };
+        uint8_t dst[10] = {0};
+        pack_row_10bit(src, dst, 8);
+        CHECK(bytes_equal("width8", dst, exp, 10), "pack10 width=8 two groups");
+    }
+    // Round-trip every 10-bit code: unpack(pack(x)) == x.
+    {
+        std::vector<uint16_t> vals(1024), back(1024);
+        for (uint32_t i = 0; i < 1024; ++i) vals[i] = static_cast<uint16_t>(i);
+        std::vector<uint8_t> packed(1024 * 10 / 8);
+        pack_row_10bit(vals.data(), packed.data(), 1024);
+        unpack_row_10bit(packed.data(), back.data(), 1024);
+        CHECK(words_equal("roundtrip", back.data(), vals.data(), 1024),
+              "pack10 round-trip over all 1024 codes");
+    }
+    // THE PASS-2 GATE, at unit level: byte-identical to the pre-move packer on a
+    // real multiple-of-4 mode width.
+    {
+        const uint32_t W = 1332;                       // imx477 10-bit mode width
+        std::vector<uint16_t> src(W);
+        for (uint32_t i = 0; i < W; ++i)
+            src[i] = static_cast<uint16_t>((i * 7919u + 12345u) & 0x3FF);
+        std::vector<uint8_t> got(W * 10 / 8, 0), exp(W * 10 / 8, 0);
+        pack_row_10bit(src.data(), got.data(), W);
+        pack_row_10bit_premove(src.data(), exp.data(), W);
+        CHECK(bytes_equal("vs pre-move", got.data(), exp.data(), got.size()),
+              "pack10 byte-identical to the pre-move packer at width=1332");
+    }
+    // Tail: a width that is not a multiple of 4 packs a ZERO-PADDED final group
+    // and emits only the (n*10+7)/8 bytes those n pixels occupy. By hand:
+    //   n=1 {3FF}         -> 1111111111 + pad          -> FF C0        (2 B)
+    //   n=2 {3FF,155}     -> ... 0101010101 + pad      -> FF D5 50     (3 B)
+    //   n=3 {3FF,155,2AA} -> ... 1010101010 + pad      -> FF D5 5A A8  (4 B)
+    {
+        const uint16_t src[3]  = { 0x3FF, 0x155, 0x2AA };
+        const uint8_t  exp1[2] = { 0xFF, 0xC0 };
+        const uint8_t  exp2[3] = { 0xFF, 0xD5, 0x50 };
+        const uint8_t  exp3[4] = { 0xFF, 0xD5, 0x5A, 0xA8 };
+        uint8_t d[5];
+
+        std::memset(d, 0xEE, sizeof d);
+        pack_row_10bit(src, d, 1);
+        CHECK(bytes_equal("tail1", d, exp1, 2), "pack10 width=1 tail");
+        CHECK(d[2] == 0xEE && d[3] == 0xEE && d[4] == 0xEE,
+              "pack10 width=1 writes exactly 2 bytes");
+
+        std::memset(d, 0xEE, sizeof d);
+        pack_row_10bit(src, d, 2);
+        CHECK(bytes_equal("tail2", d, exp2, 3), "pack10 width=2 tail");
+        CHECK(d[3] == 0xEE && d[4] == 0xEE, "pack10 width=2 writes exactly 3 bytes");
+
+        std::memset(d, 0xEE, sizeof d);
+        pack_row_10bit(src, d, 3);
+        CHECK(bytes_equal("tail3", d, exp3, 4), "pack10 width=3 tail");
+        CHECK(d[4] == 0xEE, "pack10 width=3 writes exactly 4 bytes");
+    }
+    // The tail must not fold in the word PAST the row. Same 3-pixel row, but now
+    // followed by all-ones: the pre-move packer read src[3] and produced 0xAB in
+    // the last byte; the zero-padded tail gives 0xA8. (The probe reads only
+    // in-bounds memory, so the test itself is well-defined.)
+    {
+        const uint16_t buf[8] = { 0x3FF, 0x155, 0x2AA, 0x3FF,
+                                  0x3FF, 0x3FF, 0x3FF, 0x3FF };
+        const uint8_t  exp[4] = { 0xFF, 0xD5, 0x5A, 0xA8 };
+        uint8_t d[4] = {0};
+        pack_row_10bit(buf, d, 3);
+        CHECK(bytes_equal("no over-read", d, exp, 4),
+              "pack10 width=3 ignores the word past the row (over-read fixed)");
+    }
+}
+
 // ── TIER 2: MIPI CSI-2 unpackers ─────────────────────────────────────────────
 
 // Build the CSI2 RAW12 byte triple for two right-justified 12-bit values, per
@@ -233,6 +372,33 @@ static void test_unpack_csi2_raw10() {
         unpack_csi2_raw10(bytes, dst, 8);
         CHECK(words_equal("roundtrip", dst, vals, 8), "raw10 round-trip width=8");
     }
+}
+
+// Cross-tier: the whole Pi 4 / VC4 10-bit path in miniature — sensor delivers
+// MIPI CSI-2 RAW10, the encoder unpacks it to right-justified 16-bit and repacks
+// it into the contiguous DNG layout. Both layouts must carry the same codes.
+static void test_csi2_raw10_to_contiguous() {
+    std::printf("test_csi2_raw10_to_contiguous\n");
+    const uint16_t vals[8] = { 0x3FF, 0x000, 0x155, 0x2AA, 0x001, 0x002, 0x3FE, 0x200 };
+    uint8_t csi[10];
+    csi10_pack(vals[0], vals[1], vals[2], vals[3], csi + 0);
+    csi10_pack(vals[4], vals[5], vals[6], vals[7], csi + 5);
+
+    uint16_t mid[8] = {0};
+    unpack_csi2_raw10(csi, mid, 8);
+    uint8_t contig[10] = {0};
+    pack_row_10bit(mid, contig, 8);
+    uint16_t back[8] = {0};
+    unpack_row_10bit(contig, back, 8);
+    CHECK(words_equal("csi2->contig", back, vals, 8),
+          "CSI-2 RAW10 -> contiguous DNG preserves all eight codes");
+
+    // The two layouts are genuinely different byte orders — if they were the
+    // same, the round-trip above would prove nothing.
+    bool differs = false;
+    for (size_t i = 0; i < sizeof csi; ++i)
+        if (csi[i] != contig[i]) { differs = true; break; }
+    CHECK(differs, "CSI-2 RAW10 and contiguous-10 are distinct byte layouts");
 }
 
 // ── TIER 3: PiSP COMP1 decode ────────────────────────────────────────────────
@@ -329,9 +495,11 @@ int main() {
     // Tier 1
     test_pack_row_16_to_12bit();
     test_pack_row_12bit();
+    test_pack_row_10bit();
     // Tier 2
     test_unpack_csi2_raw12();
     test_unpack_csi2_raw10();
+    test_csi2_raw10_to_contiguous();
     // Tier 3
     test_unpack_pisp_comp1_row_to_16();
     test_unpack_pisp_comp1_row_to_packed12();

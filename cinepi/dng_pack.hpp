@@ -53,6 +53,45 @@ static inline void pack_row_16_to_12bit(const uint16_t *src,
     }
 }
 
+/* Pack one 4-pixel group of right-justified 10-bit samples into 5 contiguous
+ * bytes, MSB-first (the layout DNG expects for BitsPerSample=10). */
+static inline void pack_group_10bit(const uint16_t *src, uint8_t *dst)
+{
+    dst[0] =  src[0] >> 2;                     /* upper 8 bits of pixel 0      */
+    dst[1] = (src[0] << 6) | (src[1] >> 4);    /* lower 2 + upper 6            */
+    dst[2] = (src[1] << 4) | (src[2] >> 6);    /* lower 4 + upper 4            */
+    dst[3] = (src[2] << 2) | (src[3] >> 8);    /* lower 6 + upper 2            */
+    dst[4] =  src[3];                          /* lower 8 bits of pixel 3      */
+}
+
+/* Pack a row of right-justified 10-bit samples to contiguous 10-bit (4 px in
+ * 5 bytes). Moved here from dng_encoder.cpp's pack_10bit_data(); the math per
+ * 4-pixel group is unchanged.
+ *
+ * A width that is not a multiple of 4 packs a ZERO-PADDED final group and emits
+ * only the (n*10+7)/8 bytes those n pixels occupy — the original read up to 3
+ * uint16 past the end of the source row instead. Every 10-bit sensor mode has a
+ * multiple-of-4 width (1332, 1456, 3936, 5568), so recorded DNG output is
+ * byte-identical; the tail only removes the over-read. */
+static inline void pack_row_10bit(const uint16_t *src,
+                                  uint8_t       *dst,
+                                  uint32_t       width)
+{
+    uint32_t x = 0;
+    for (; x + 4u <= width; x += 4u, dst += 5)
+        pack_group_10bit(src + x, dst);
+
+    const uint32_t remaining = width - x;
+    if (remaining > 0)
+    {
+        uint16_t working[4] {};
+        uint8_t  packed[5] {};
+        std::copy(src + x, src + width, working);
+        pack_group_10bit(working, packed);
+        std::memcpy(dst, packed, (static_cast<size_t>(remaining) * 10u + 7u) / 8u);
+    }
+}
+
 /* Unpack MIPI CSI-2 RAW12 (2 px in 3 bytes) to right-justified 16-bit (0..4095).
  * VC4/Unicam delivers SBGGR12_CSI2P in this layout — verified against real Pi 4
  * IMX477 captures (decoding as contiguous-12 instead gives a checkerboard/
@@ -72,7 +111,8 @@ static inline void unpack_csi2_raw12(const uint8_t *src, uint16_t *dst, uint32_t
 
 /* Unpack MIPI CSI-2 RAW10 (4 px in 5 bytes) to right-justified 16-bit (0..1023).
  * Byte 4 holds the four pixels' low 2 bits, first pixel in the lowest pair. Same
- * MIPI convention as RAW12 above; feeds pack_10bit_data(). */
+ * MIPI convention as RAW12 above; feeds pack_row_10bit(). Note that this is NOT
+ * the inverse of pack_row_10bit — that packs the CONTIGUOUS DNG layout. */
 static inline void unpack_csi2_raw10(const uint8_t *src, uint16_t *dst, uint32_t width)
 {
     for (uint32_t x = 0; x + 3 < width; x += 4)
