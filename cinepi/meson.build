@@ -32,6 +32,7 @@ sources = [
   'cinepi_state.cpp',
   'utils.cpp',
   'cinepi_options.cpp',
+  'log_lut.cpp',
 ]
 
 
@@ -73,3 +74,12 @@ dng_pack_test = executable('dng_pack_test',
            include_directories : [include_directories('..')],
            install : false)
 test('dng_pack', dng_pack_test)
+
+# Unit tests for the CineMate Log curve engine. No libcamera / jsoncpp deps — it
+# includes only cinepi/log_lut.hpp (the spec loader in log_lut.cpp is what needs
+# jsoncpp, and it is not part of the tested core). Run with `meson test`.
+log_lut_test = executable('log_lut_test',
+           '../tests/log_lut_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('log_lut', log_lut_test)
