@@ -190,6 +190,12 @@ private:
      * without a lock. params().target_bits is the authoritative code depth. */
     const LogLut *log_lut_ = nullptr;
 
+    /* How far the DMA row has to be shifted down to reach the curve's source
+     * domain: 4 for a <=12-bit sensor mode on PiSP, which arrives MSB-aligned in
+     * a 16-bit container, and 0 when the row is already right-justified. Set
+     * beside log_lut_ and only meaningful while it is non-null. */
+    unsigned log_src_shift_ = 0;
+
     /* ──  Reusable encoded-buffer pool  ───────────────────── */
     std::vector<uint8_t *> buffer_pool_;
     std::mutex              buffer_pool_mutex_;

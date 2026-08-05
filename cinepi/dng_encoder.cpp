@@ -521,37 +521,115 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      *           dng_save() into the identity, which is the required bypass:
      *           SensorBlackLevels is already in that same 16-bit linear domain.
      *
-     * Scope: 16 significant source bits -> 12-bit codes. `--log-encode 10` is
-     * the next pass and 12-bit sources the one after; both fall through to the
-     * normal linear path here rather than emitting an untested file. */
-    log_lut_ = nullptr;
+     * Scope: 16-bit ClearHDR and 12-bit SDR sensor modes, to 12- or 10-bit
+     * codes. Anything else falls through to the normal linear path rather than
+     * emitting an untested file. */
+    log_lut_       = nullptr;
+    log_src_shift_ = 0;
     if (options_ && options_->log_encode)
     {
         std::string err;
-        const LogLut *lut = nullptr;
+        const LogLut *lut  = nullptr;
+        const int target   = options_->log_encode;
+        const int src_bits = static_cast<int>(sensor_mode_bit_depth_);
+        unsigned shift     = 0;
 
-        if (bf.bits != 16 || sensor_mode_bit_depth_ != 16)
-            err = "needs a 16-bit sensor mode (this one is " +
-                  std::to_string(sensor_mode_bit_depth_) + "-bit)";
-        else if (options_->log_encode != 12)
-            err = "only --log-encode 12 is implemented so far";
-        else
-            lut = get_log_lut(bf.bits, options_->log_encode, err);
-
-        /* The loaded spec, not the flag, decides the real code depth — nothing
-         * cross-checks the two — and the row path below hard-codes the 12-bit
-         * packer. So refuse a spec that says otherwise instead of packing 12
-         * bits and labelling the file with a different number. */
-        if (lut && lut->params().target_bits != 12)
+        /* Which curve is keyed on the SENSOR mode depth, not bf.bits. On PiSP
+         * every raw stream arrives in a 16-bit container, so a 12-bit mode is
+         * SRGGB16 carrying its 12 significant bits MSB-aligned — measured on
+         * device: stride is 2 B/px and the recorded BlackLevel 200 lands at code
+         * 200, not at 12. bf describes the row LAYOUT, sensor_mode_bit_depth_
+         * the DOMAIN the curve was fitted to, and those two disagree exactly
+         * there. Getting it wrong is silent: a 16-bit sample indexed into a
+         * 4096-entry forward table clamps, pinning the frame at white. */
+        if (src_bits != 16 && src_bits != 12)
+            err = "needs a 16- or 12-bit sensor mode (this one is " +
+                  std::to_string(src_bits) + "-bit)";
+        /* Which row shapes: only the ones the loop in dng_save() can normalise
+         * to right-justified src_bits, and nothing else. */
+        else if (bf.compressed && src_bits != 16)
+            err = "COMP1 rows decode to a 16-bit domain, not " + std::to_string(src_bits);
+        else if (bf.packed && (bf.bits != 12 || src_bits != 12))
+            err = "no CSI2 unpacker for packed " + std::to_string(bf.bits) +
+                  "-bit rows in a " + std::to_string(src_bits) + "-bit domain";
+        else if (!bf.compressed && !bf.packed && bf.bits != src_bits)
         {
-            err = "spec targets " + std::to_string(lut->params().target_bits) + " bit, expected 12";
-            lut = nullptr;
+            /* The one legal mismatch is the PiSP SDR container above. */
+            if (bf.bits == 16 && src_bits == 12)
+                shift = 4;
+            else
+                err = std::to_string(bf.bits) + "-bit rows cannot carry a " +
+                      std::to_string(src_bits) + "-bit domain";
+        }
+
+        if (err.empty())
+            lut = get_log_lut(src_bits, target, err);
+
+        /* The loaded spec, not the flag, decides the real depths. load_log_lut()
+         * picks the file by NAME and verifies its table round-trips, but never
+         * cross-checks the depths the file declares against the pair it was
+         * asked for — and the row path below only has packers for 12 and 10. So
+         * refuse a spec that disagrees, instead of encoding against one domain
+         * and labelling the file with another. */
+        if (lut)
+        {
+            const LogLutParams &lp = lut->params();
+            if (lp.target_bits != target)
+                err = "spec targets " + std::to_string(lp.target_bits) +
+                      " bit, expected " + std::to_string(target);
+            else if (lp.source_bits != src_bits)
+                err = "spec sources " + std::to_string(lp.source_bits) +
+                      " bit, expected " + std::to_string(src_bits);
+            else if (lp.target_bits != 12 && lp.target_bits != 10)
+                err = "no packer for " + std::to_string(lp.target_bits) + "-bit codes";
+
+            if (!err.empty())
+                lut = nullptr;
+        }
+
+        /* A spec is keyed on the DEPTH PAIR alone — log_lut_spec_filename() builds
+         * the name from <src>to<tgt> and nothing else — but its black level is
+         * per-sensor. cinemate_log_12to10 assumes 200 (imx585/imx283 3200 in the
+         * 16-bit domain); every sensor has a 12-bit mode and imx477's black is
+         * 256, imx296's 240. Handing it that spec would build the toe around 200
+         * while SensorBlackLevels writes 256 into the file's own BlackLevel tag —
+         * curve and tag disagreeing by 56 LSB, exactly where the footroom codes
+         * live. Refuse instead, like every other scope guard here.
+         *
+         * Tolerance is one footroom code (foot/F): below that the toe is
+         * misplaced by less than the quantisation it controls, which is also
+         * enough slack for per-channel jitter in the reported levels. Making spec
+         * selection genuinely sensor-aware is a separate pass — it breaks the
+         * "rebuilt table must equal the spec's shipped table" invariant. */
+        if (lut)
+        {
+            const LogLutParams &lp = lut->params();
+            auto bl = metadata.get(controls::SensorBlackLevels);
+            if (bl && bl->size() >= 4)
+            {
+                int worst_seen = lp.black_level;
+                float worst_off = 0.f;
+                for (size_t i = 0; i < 4; ++i)
+                {
+                    const int scaled = log_lut_scale_black(lp, (*bl)[i]);
+                    const float off  = std::fabs(static_cast<float>(scaled - lp.black_level));
+                    if (off > worst_off) { worst_off = off; worst_seen = scaled; }
+                }
+                if (worst_off > log_lut_black_tolerance(lp))
+                {
+                    err = "spec assumes black " + std::to_string(lp.black_level) +
+                          " but this sensor reports " + std::to_string(worst_seen) +
+                          " at " + std::to_string(lp.source_bits) + " bit";
+                    lut = nullptr;
+                }
+            }
         }
 
         if (lut)
         {
-            log_lut_ = lut;
-            write12bit_ = false;          /* the log path owns the row conversion */
+            log_lut_       = lut;
+            log_src_shift_ = shift;
+            write12bit_    = false;       /* the log path owns the row conversion */
             dng_info.bits  = lut->params().target_bits;
             dng_info.white = lut->params().white_level;
         }
@@ -695,34 +773,54 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
     if (log_lut_)
     {
-        /* CineMate Log: 16-bit linear -> log codes, packed at the target depth.
-         * The forward LUT already emits right-justified target-depth codes, so
-         * the ordinary packer consumes its output with no extra conversion.
+        /* CineMate Log: linear sensor codes -> log codes, packed at the target
+         * depth. The forward LUT already emits right-justified target-depth
+         * codes, so the ordinary packer consumes its output with no extra
+         * conversion.
          *
-         * Both 16-bit sources funnel through one uint16 row: COMP1 has to be
-         * decompressed first, unpacked raw can be read in place. Encoding
-         * row16Buf into itself is deliberate — the map is per-sample and the
-         * write to x follows the read of x — and it keeps the compressed case
-         * to a single scratch row. */
-        const uint32_t rowPacked = (info.width * 12 + 7) / 8;
+         * Every source shape funnels through one uint16 row, right-justified in
+         * the curve's own source domain: COMP1 is decompressed, CSI2-packed
+         * RAW12 is unpacked, the PiSP SDR container is shifted down off its MSB
+         * alignment, and an already-right-justified row is read in place.
+         * setup_encoder() refused anything this chain cannot normalise, so the
+         * cases below are exhaustive. Encoding row16Buf into itself is
+         * deliberate — the map is per-sample and the write to x follows the read
+         * of x — and it keeps every converting case to a single scratch row. */
+        const int target         = log_lut_->params().target_bits;
+        const uint32_t rowPacked = (info.width * target + 7) / 8;
         rowBuf.resize(rowPacked);
         row16Buf.resize(info.width);
 
         for (uint32_t y = 0; y < info.height; ++y)
         {
+            const uint8_t  *srow = raw + y * info.stride;
             const uint16_t *lin;
             if (bayer_format.compressed)
             {
-                unpack_pisp_comp1_row_to_16(raw + y * info.stride, row16Buf.data(), info.width);
+                unpack_pisp_comp1_row_to_16(srow, row16Buf.data(), info.width);
+                lin = row16Buf.data();
+            }
+            else if (bayer_format.packed)
+            {
+                unpack_csi2_raw12(srow, row16Buf.data(), info.width);
+                lin = row16Buf.data();
+            }
+            else if (log_src_shift_)
+            {
+                right_justify_row(reinterpret_cast<const uint16_t *>(srow),
+                                  row16Buf.data(), info.width, log_src_shift_);
                 lin = row16Buf.data();
             }
             else
             {
-                lin = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
+                lin = reinterpret_cast<const uint16_t *>(srow);
             }
 
             log_lut_->encode_row(lin, row16Buf.data(), info.width);
-            pack_row_12bit(row16Buf.data(), rowBuf.data(), info.width);
+            if (target == 12)
+                pack_row_12bit(row16Buf.data(), rowBuf.data(), info.width);
+            else
+                pack_row_10bit(row16Buf.data(), rowBuf.data(), info.width);
             write_pod(buf, rowBuf.data(), rowPacked);
         }
     }

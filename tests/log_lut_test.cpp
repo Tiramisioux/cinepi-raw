@@ -255,6 +255,23 @@ static void unpack_row_12bit(const uint8_t *src, uint16_t *dst, uint32_t width)
     }
 }
 
+// Same claim at the 10-bit target Pass 5 adds. Walks the MSB-first bitstream one
+// bit at a time straight from the DNG contiguous-10 layout, so it shares no
+// algebra with pack_row_10bit and the round-trip stays an independent check.
+// (dng_pack_test.cpp has its own copy for the same reason; dng_pack.hpp
+// deliberately does not export one — nothing in cinepi-raw decodes such a row.)
+static void unpack_row_10bit(const uint8_t *src, uint16_t *dst, uint32_t width)
+{
+    for (uint32_t x = 0; x < width; ++x) {
+        uint16_t v = 0;
+        for (size_t b = 0; b < 10; ++b) {
+            const size_t p = static_cast<size_t>(x) * 10 + b;   // MSB-first bit index
+            v = static_cast<uint16_t>((v << 1) | ((src[p >> 3] >> (7 - (p & 7))) & 1));
+        }
+        dst[x] = v;
+    }
+}
+
 static void test_encode_row(const Case &c)
 {
     std::printf("test_encode_row %s\n", c.name);
@@ -290,13 +307,114 @@ static void test_encode_row(const Case &c)
     lut.encode_row(inplace.data(), inplace.data(), kWidth);
     CHECK(inplace == dst, "encode_row is safe when dst aliases src");
 
-    // The composition, for the 12-bit target the DNG writer actually uses.
-    if (p.target_bits == 12) {
-        std::vector<uint8_t>  packed((kWidth * 12 + 7) / 8);
+    // The composition, at whichever target depth the DNG writer dispatches to.
+    {
+        std::vector<uint8_t>  packed((kWidth * p.target_bits + 7) / 8);
         std::vector<uint16_t> back(kWidth);
-        pack_row_12bit(dst.data(), packed.data(), kWidth);
-        unpack_row_12bit(packed.data(), back.data(), kWidth);
-        CHECK(back == dst, "pack_row_12bit round-trips the log codes unshifted");
+        if (p.target_bits == 12) {
+            pack_row_12bit(dst.data(), packed.data(), kWidth);
+            unpack_row_12bit(packed.data(), back.data(), kWidth);
+            CHECK(back == dst, "pack_row_12bit round-trips the log codes unshifted");
+        } else {
+            pack_row_10bit(dst.data(), packed.data(), kWidth);
+            unpack_row_10bit(packed.data(), back.data(), kWidth);
+            CHECK(back == dst, "pack_row_10bit round-trips the log codes unshifted");
+        }
+    }
+
+    // ── the PiSP source container, for the 12-bit sensor modes Pass 5 admits ──
+    //
+    // A 12-bit mode does not arrive as SBGGR12. On PiSP it is SRGGB16 holding
+    // value << 4, so the row path shifts it back down before indexing a
+    // 4096-entry forward table. The 16-bit curves need no shift — there the
+    // container IS the source domain.
+    if (p.source_bits == 12) {
+        std::vector<uint16_t> msb(kWidth), just(kWidth), viaShift(kWidth), direct(kWidth);
+        for (uint32_t x = 0; x < kWidth; ++x)
+            msb[x] = static_cast<uint16_t>(src[x] << 4);      // what the DMA buffer holds
+
+        right_justify_row(msb.data(), just.data(), kWidth, 4);
+        CHECK(just == src, "right_justify_row(v << 4, 4) recovers the sensor code");
+
+        lut.encode_row(just.data(), viaShift.data(), kWidth);
+        lut.encode_row(src.data(), direct.data(), kWidth);
+        CHECK(viaShift == direct, "the shifted container encodes like the raw sensor code");
+
+        // And the shift is load-bearing. Feeding the container straight in makes
+        // encode() clamp every over-range sample to the last forward entry — the
+        // silent all-white frame the guard in setup_encoder() exists to prevent.
+        // Both the count and the code are derived from the function bodies
+        // (encode() clamps to forward_.size()-1; forward[WL] is CMAX), not typed in.
+        std::vector<uint16_t> unshifted(kWidth);
+        lut.encode_row(msb.data(), unshifted.data(), kWidth);
+        const uint16_t top_index = static_cast<uint16_t>((1u << p.source_bits) - 1u);
+        size_t expect = 0, got = 0;
+        for (uint32_t x = 0; x < kWidth; ++x) {
+            if (msb[x] >= top_index) ++expect;
+            if (unshifted[x] == lut.encode(top_index)) ++got;
+        }
+        CHECK(expect > 0 && got == expect,
+              "skipping the shift clamps every over-range sample to CMAX");
+        CHECK(unshifted != direct, "so the unshifted row is NOT the correct encoding");
+    }
+}
+
+// ── TIER 3b: does this curve belong to this sensor? ──────────────────────────
+//
+// Specs are found by depth pair only, so cinemate_log_12to10 (black 200) is what
+// ANY 12-bit mode gets — including sensors whose black is not 3200 in the 16-bit
+// domain. The reported levels below are the rpi.black_level values shipped in
+// libcamera/src/ipa/rpi/pisp/data/*.json, not invented.
+static void test_black_level_guard()
+{
+    std::printf("test_black_level_guard\n");
+
+    struct Sensor { const char *name; float bl16; };
+    static const Sensor kSensors[] = {
+        { "imx585/imx283",           3200.f },   // what the 12to10 spec assumes
+        { "imx290/296/415/462",      3840.f },
+        { "imx219/477/519/708/...",  4096.f },
+    };
+
+    const LogLutParams &p12 = kCases[2].p;      // 12to10, black 200
+    CHECK(p12.source_bits == 12 && p12.black_level == 200, "using the 12to10 spec");
+
+    for (const Sensor &s : kSensors) {
+        // Independent derivation of the scaling: integer rational arithmetic
+        // instead of the float expression the function uses.
+        const int src_white = (1 << p12.source_bits) - 1;
+        const int expect = static_cast<int>(
+            (static_cast<long long>(s.bl16) * src_white * 2 + 65535) / (2LL * 65535));
+        const int got = log_lut_scale_black(p12, s.bl16);
+        CHECK(got == expect, "scaled black matches an independent rational derivation");
+
+        const float off = std::fabs(static_cast<float>(got - p12.black_level));
+        const bool accepted = off <= log_lut_black_tolerance(p12);
+        // Only the sensor the spec was fitted to may be accepted.
+        const bool is_own_sensor = (s.bl16 == 3200.f);
+        CHECK(accepted == is_own_sensor,
+              is_own_sensor ? "the spec's own sensor is accepted"
+                            : "a sensor with a different black level is refused");
+    }
+
+    // The tolerance is one footroom code, derived from the params.
+    CHECK(log_lut_black_tolerance(p12) == static_cast<float>(p12.footroom_lsb) / p12.footroom_codes,
+          "tolerance is foot/F");
+    // A drift smaller than one footroom code must NOT trip the guard: the toe
+    // moves less than the quantisation it controls, and channels jitter.
+    {
+        const float tol = log_lut_black_tolerance(p12);
+        const int near_miss = p12.black_level + static_cast<int>(tol) - 1;
+        CHECK(std::fabs(static_cast<float>(near_miss - p12.black_level)) <= tol,
+              "sub-footroom-code drift is tolerated");
+    }
+
+    // 16-bit sources are the identity — only imx585 has a 16-bit mode and the
+    // 16to12/16to10 specs are fitted to exactly its black level.
+    for (int i = 0; i < 2; ++i) {
+        const LogLutParams &p16 = kCases[i].p;
+        CHECK(log_lut_scale_black(p16, 3200.f) == p16.black_level,
+              "16-bit source: reported black scales to the spec's black unchanged");
     }
 }
 
@@ -355,6 +473,7 @@ int main()
     test_golden(kCases[1], kFwd16to10, kInv16to10, 10);
     test_golden(kCases[2], kFwd12to10, kInv12to10, 10);
 
+    test_black_level_guard();
     test_validation();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);

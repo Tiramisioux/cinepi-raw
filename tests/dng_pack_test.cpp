@@ -106,6 +106,49 @@ static void test_pack_row_16_to_12bit() {
     }
 }
 
+// right_justify_row: undo the MSB alignment PiSP puts on a sub-16-bit sensor
+// mode. Shares the >>4 with pack_row_16_to_12bit, so cross-check against it.
+static void test_right_justify_row() {
+    std::printf("test_right_justify_row\n");
+    {
+        // A 12-bit mode arrives as value << 4; shifting back must be exact over
+        // the whole 12-bit domain, including both ends.
+        const uint16_t src[4] = { 0x0000, 0x00C0 << 4, 0x0ABC << 4, 0x0FFF << 4 };
+        const uint16_t exp[4] = { 0x0000, 0x00C0,      0x0ABC,      0x0FFF };
+        uint16_t dst[4] = {0xEEEE,0xEEEE,0xEEEE,0xEEEE};
+        right_justify_row(src, dst, 4, 4);
+        CHECK(std::memcmp(dst, exp, sizeof exp) == 0, "shift=4 recovers the 12-bit code");
+    }
+    {
+        // shift=0 is the identity, which is how the caller expresses "already
+        // right-justified" without branching.
+        const uint16_t src[3] = { 0x0000, 0x1234, 0xFFFF };
+        uint16_t dst[3] = {0xEEEE,0xEEEE,0xEEEE};
+        right_justify_row(src, dst, 3, 0);
+        CHECK(std::memcmp(dst, src, sizeof src) == 0, "shift=0 is the identity");
+    }
+    {
+        // In place, because the encoder normalises through one scratch row.
+        uint16_t buf[2] = { 0x0ABC << 4, 0x0FFF << 4 };
+        const uint16_t exp[2] = { 0x0ABC, 0x0FFF };
+        right_justify_row(buf, buf, 2, 4);
+        CHECK(std::memcmp(buf, exp, sizeof exp) == 0, "safe when dst aliases src");
+    }
+    {
+        // Cross-check: pack_row_16_to_12bit drops the same 4 LSBs on its way into
+        // the packed layout, so right-justifying first then packing right-
+        // justified 12 must give the identical bytes.
+        const uint16_t v16[2] = { 0x0ABC << 4, 0x0123 << 4 };
+        uint16_t just[2];
+        uint8_t a[3] = {0}, b[3] = {0};
+        right_justify_row(v16, just, 2, 4);
+        pack_row_12bit(just, a, 2);
+        pack_row_16_to_12bit(v16, b, 2);
+        CHECK(bytes_equal("crosscheck", a, b, 3),
+              "right_justify + pack12 == pack16 — same 4 bits dropped");
+    }
+}
+
 // pack_row_12bit: input already right-justified 12-bit (no >>4), same packing.
 static void test_pack_row_12bit() {
     std::printf("test_pack_row_12bit\n");
@@ -494,6 +537,7 @@ int main() {
     std::printf("=== dng_pack unit tests ===\n");
     // Tier 1
     test_pack_row_16_to_12bit();
+    test_right_justify_row();
     test_pack_row_12bit();
     test_pack_row_10bit();
     // Tier 2

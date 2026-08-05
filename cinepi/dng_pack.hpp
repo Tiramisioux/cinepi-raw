@@ -53,6 +53,26 @@ static inline void pack_row_16_to_12bit(const uint16_t *src,
     }
 }
 
+/* Shift an MSB-aligned row down into the sensor's own right-justified domain.
+ *
+ * PiSP hands every raw stream over in a 16-bit container with the significant
+ * bits at the TOP, so a 12-bit sensor mode arrives as SRGGB16 holding
+ * value << 4. Anything indexed by the sensor's real code — a source-depth LUT,
+ * say — needs the shift undone first; a plain reinterpret_cast reads samples up
+ * to 65535 out of a domain that only goes to 4095.
+ *
+ * pack_row_16_to_12bit does the same >> 4 on its way into the packed 12-bit DNG
+ * layout. This one stops at 16-bit samples, for callers that still have work to
+ * do before packing. */
+static inline void right_justify_row(const uint16_t *src,
+                                     uint16_t       *dst,
+                                     uint32_t        width,
+                                     unsigned        shift)
+{
+    for (uint32_t x = 0; x < width; ++x)
+        dst[x] = static_cast<uint16_t>(src[x] >> shift);
+}
+
 /* Pack one 4-pixel group of right-justified 10-bit samples into 5 contiguous
  * bytes, MSB-first (the layout DNG expects for BitsPerSample=10). */
 static inline void pack_group_10bit(const uint16_t *src, uint8_t *dst)

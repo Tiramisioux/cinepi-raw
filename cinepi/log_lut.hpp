@@ -94,6 +94,32 @@ struct LogLutParams
     }
 };
 
+/* ── does this curve belong to this sensor? ─────────────────────────────────────
+ *
+ * A spec is found by DEPTH PAIR alone (log_lut_spec_filename), but its black
+ * level is per-sensor: cinemate_log_12to10 assumes 200, which is imx585/imx283,
+ * while imx477 reads 256 and imx296 240 at 12 bit. Handing a sensor the wrong
+ * curve puts the toe in the wrong place while the file's BlackLevel tag reports
+ * the true one. The encoder compares the two and refuses on mismatch.
+ *
+ * Split out as pure functions so the rule is testable without libcamera. */
+
+/* SensorBlackLevels reports in the 16-bit linear domain. Scale it into this
+ * curve's source domain, the same rounding dng_save() uses for the output tag. */
+inline int log_lut_scale_black(const LogLutParams &p, float reported_16bit)
+{
+    const float src_white = static_cast<float>((1u << p.source_bits) - 1u);
+    return static_cast<int>(reported_16bit * src_white / 65535.f + 0.5f);
+}
+
+/* How far the reported black may sit from the spec's before it matters: one
+ * footroom code (foot/F). Below that the toe is misplaced by less than the
+ * quantisation it controls, which also absorbs per-channel jitter. */
+inline float log_lut_black_tolerance(const LogLutParams &p)
+{
+    return p.has_footroom() ? static_cast<float>(p.footroom_lsb) / p.footroom_codes : 1.f;
+}
+
 /* Linear source level -> log code. Mirrors gen_cinemate_log.py enc(). */
 inline int log_encode_code(double L, const LogLutParams &p)
 {
