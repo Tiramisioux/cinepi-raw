@@ -3,8 +3,7 @@
 // Unit tests for --log-encode argv parsing (cinepi/log_encode_arg.hpp).
 //
 // Pure / self-contained: no libcamera, no boost, no Redis. Build & run:
-//   c++ -std=c++17 -O2 -Wall -Wextra -I. tests/log_encode_arg_test.cpp \
-//       -o /tmp/log_encode_arg_test && /tmp/log_encode_arg_test
+//   c++ -std=c++17 -O2 -Wall -Wextra -I. tests/log_encode_arg_test.cpp -o /tmp/log_encode_arg_test && /tmp/log_encode_arg_test
 // (or via meson: `meson test log_encode_arg`).
 //
 // Why this file exists: CinePiOptions::Parse walks argv by hand, so a bare flag
