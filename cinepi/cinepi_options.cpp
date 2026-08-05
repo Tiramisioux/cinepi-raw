@@ -636,8 +636,7 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                 std::string lut_summary;
                 const int usable = preload_log_luts(RawOptions::log_encode, lut_summary);
                 if (usable)
-                        spdlog::info("cinepi-cli: log-encode target={} bit "
-                                     "(parsed + tables loaded; encoder not wired yet): {}",
+                        spdlog::info("cinepi-cli: log-encode target={} bit: {}",
                                      RawOptions::log_encode, lut_summary);
                 else
                         spdlog::warn("cinepi-cli: log-encode target={} bit but {}",

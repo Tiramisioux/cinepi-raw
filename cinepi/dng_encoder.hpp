@@ -18,7 +18,8 @@
 
 #include "encoder/encoder.hpp"
 #include "raw_options.hpp"
-#include "cinepi_frameinfo.hpp"	
+#include "cinepi_frameinfo.hpp"
+#include "log_lut.hpp"
 
 
 class DngEncoder : public Encoder
@@ -177,6 +178,17 @@ private:
     bool raw_compressed_in_ = false;
 
     bool write12bit_{false};
+
+    /* ──  CineMate Log  ───────────────────────────────────────
+     * Resolved once per configure in setup_encoder(), where the SOURCE depth
+     * (the Bayer format) and the TARGET depth (--log-encode) are known
+     * together; dng_save() only reads it. Non-null is the single "this clip is
+     * log-encoded" switch, and it is only set when a spec ships for the pair —
+     * a missing curve degrades to a normal linear recording rather than failing
+     * the take. The pointer comes from the process-wide cache in log_lut.cpp
+     * and stays valid for the process lifetime, so encode workers read it
+     * without a lock. params().target_bits is the authoritative code depth. */
+    const LogLut *log_lut_ = nullptr;
 
     /* ──  Reusable encoded-buffer pool  ───────────────────── */
     std::vector<uint8_t *> buffer_pool_;

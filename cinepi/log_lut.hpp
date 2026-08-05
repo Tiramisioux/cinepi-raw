@@ -184,6 +184,19 @@ public:
         return forward_[std::min(static_cast<size_t>(linear), forward_.size() - 1)];
     }
 
+    /* Encode a whole row. Output codes are right-justified in target_bits, which
+     * is exactly what dng_pack.hpp's pack_row_12bit/pack_row_10bit consume — the
+     * log path needs no depth-converting packer.
+     *
+     * dst MAY alias src: the map is per-sample and the write to x follows the
+     * read of x. The encoder relies on that to decompress COMP1 and log-encode
+     * through a single scratch row. */
+    void encode_row(const uint16_t *src, uint16_t *dst, size_t width) const
+    {
+        for (size_t x = 0; x < width; ++x)
+            dst[x] = encode(src[x]);
+    }
+
 private:
     LogLutParams params_;
     std::vector<uint16_t> forward_;

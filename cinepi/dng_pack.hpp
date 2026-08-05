@@ -250,7 +250,7 @@ static void decode_pisp_comp1_block(const uint8_t *src, uint16_t *dst)
         dst[i] = add_pisp_comp1_offset(dst[i]);
 }
 
-static void unpack_pisp_comp1_row_to_16(const uint8_t *src, uint16_t *dst, uint32_t width)
+static inline void unpack_pisp_comp1_row_to_16(const uint8_t *src, uint16_t *dst, uint32_t width)
 {
     const uint32_t full_blocks = width / 8u;
     uint32_t x = 0;
@@ -266,7 +266,7 @@ static void unpack_pisp_comp1_row_to_16(const uint8_t *src, uint16_t *dst, uint3
     }
 }
 
-static void unpack_pisp_comp1_row_to_packed12(const uint8_t *src, uint8_t *dst, uint32_t width)
+static inline void unpack_pisp_comp1_row_to_packed12(const uint8_t *src, uint8_t *dst, uint32_t width)
 {
     const uint32_t full_blocks = width / 8u;
     uint32_t x = 0;

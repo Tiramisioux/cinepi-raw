@@ -150,6 +150,7 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--hdmi-port <int>`       | `-1`    | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
 | `--same-hdmi`             | `false` | Force both CinePi apps (capture & controller) to share the same HDMI output. |
 | `--hdr sensor`            | off     | Enable on-sensor HDR before start-up (imx708 stock HDR, imx585 ClearHDR). Changes the sensor's mode list and halves ClearHDR frame rates — see [IMX585 ClearHDR](#imx585-clearhdr-16-bit-hdr). |
+| `--log-encode [<10\|12>]` | off     | Log-encode recorded DNGs with CineMate Log: a µ-law curve companding the linear sensor signal to fewer bits, plus a DNG `LinearizationTable` (tag `0xC618`) so any raw application decodes it straight back to linear. Bare flag = 12 bit. Implemented so far for **12-bit output from a 16-bit sensor mode** (imx585 ClearHDR), where it costs ~25 % of the file size; any other combination records linear and logs why. |
 | `--encode-workers <n>`    | `2`     | Number of DNG encode worker threads to spawn (min. `1`). |
 | `--disk-workers <n>`      | `8`     | Number of disk writer threads used for flushing DNGs (min. `1`). |
 | `--encode-affinity <list>`| `auto`  | Pin encode workers to a CPU list (e.g. `4,5` or `2-5`). |

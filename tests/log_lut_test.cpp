@@ -22,6 +22,9 @@
 // or simply re-derive them from cinemate_log_*.json's linearization_table.
 
 #include "cinepi/log_lut.hpp"
+// The encode hook hands LUT output straight to this packer; test_encode_row
+// proves the two agree on the sample domain.
+#include "cinepi/dng_pack.hpp"
 
 #include <cfenv>
 #include <cmath>
@@ -233,6 +236,70 @@ static void test_roundtrip(const Case &c)
     CHECK(worst < c.max_roundtrip_mstop, "round-trip within this curve's measured bound");
 }
 
+// ── TIER 3b: the encode hook's row path ──────────────────────────────────────
+//
+// Pass 4 rests on one claim that neither the curve tests nor the packer tests
+// cover on their own: a forward code is ALREADY a right-justified target-depth
+// sample, so the DNG writer can hand LUT output straight to pack_row_12bit with
+// no shifting. If that were wrong the recording would be silently mis-scaled by
+// 16x, and every test above would still pass. So encode a row through the real
+// LUT, pack it with the real packer, and unpack it with an inverse derived from
+// the DNG contiguous-12 bit layout rather than from pack_row_12bit's algebra.
+static void unpack_row_12bit(const uint8_t *src, uint16_t *dst, uint32_t width)
+{
+    // Contiguous 12-bit, MSB-first: 2 px per 3 bytes.
+    //   px0 = b0[7:0] b1[7:4]      px1 = b1[3:0] b2[7:0]
+    for (uint32_t x = 0; x + 1 < width; x += 2, src += 3) {
+        dst[x]     = static_cast<uint16_t>((static_cast<uint16_t>(src[0]) << 4) | (src[1] >> 4));
+        dst[x + 1] = static_cast<uint16_t>((static_cast<uint16_t>(src[1] & 0x0F) << 8) | src[2]);
+    }
+}
+
+static void test_encode_row(const Case &c)
+{
+    std::printf("test_encode_row %s\n", c.name);
+    LogLut lut;
+    if (!lut.build(c.p))
+        return;
+
+    const LogLutParams &p = c.p;
+    const int cmax = p.code_max();
+
+    // A linear ramp over the source range, with WL forced into the last sample
+    // so the row spans code 0..CMAX. Without that the ramp stops short of white
+    // (64512 of 65535 at 16 bit) and the packer is never exercised on 0xFFF —
+    // the one code where a bad shift or mask is most likely to show up.
+    const uint32_t kWidth = 64;
+    std::vector<uint16_t> src(kWidth), dst(kWidth);
+    const unsigned step = (1u << p.source_bits) / kWidth;
+    for (uint32_t x = 0; x < kWidth; ++x)
+        src[x] = static_cast<uint16_t>(x * step);
+    src[kWidth - 1] = static_cast<uint16_t>(p.white_level);
+
+    lut.encode_row(src.data(), dst.data(), kWidth);
+    size_t mismatch = 0;
+    for (uint32_t x = 0; x < kWidth; ++x)
+        if (dst[x] != lut.encode(src[x]))
+            ++mismatch;
+    CHECK(mismatch == 0, "encode_row matches per-sample encode()");
+    CHECK(dst.front() == 0 && dst.back() == cmax, "the test row spans code 0..CMAX");
+
+    // In-place is safe — the encoder decompresses COMP1 and log-encodes through
+    // one scratch row, so dst aliases src on every compressed frame.
+    std::vector<uint16_t> inplace = src;
+    lut.encode_row(inplace.data(), inplace.data(), kWidth);
+    CHECK(inplace == dst, "encode_row is safe when dst aliases src");
+
+    // The composition, for the 12-bit target the DNG writer actually uses.
+    if (p.target_bits == 12) {
+        std::vector<uint8_t>  packed((kWidth * 12 + 7) / 8);
+        std::vector<uint16_t> back(kWidth);
+        pack_row_12bit(dst.data(), packed.data(), kWidth);
+        unpack_row_12bit(packed.data(), back.data(), kWidth);
+        CHECK(back == dst, "pack_row_12bit round-trips the log codes unshifted");
+    }
+}
+
 // ── TIER 4: params validation ────────────────────────────────────────────────
 static void test_validation()
 {
@@ -282,6 +349,7 @@ int main()
     for (const Case &c : kCases) {
         test_shape(c);
         test_roundtrip(c);
+        test_encode_row(c);
     }
     test_golden(kCases[0], kFwd16to12, kInv16to12, 10);
     test_golden(kCases[1], kFwd16to10, kInv16to10, 10);

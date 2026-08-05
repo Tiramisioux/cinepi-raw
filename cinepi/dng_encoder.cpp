@@ -505,6 +505,60 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
         dng_info.white = (1u << 12) - 1u;
     }
 
+    /* ──  CineMate Log  ───────────────────────────────────────
+     * Resolve the curve here, the one place that knows both depths, and let
+     * everything downstream key off log_lut_. dng_info.bits/white feed four
+     * things at once — the dng_save() branch chain, tag 258, tag 0xC61D and
+     * the black-level rescale — so they are the only two values the log path
+     * has to override:
+     *
+     *   bits  = the STORED code depth (12), so tag 258 and the buffer sizing
+     *           below describe the packed log codes that are really written.
+     *   white = the LINEAR (table-output) white level, because under a
+     *           LinearizationTable the level tags live in the table's OUTPUT
+     *           domain, not the code domain. That is also exactly what turns
+     *           the `* dng_info.white / 65535.f` black rescale at the bottom of
+     *           dng_save() into the identity, which is the required bypass:
+     *           SensorBlackLevels is already in that same 16-bit linear domain.
+     *
+     * Scope: 16 significant source bits -> 12-bit codes. `--log-encode 10` is
+     * the next pass and 12-bit sources the one after; both fall through to the
+     * normal linear path here rather than emitting an untested file. */
+    log_lut_ = nullptr;
+    if (options_ && options_->log_encode)
+    {
+        std::string err;
+        const LogLut *lut = nullptr;
+
+        if (bf.bits != 16 || sensor_mode_bit_depth_ != 16)
+            err = "needs a 16-bit sensor mode (this one is " +
+                  std::to_string(sensor_mode_bit_depth_) + "-bit)";
+        else if (options_->log_encode != 12)
+            err = "only --log-encode 12 is implemented so far";
+        else
+            lut = get_log_lut(bf.bits, options_->log_encode, err);
+
+        /* The loaded spec, not the flag, decides the real code depth — nothing
+         * cross-checks the two — and the row path below hard-codes the 12-bit
+         * packer. So refuse a spec that says otherwise instead of packing 12
+         * bits and labelling the file with a different number. */
+        if (lut && lut->params().target_bits != 12)
+        {
+            err = "spec targets " + std::to_string(lut->params().target_bits) + " bit, expected 12";
+            lut = nullptr;
+        }
+
+        if (lut)
+        {
+            log_lut_ = lut;
+            write12bit_ = false;          /* the log path owns the row conversion */
+            dng_info.bits  = lut->params().target_bits;
+            dng_info.white = lut->params().white_level;
+        }
+        else
+            console->warn("CineMate Log off for this mode: {}", err);
+    }
+
     /* ──  White-balance gains & CCM  ──────────────────────────── */
     std::fill(std::begin(dng_info.NEUTRAL), std::end(dng_info.NEUTRAL), 1.f);
     Matrix wb(1, 1, 1);
@@ -540,8 +594,14 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.thumbPhotometric     = PHOTOMETRIC_MINISBLACK;   /* = 1 */
 
     /* ──  Buffer sizing  ──────────────────────────────────────── */
+    /* 64 KB covers the IFD and its out-of-line payloads; log adds an 8 KB
+     * LinearizationTable on top of that. Worth stating explicitly: an overflow
+     * here does not crash, write_pod() throws and the frame is dropped without
+     * a pixel of evidence. */
     const uint32_t frame = ((cfg.size.width * dng_info.bits + 7) / 8) * cfg.size.height;
-    dng_info.buffer_size = align_up(frame + 64 * 1024, ONE_MB);
+    const uint32_t tail_slack =
+        64 * 1024 + (log_lut_ ? static_cast<uint32_t>(log_lut_->inverse_size() * sizeof(uint16_t)) : 0u);
+    dng_info.buffer_size = align_up(frame + tail_slack, ONE_MB);
 
     /* ──  Static strings & misc  ──────────────────────────────── */
     dng_info.make       = "Raspberry Pi";
@@ -595,6 +655,9 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
                   cfg.size.width, cfg.size.height,
                   dng_info.bits, dng_info.buffer_size / ONE_MB);
     console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
+    if (log_lut_)
+        console->info("{}  LinearizationTable {} entries", log_lut_->params().describe(),
+                      log_lut_->inverse_size());
     if (raw_compressed_in_)
         console->info("PiSP COMP1 raw input detected; decoding to {}-bit DNG rows", dng_info.bits);
 }
@@ -630,7 +693,40 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     /* ── 1. Raw image copy (packing if 12-bit) ─────────────────── */
     const uint32_t rawOff = buf.offset;
 
-    if (bayer_format.compressed)
+    if (log_lut_)
+    {
+        /* CineMate Log: 16-bit linear -> log codes, packed at the target depth.
+         * The forward LUT already emits right-justified target-depth codes, so
+         * the ordinary packer consumes its output with no extra conversion.
+         *
+         * Both 16-bit sources funnel through one uint16 row: COMP1 has to be
+         * decompressed first, unpacked raw can be read in place. Encoding
+         * row16Buf into itself is deliberate — the map is per-sample and the
+         * write to x follows the read of x — and it keeps the compressed case
+         * to a single scratch row. */
+        const uint32_t rowPacked = (info.width * 12 + 7) / 8;
+        rowBuf.resize(rowPacked);
+        row16Buf.resize(info.width);
+
+        for (uint32_t y = 0; y < info.height; ++y)
+        {
+            const uint16_t *lin;
+            if (bayer_format.compressed)
+            {
+                unpack_pisp_comp1_row_to_16(raw + y * info.stride, row16Buf.data(), info.width);
+                lin = row16Buf.data();
+            }
+            else
+            {
+                lin = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
+            }
+
+            log_lut_->encode_row(lin, row16Buf.data(), info.width);
+            pack_row_12bit(row16Buf.data(), rowBuf.data(), info.width);
+            write_pod(buf, rowBuf.data(), rowPacked);
+        }
+    }
+    else if (bayer_format.compressed)
     {
         if (write12bit_)
         {
@@ -807,6 +903,15 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(0xC61A, TIFF_RATIONAL, 4, blackRat);
     uint16_t white16 = static_cast<uint16_t>(dng_info.white);
     ifd.addEntry(0xC61D, TIFF_SHORT, 1, &white16);
+
+    /* LinearizationTable — log only. The inverse table IS the tag's SHORT
+     * payload, no conversion. It is what puts the two levels above into the
+     * right domain: a reader applies this table first, so BlackLevel/WhiteLevel
+     * describe its OUTPUT (linear), not the stored codes. Tag order does not
+     * matter here, sortEntries() below puts the directory in ascending order. */
+    if (log_lut_)
+        ifd.addEntry(0xC618, TIFF_SHORT,
+                     static_cast<uint32_t>(log_lut_->inverse_size()), log_lut_->inverse());
 
     /* colour matrices */
     ifd.addEntry(0xC621, TIFF_SRATIONAL, 9, matrixXY);   /* ColorMatrix1 */
