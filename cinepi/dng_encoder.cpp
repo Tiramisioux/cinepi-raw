@@ -605,7 +605,19 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
         {
             const LogLutParams &lp = lut->params();
             auto bl = metadata.get(controls::SensorBlackLevels);
-            if (bl && bl->size() >= 4)
+            if (!bl || bl->size() < 4)
+            {
+                /* Without the reported levels this check cannot run at all, and
+                 * the entire reason it exists is that a wrong black is SILENT —
+                 * the toe lands in the wrong place and nothing downstream says
+                 * so. Refuse, like every other guard here, rather than encode
+                 * against a curve nothing has confirmed belongs to this sensor.
+                 * Every Pi sensor reports these; a mode that somehow does not
+                 * records linear instead of recording something subtly wrong. */
+                err = "no SensorBlackLevels reported, cannot verify the curve's black level";
+                lut = nullptr;
+            }
+            else
             {
                 int worst_seen = lp.black_level;
                 float worst_off = 0.f;
@@ -893,12 +905,13 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     }
     else if (dng_info.bits == 10)
     {
+        /* pack_row_10bit() writes exactly this many bytes: Pass 2 gave it a
+         * zero-padded final group that emits only the (n*10+7)/8 bytes those n
+         * pixels occupy, replacing the old flat 5 B/group (which also over-READ
+         * the source row). So the scratch row needs no rounding-up — same sizing
+         * as the log path above. */
         const uint32_t rowPacked = (info.width * 10 + 7) / 8;   /* 1.25 B / px */
-        /* pack_row_10bit() writes 5 bytes per 4-pixel group; size the scratch
-         * row to the rounded-up group count so a width that is not a multiple of
-         * 4 cannot overflow it. For the standard 10-bit modes (mult-of-4 width)
-         * this equals rowPacked exactly. */
-        rowBuf.resize(((info.width + 3u) / 4u) * 5u);
+        rowBuf.resize(rowPacked);
         if (bayer_format.packed)
             row16Buf.resize(info.width);
 
@@ -940,7 +953,30 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     /* ──  3.  Per-channel black-level  ────────────────────────── */
     uint16_t black[4] {};
     auto ord = bayer_format.order;
-    if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
+    if (log_lut_)
+    {
+        /* Under a LinearizationTable a reader applies the curve BEFORE reading
+         * this tag, so BlackLevel describes the table's OUTPUT — and that output
+         * has exactly one black point: inverse[F] == lp.black_level, by
+         * construction (log_decode_level(F) is BL + 0; asserted for all three
+         * shipped curves in tests/log_lut_test.cpp).
+         *
+         * So the curve is the authority here, not the metadata. The reported
+         * per-channel levels do not survive the encode — all four CFA channels
+         * pass through the same single-channel map — and writing them would
+         * claim a per-channel pedestal the table has already flattened, up to
+         * the one footroom code of slack setup_encoder() allows. That is exactly
+         * the shadow range the footroom exists to preserve.
+         *
+         * It is also the only right answer if SensorBlackLevels goes missing:
+         * the 4096-pedestal fallback below is a LINEAR-path assumption and would
+         * write 4096 (16->*) or 256 (12->10) where the curve says 3200 or 200.
+         * setup_encoder() now refuses the log path in that case, so this is
+         * belt-and-braces rather than the only guard. */
+        std::fill(std::begin(black), std::end(black),
+                  static_cast<uint16_t>(log_lut_->params().black_level));
+    }
+    else if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
     {
         for (int i = 0; i < 4; ++i)
         {

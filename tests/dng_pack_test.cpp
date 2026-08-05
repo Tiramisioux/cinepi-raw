@@ -322,6 +322,31 @@ static void test_pack_row_10bit() {
         CHECK(bytes_equal("no over-read", d, exp, 4),
               "pack10 width=3 ignores the word past the row (over-read fixed)");
     }
+    // Sweep: the packer writes EXACTLY (width*10+7)/8 bytes at every width, not
+    // the rounded-up ((width+3)/4)*5 the pre-move body needed. dng_encoder.cpp
+    // sizes both the linear and the log 10-bit scratch row on that expression
+    // alone, with no slack, so a width where the packer ran one byte over would
+    // be a heap overflow rather than a cosmetic waste. Guard bytes, every width
+    // through two full groups past the largest remainder case.
+    {
+        bool clean = true;
+        size_t first_bad = 0;
+        for (uint32_t w = 1; w <= 64; ++w) {
+            const size_t exact = (static_cast<size_t>(w) * 10u + 7u) / 8u;
+            const size_t slack = ((static_cast<size_t>(w) + 3u) / 4u) * 5u;
+            std::vector<uint16_t> src(w);
+            for (uint32_t x = 0; x < w; ++x)
+                src[x] = static_cast<uint16_t>((x * 37u) & 0x3FF);
+            std::vector<uint8_t> dst(exact + 8, 0xEE);
+            pack_row_10bit(src.data(), dst.data(), w);
+            for (size_t i = exact; i < dst.size(); ++i)
+                if (dst[i] != 0xEE) { clean = false; if (!first_bad) first_bad = w; break; }
+            if (slack < exact) { clean = false; if (!first_bad) first_bad = w; }
+        }
+        CHECK(clean, "pack10 writes exactly (w*10+7)/8 bytes at every width 1..64");
+        if (!clean)
+            std::printf("  first bad width: %zu\n", first_bad);
+    }
 }
 
 // ── TIER 2: MIPI CSI-2 unpackers ─────────────────────────────────────────────

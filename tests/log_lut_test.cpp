@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 // ── tiny test harness (same shape as dng_pack_test.cpp) ──────────────────────
@@ -359,6 +360,209 @@ static void test_encode_row(const Case &c)
     }
 }
 
+// ── TIER 3a: the two source shapes no CM5 sensor can deliver ─────────────────
+//
+// dng_save()'s log row path funnels four source shapes into one right-justified
+// uint16 row. test_encode_row above covers the two a CM5 actually produces —
+// plain SRGGB16, and the MSB-aligned PiSP SDR container. The other two have
+// never executed anywhere: COMP1 needs a mode the PiSP frontend chooses to
+// compress, and CSI2-packed RAW12 exists only on Pi 4 / VC4 (imx477, imx296 via
+// packing_by_platform.pi4 = "P") and on imx519. No hardware here can gate them,
+// so these tests are the honest substitute.
+//
+// Both unpackers are already tested in ISOLATION in dng_pack_test.cpp. What is
+// untested is the COMPOSITION the encoder actually runs — the same gap
+// test_encode_row was written to close for the uncompressed case. Each test
+// below mirrors dng_encoder.cpp's loop step for step, including the deliberate
+// aliasing: unpack into row16Buf, then encode row16Buf into ITSELF.
+//
+// Every expected value comes from the unpacker or from lut.encode(); none is
+// typed in.
+
+static void test_encode_row_comp1(const Case &c)
+{
+    // setup_encoder() admits COMP1 only in a 16-bit domain:
+    //   "COMP1 rows decode to a 16-bit domain, not <src_bits>"
+    if (c.p.source_bits != 16)
+        return;
+    std::printf("test_encode_row_comp1 %s\n", c.name);
+
+    LogLut lut;
+    if (!lut.build(c.p))
+        return;
+
+    // COMP1 stores 8 px in 8 bytes, so a 64 px row is 64 bytes. The pattern is
+    // arbitrary but deterministic; what matters is that it reaches all four
+    // qmodes, which is asserted below rather than assumed.
+    const uint32_t kWidth = 64;
+    std::vector<uint8_t> comp1(kWidth);
+    for (uint32_t i = 0; i < kWidth; ++i)
+        comp1[i] = static_cast<uint8_t>(i * 37u + (i >> 3));
+
+    {
+        bool qmode_seen[4] = { false, false, false, false };
+        for (uint32_t w = 0; w < kWidth; w += 4)          // one 32-bit word each
+            qmode_seen[comp1[w] & 3] = true;
+        CHECK(qmode_seen[0] && qmode_seen[1] && qmode_seen[2] && qmode_seen[3],
+              "comp1: the fixture row reaches all four qmodes");
+    }
+
+    // ── the encoder's loop, verbatim ──
+    std::vector<uint16_t> row(kWidth);
+    unpack_pisp_comp1_row_to_16(comp1.data(), row.data(), kWidth);
+    const std::vector<uint16_t> decoded = row;      // what the LUT must see
+    lut.encode_row(row.data(), row.data(), kWidth); // aliased, exactly as shipped
+
+    size_t mismatch = 0;
+    for (uint32_t x = 0; x < kWidth; ++x)
+        if (row[x] != lut.encode(decoded[x]))
+            ++mismatch;
+    CHECK(mismatch == 0, "comp1: the aliased encode maps the decoded 16-bit row");
+
+    // COMP1 decodes into PiSP's 16-bit working domain, which IS the domain these
+    // curves were fitted to — hence no shift on this branch (log_src_shift_ stays
+    // 0). The decoder adds PISP_COMP1_OFFSET to every lane, and that floor sits
+    // below the 16-bit curves' black, so a COMP1 row genuinely exercises the
+    // footroom leg and not only the mu-law one.
+    uint16_t lo = 0xFFFF;
+    for (uint16_t v : decoded)
+        lo = std::min(lo, v);
+    CHECK(lo >= PISP_COMP1_OFFSET, "comp1: every lane carries the +offset pedestal");
+    CHECK(PISP_COMP1_OFFSET < c.p.black_level,
+          "comp1: that pedestal is below BL, so the row reaches the footroom codes");
+    {
+        size_t below = 0, above = 0;
+        for (uint16_t v : decoded)
+            (v < c.p.black_level ? below : above)++;
+        CHECK(below > 0 && above > 0, "comp1: the row spans both legs of the curve");
+    }
+
+    // The packer consumes those codes unshifted, at whichever target this curve
+    // has — the same dispatch dng_save() makes on lut->params().target_bits.
+    {
+        std::vector<uint8_t>  packed((kWidth * c.p.target_bits + 7) / 8);
+        std::vector<uint16_t> back(kWidth);
+        if (c.p.target_bits == 12) {
+            pack_row_12bit(row.data(), packed.data(), kWidth);
+            unpack_row_12bit(packed.data(), back.data(), kWidth);
+        } else {
+            pack_row_10bit(row.data(), packed.data(), kWidth);
+            unpack_row_10bit(packed.data(), back.data(), kWidth);
+        }
+        CHECK(back == row, "comp1: packed log codes round-trip at the curve's target");
+    }
+
+    // Negative control: the decode is load-bearing. Reading the same bytes as
+    // uint16 samples — what the row path's `else` arm does — covers half the row
+    // and gives different codes, so a dropped `if (compressed)` cannot pass this
+    // test silently.
+    {
+        std::vector<uint16_t> as16(kWidth / 2), skipped(kWidth / 2);
+        std::memcpy(as16.data(), comp1.data(), as16.size() * sizeof(uint16_t));
+        lut.encode_row(as16.data(), skipped.data(), kWidth / 2);
+        bool same = true;
+        for (uint32_t x = 0; x < kWidth / 2; ++x)
+            if (skipped[x] != row[x]) { same = false; break; }
+        CHECK(!same, "comp1: skipping the decode gives a different row");
+    }
+}
+
+// Build the MIPI CSI-2 RAW12 pair (2 px in 3 bytes) for two right-justified
+// 12-bit values. Same fixture as dng_pack_test.cpp's csi12_pack, derived from
+// the layout documented on unpack_csi2_raw12: byte 2 carries the two low
+// nibbles, even pixel low, odd pixel high.
+static void csi12_pack(uint16_t v0, uint16_t v1, uint8_t out[3])
+{
+    out[0] = static_cast<uint8_t>(v0 >> 4);
+    out[1] = static_cast<uint8_t>(v1 >> 4);
+    out[2] = static_cast<uint8_t>((v0 & 0x0F) | ((v1 & 0x0F) << 4));
+}
+
+static void test_encode_row_csi2_raw12(const Case &c)
+{
+    // setup_encoder() admits a packed row only as 12-bit CSI2 in a 12-bit domain:
+    //   "no CSI2 unpacker for packed <bf.bits>-bit rows in a <src_bits>-bit domain"
+    if (c.p.source_bits != 12)
+        return;
+    std::printf("test_encode_row_csi2_raw12 %s\n", c.name);
+
+    LogLut lut;
+    if (!lut.build(c.p))
+        return;
+
+    // Same ramp shape test_encode_row uses, with WL forced into the last sample
+    // so the row spans code 0..CMAX and the packer sees the top code.
+    const uint32_t kWidth = 64;
+    std::vector<uint16_t> src(kWidth);
+    const unsigned step = (1u << c.p.source_bits) / kWidth;
+    for (uint32_t x = 0; x < kWidth; ++x)
+        src[x] = static_cast<uint16_t>(x * step);
+    src[kWidth - 1] = static_cast<uint16_t>(c.p.white_level);
+
+    std::vector<uint8_t> mipi((kWidth * 12u + 7u) / 8u);
+    for (uint32_t x = 0; x + 1 < kWidth; x += 2)
+        csi12_pack(src[x], src[x + 1], mipi.data() + (x / 2) * 3);
+
+    // ── the encoder's loop, verbatim ──
+    std::vector<uint16_t> row(kWidth);
+    unpack_csi2_raw12(mipi.data(), row.data(), kWidth);
+    CHECK(row == src, "csi2 raw12: unpack recovers the sensor codes");
+
+    // Right-justified output, so it indexes the 4096-entry forward table
+    // directly. No shift on this branch — log_src_shift_ is only set for the
+    // UNPACKED PiSP container, and nothing here overshoots the table.
+    {
+        const uint16_t top = static_cast<uint16_t>((1u << c.p.source_bits) - 1u);
+        size_t over = 0;
+        for (uint16_t v : row)
+            if (v > top) ++over;
+        CHECK(over == 0, "csi2 raw12: the row stays inside the source domain, so encode() never clamps");
+    }
+
+    std::vector<uint16_t> direct(kWidth);
+    lut.encode_row(src.data(), direct.data(), kWidth);
+    lut.encode_row(row.data(), row.data(), kWidth);   // aliased, exactly as shipped
+    CHECK(row == direct, "csi2 raw12: the unpacked row encodes like the sensor codes");
+    CHECK(direct.front() == 0 && direct.back() == c.p.code_max(),
+          "csi2 raw12: the fixture row spans code 0..CMAX");
+
+    {
+        std::vector<uint8_t>  packed((kWidth * c.p.target_bits + 7) / 8);
+        std::vector<uint16_t> back(kWidth);
+        pack_row_10bit(row.data(), packed.data(), kWidth);
+        unpack_row_10bit(packed.data(), back.data(), kWidth);
+        CHECK(c.p.target_bits == 10, "csi2 raw12: this curve targets the 10-bit packer");
+        CHECK(back == row, "csi2 raw12: packed log codes round-trip at 10 bit");
+    }
+
+    // Negative control: MIPI RAW12 is NOT a uint16 row. Reading it as one is the
+    // garbled "wrong bit order" raw the Pi 4 packing fix exists to prevent — and
+    // it overshoots the 12-bit domain, so encode() would silently clamp those
+    // samples to CMAX. Both properties are asserted, so a dropped `if (packed)`
+    // cannot pass.
+    {
+        std::vector<uint16_t> as16(kWidth / 2), skipped(kWidth / 2);
+        std::memcpy(as16.data(), mipi.data(), as16.size() * sizeof(uint16_t));
+
+        const uint16_t top = static_cast<uint16_t>((1u << c.p.source_bits) - 1u);
+        size_t over = 0;
+        for (uint16_t v : as16)
+            if (v > top) ++over;
+        CHECK(over > 0, "csi2 raw12: the un-unpacked row overshoots the source domain");
+
+        lut.encode_row(as16.data(), skipped.data(), kWidth / 2);
+        size_t clamped = 0;
+        for (uint16_t v : skipped)
+            if (v == lut.encode(top)) ++clamped;
+        CHECK(clamped >= over, "csi2 raw12: skipping the unpack clamps those samples to CMAX");
+
+        bool same = true;
+        for (uint32_t x = 0; x < kWidth / 2; ++x)
+            if (skipped[x] != row[x]) { same = false; break; }
+        CHECK(!same, "csi2 raw12: skipping the unpack gives a different row");
+    }
+}
+
 // ── TIER 3b: does this curve belong to this sensor? ──────────────────────────
 //
 // Specs are found by depth pair only, so cinemate_log_12to10 (black 200) is what
@@ -416,6 +620,31 @@ static void test_black_level_guard()
         CHECK(log_lut_scale_black(p16, 3200.f) == p16.black_level,
               "16-bit source: reported black scales to the spec's black unchanged");
     }
+
+    // ── what the BlackLevel tag must carry under a LinearizationTable ──
+    //
+    // dng_save() writes the CURVE's black for a log file, not the reported
+    // levels and not the linear path's pedestal fallback. Two facts justify
+    // that, and both are checked here so the tag rule is pinned off-device:
+    //
+    //  1. the table's output really does have that black point, and
+    //  2. the fallback is genuinely wrong — it was what shipped before Pass 6
+    //     whenever SensorBlackLevels went missing.
+    //
+    // The fallback expression is copied from dng_save()'s else-branch, with
+    // dng_info.white = the curve's white_level (what the log path sets it to).
+    for (const Case &c : kCases) {
+        LogLut l;
+        if (!l.build(c.p))
+            continue;
+        CHECK(l.inverse()[c.p.footroom_codes] == c.p.black_level,
+              "the table's output black point IS the curve's black level");
+
+        const int fallback =
+            static_cast<int>(4096.f * c.p.white_level / 65535.f + 0.5f);
+        CHECK(fallback != c.p.black_level,
+              "the linear 4096-pedestal fallback would write the wrong BlackLevel");
+    }
 }
 
 // ── TIER 4: params validation ────────────────────────────────────────────────
@@ -468,6 +697,8 @@ int main()
         test_shape(c);
         test_roundtrip(c);
         test_encode_row(c);
+        test_encode_row_comp1(c);
+        test_encode_row_csi2_raw12(c);
     }
     test_golden(kCases[0], kFwd16to12, kInv16to12, 10);
     test_golden(kCases[1], kFwd16to10, kInv16to10, 10);
