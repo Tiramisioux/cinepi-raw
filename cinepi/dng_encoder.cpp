@@ -486,16 +486,19 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.black_level_repeat_dim[1] = 2;
 
     /* On PiSP every raw stream arrives as a 16-bit container. SDR sensor modes
-     * (<=12 significant bits, MSB-aligned) pack down to 12-bit DNGs by default;
+     * (<=12 significant bits, MSB-aligned) always pack down to 12-bit DNGs;
      * dropping the 4 padding LSBs is lossless there. A true 16-bit sensor mode
      * (imx585 ClearHDR SRGGB16, sensor mode bit depth 16) carries real data in
-     * all 16 bits, so it always keeps full depth; --keep16 forces full depth
-     * for the SDR case too. The bit depth comes from the snapshot taken at
-     * reconfigure time, not options_->mode (which the redis thread mutates).
-     * BlackLevel is computed per-frame in dng_save() from SensorBlackLevels,
-     * scaled to the output white level. */
-    write12bit_ = (bf.bits == 16) && !options_->keep16 &&
-                  sensor_mode_bit_depth_ != 16;
+     * all 16 bits, so it keeps full depth. The bit depth comes from the snapshot
+     * taken at reconfigure time, not options_->mode (which the redis thread
+     * mutates). BlackLevel is computed per-frame in dng_save() from
+     * SensorBlackLevels, scaled to the output white level.
+     *
+     * (--keep16 used to force full depth for the SDR case too; it was removed
+     * because the 4 bits it preserved are padding, so it only ever bought a
+     * ~33% larger file carrying the same information. --log-encode is the one
+     * output-depth control now.) */
+    write12bit_ = (bf.bits == 16) && sensor_mode_bit_depth_ != 16;
 
     if (write12bit_) {
         dng_info.bits  = 12;

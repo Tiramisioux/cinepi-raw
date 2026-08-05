@@ -83,3 +83,12 @@ log_lut_test = executable('log_lut_test',
            include_directories : [include_directories('..')],
            install : false)
 test('log_lut', log_lut_test)
+
+# Unit tests for --log-encode argv parsing. No libcamera / boost deps — it
+# includes only cinepi/log_encode_arg.hpp, which is where the bare-flag lookahead
+# rules live precisely so they can be tested off-device. Run with `meson test`.
+log_encode_arg_test = executable('log_encode_arg_test',
+           '../tests/log_encode_arg_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('log_encode_arg', log_encode_arg_test)

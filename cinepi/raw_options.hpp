@@ -16,7 +16,6 @@ struct RawOptions : public VideoOptions
 {
     RawOptions()
         : VideoOptions()
-        , keep16(false)                     // NEW → default = pack to 12-bit
     {
         using namespace boost::program_options;
         options_.add_options();
@@ -51,8 +50,10 @@ struct RawOptions : public VideoOptions
 
     float       clipping{};
 
-    /* keep full 16-bit raw instead of packing – NEW */
-    bool keep16;                           // set by --keep16 in CinePiOptions
+    /* CineMate Log target depth: 0 = off, else 10 or 12. Set by --log-encode in
+     * CinePiOptions and read by the DNG encoder. Startup-only — the redis thread
+     * mutates this struct live, and the encode path cannot swap curves mid-clip. */
+    int log_encode { 0 };
 
     /* worker pool sizing + tuning */
     uint32_t encode_workers { 2 };

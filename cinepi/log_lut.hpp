@@ -210,4 +210,29 @@ bool load_log_lut_spec(const std::string &path, LogLutParams &params,
  * it is a hard failure, not a warning. */
 bool load_log_lut(int source_bits, int target_bits, LogLut &lut, std::string &err);
 
+/* ── the process-wide cache ─────────────────────────────────────────────────── */
+/*
+ * There is no single startup load, because the flag only fixes the TARGET depth.
+ * The SOURCE depth is a property of the configured camera mode — it is not known
+ * when the options are parsed, and a redis mode switch reconfigures the encoder
+ * with a different one mid-run. So the LUT is keyed by the pair and built on
+ * first use: the startup probe warms whatever the shipped specs cover, and the
+ * encoder asks for the pair it actually has.
+ */
+
+/* Source depths a shipped spec may exist for, most-likely first. */
+extern const int kLogLutSourceBits[2];
+
+/* Cached LUT for a depth pair, built on first use and kept for the process
+ * lifetime (a 16-bit source costs 128 KB + 8 KB). Returns nullptr with `err` set
+ * when no spec ships for the pair or the build failed; the failure is cached too,
+ * so a missing spec is not re-searched once per frame. Thread-safe: encode
+ * workers call this concurrently, and the returned pointer stays valid. */
+const LogLut *get_log_lut(int source_bits, int target_bits, std::string &err);
+
+/* Warm the cache for every source depth at `target_bits` and describe what came
+ * back, for the startup log. Returns the number of usable source depths; on 0,
+ * `summary` explains why. */
+int preload_log_luts(int target_bits, std::string &summary);
+
 #endif /* CINEPI_LOG_LUT_HPP */

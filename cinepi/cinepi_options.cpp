@@ -20,6 +20,9 @@
 
 #include "core/rpicam_app.hpp"
 
+#include "cinepi/log_encode_arg.hpp"
+#include "cinepi/log_lut.hpp"
+
 using namespace boost::program_options;
 
 namespace
@@ -172,9 +175,10 @@ CinePiOptions::CinePiOptions()
                 ("same-hdmi",
                         value<bool>()->default_value(false)->implicit_value(true),
                         "Force preview and GUI to share the same HDMI output")
-                ("keep16",
-                        value<bool>()->default_value(false)->implicit_value(true),
-                        "Write full 16-bit DNGs (disable 12-bit packing)")
+                ("log-encode",
+                        value<int>()->implicit_value(kLogEncodeDefaultBits, "12"),
+                        "Log-encode recorded DNGs with CineMate Log at 10 or 12 bit\n"
+                        "(bare flag = 12). Off when not given.")
                 ("zoom",
                     value<float>()
                         ->implicit_value(1.0f, "1.0")   // 1st arg = float, 2nd = help text
@@ -411,22 +415,24 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                         continue;
                 }
 
-                /* same-hdmi / keep16 -------------------------------------- */
+                /* same-hdmi ------------------------------------------------ */
                 if (arg == "--same-hdmi") { same_hdmi = true; continue; }
-                /* Qualified: RawOptions::keep16 is the member the DNG encoder
-                 * reads. A private CinePiOptions::keep16 used to shadow it here,
-                 * which made --keep16 a silent no-op. Accepts the bare flag and
-                 * the documented value forms: --keep16 true|false, --keep16=... */
-                if (arg == "--keep16" || arg.rfind("--keep16=", 0) == 0) {
-                        std::string v;
-                        if (arg.rfind("--keep16=", 0) == 0)
-                                v = arg.substr(sizeof("--keep16=") - 1);
-                        else if (i + 1 < argc) {
-                                std::string next = argv[i + 1];
-                                if (next == "true" || next == "false" || next == "1" || next == "0")
-                                        v = argv[++i];
-                        }
-                        RawOptions::keep16 = v.empty() || (v != "false" && v != "0");
+
+                /* log-encode ----------------------------------------------- */
+                /* KEEP THE ASSIGNMENT QUALIFIED. RawOptions::log_encode is the
+                 * member the DNG encoder reads; a private CinePiOptions member
+                 * of the same name would shadow it here and silently turn the
+                 * flag into a no-op. That bug shipped once, as --keep16.
+                 * The bare/space/'=' forms are parsed in log_encode_arg.hpp so
+                 * the lookahead rules are unit-testable off-device. */
+                LogEncodeArg log_arg =
+                        parse_log_encode_arg(arg, i + 1 < argc ? argv[i + 1] : nullptr);
+                if (log_arg.matched) {
+                        if (!log_arg.error.empty())
+                                throw std::runtime_error(log_arg.error);
+                        RawOptions::log_encode = log_arg.target_bits;
+                        if (log_arg.consumed_next)
+                                ++i;
                         continue;
                 }
 
@@ -621,6 +627,22 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                      same_hdmi ? "true" : "false",
                      Zoom(),
                      scaler_crops_rects.size());
+
+        /* Warm the CineMate Log tables now so a missing or drifted spec is a
+         * launch-time complaint, not a first-frame surprise. Only the target
+         * depth is known here — the source depth comes from the camera mode, so
+         * this probes every source a spec ships for. */
+        if (RawOptions::log_encode) {
+                std::string lut_summary;
+                const int usable = preload_log_luts(RawOptions::log_encode, lut_summary);
+                if (usable)
+                        spdlog::info("cinepi-cli: log-encode target={} bit "
+                                     "(parsed + tables loaded; encoder not wired yet): {}",
+                                     RawOptions::log_encode, lut_summary);
+                else
+                        spdlog::warn("cinepi-cli: log-encode target={} bit but {}",
+                                     RawOptions::log_encode, lut_summary);
+        }
 
         spdlog::info("cinepi-cli: encode_workers={} disk_workers={} encode_affinity={} disk_affinity={} encode_nice={} disk_nice={}",
                       RawOptions::encode_workers,

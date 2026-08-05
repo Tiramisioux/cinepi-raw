@@ -150,7 +150,6 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-rawâ
 | `--hdmi-port <int>`       | `-1`    | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
 | `--same-hdmi`             | `false` | Force both CinePi apps (capture & controller) to share the same HDMI output. |
 | `--hdr sensor`            | off     | Enable on-sensor HDR before start-up (imx708 stock HDR, imx585 ClearHDR). Changes the sensor's mode list and halves ClearHDR frame rates â€” see [IMX585 ClearHDR](#imx585-clearhdr-16-bit-hdr). |
-| `--keep16`                | `false` | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit SDR streams. True 16-bit sensor modes (e.g. imx585 ClearHDR, `--mode W:H:16:U`) always write 16-bit DNGs regardless of this flag. |
 | `--encode-workers <n>`    | `2`     | Number of DNG encode worker threads to spawn (min. `1`). |
 | `--disk-workers <n>`      | `8`     | Number of disk writer threads used for flushing DNGs (min. `1`). |
 | `--encode-affinity <list>`| `auto`  | Pin encode workers to a CPU list (e.g. `4,5` or `2-5`). |
@@ -214,7 +213,9 @@ constant-rate, disable the lock and discipline the sync server's rate instead.
 
 - Frames are written uncompressed, for simple I/O.
 
-- Packs 16-bit SDR streams (12-bit sensor data, MSB-aligned, so the pack is lossless) to 12 bit, unless `--keep16` is used. True 16-bit sensor modes (imx585 ClearHDR) always keep full 16-bit depth.
+- Packs 16-bit SDR streams (12-bit sensor data, MSB-aligned, so the pack is lossless) to 12 bit. True 16-bit sensor modes (imx585 ClearHDR) always keep full 16-bit depth.
+
+  The `--keep16` flag, which disabled that packing, was removed. The 4 bits it preserved are padding, so it only ever produced a ~33% larger file carrying the same information.
 
 - Supports both IMX 585 color and mono variants.
 

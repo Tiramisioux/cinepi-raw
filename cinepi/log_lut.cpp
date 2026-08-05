@@ -14,7 +14,10 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
+#include <utility>
 
 namespace
 {
@@ -166,4 +169,83 @@ bool load_log_lut(int source_bits, int target_bits, LogLut &lut, std::string &er
         }
     }
     return true;
+}
+
+/* ── the process-wide cache ─────────────────────────────────────────────────── */
+
+const int kLogLutSourceBits[2] = { 16, 12 };
+
+namespace
+{
+
+struct CacheEntry
+{
+    LogLut lut;
+    bool ok = false;
+    std::string err;
+};
+
+std::mutex g_cache_mutex;
+/* std::map, not unordered_map: node-based, so a reference handed out earlier
+ * stays valid when a later pair is inserted. */
+std::map<std::pair<int, int>, CacheEntry> g_cache;
+
+} // namespace
+
+const LogLut *get_log_lut(int source_bits, int target_bits, std::string &err)
+{
+    const std::pair<int, int> key(source_bits, target_bits);
+
+    /* Held across the build (a few ms, first use only) so two encode workers
+     * racing on the same pair cannot both build it. */
+    std::lock_guard<std::mutex> lock(g_cache_mutex);
+
+    auto it = g_cache.find(key);
+    if (it == g_cache.end())
+    {
+        CacheEntry entry;
+        entry.ok = load_log_lut(source_bits, target_bits, entry.lut, entry.err);
+        it = g_cache.emplace(key, std::move(entry)).first;
+    }
+
+    if (!it->second.ok)
+    {
+        err = it->second.err;
+        return nullptr;
+    }
+    return &it->second.lut;
+}
+
+int preload_log_luts(int target_bits, std::string &summary)
+{
+    std::ostringstream out;
+    std::string first_err;
+    int usable = 0;
+
+    for (int source_bits : kLogLutSourceBits)
+    {
+        std::string err;
+        const LogLut *lut = get_log_lut(source_bits, target_bits, err);
+        if (!lut)
+        {
+            if (first_err.empty())
+                first_err = err;
+            continue;
+        }
+        out << (usable++ ? " | " : "") << lut->params().describe()
+            << " table=" << lut->inverse_size();
+    }
+
+    if (!usable)
+    {
+        std::ostringstream m;
+        m << "no usable CineMate Log spec for target " << target_bits << " bit";
+        if (!first_err.empty())
+            m << " (" << first_err << ")";
+        summary = m.str();
+        return 0;
+    }
+
+    summary = out.str();
+    return usable;
 }
