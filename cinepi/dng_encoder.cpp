@@ -545,6 +545,17 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
         if (src_bits != 16 && src_bits != 12)
             err = "needs a 16- or 12-bit sensor mode (this one is " +
                   std::to_string(src_bits) + "-bit)";
+        /* The source must be LINEAR, and 12-bit ClearHDR is not — it is
+         * CCMP-companded on-sensor. See log_source_is_companded(): no other
+         * guard here can see this, including the black-level one, because CCMP
+         * leaves the pedestal alone and only bends the transfer above its first
+         * knee. Refuse UNTIL the decompand runs first; this guard is meant to be
+         * replaced by that precomposition, not deleted. */
+        else if (log_source_is_companded(src_bits, options_->hdr))
+            err = "12-bit ClearHDR is CCMP-companded on-sensor and log-encoding "
+                  "it would compand twice. Unsupported until the CCMP decompand "
+                  "runs first — after which the source domain is 16-bit and the "
+                  "spec is 16to10, never 12to10. Recording linear 12-bit instead";
         /* Which row shapes: only the ones the loop in dng_save() can normalise
          * to right-justified src_bits, and nothing else. */
         else if (bf.compressed && src_bits != 16)

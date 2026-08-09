@@ -647,6 +647,44 @@ static void test_black_level_guard()
     }
 }
 
+// ── TIER 3c: is the SOURCE already companded? ────────────────────────────────
+//
+// The guard the black-level one cannot be. In 12-bit ClearHDR the imx585
+// companands on-sensor (CCMP), so log-encoding compands twice — but CCMP is the
+// IDENTITY below its first knee and black sits well inside that segment, so the
+// pedestal is untouched and every level-based check reads clean. Pinned here
+// because the failure is silent in exactly the place the other guards look.
+static void test_companded_source_guard()
+{
+    std::printf("test_companded_source_guard\n");
+
+    // The combination that must be refused, and only it.
+    CHECK(log_source_is_companded(12, "sensor"), "12-bit + ClearHDR is refused");
+    CHECK(log_source_is_companded(12, "auto"), "12-bit + auto ClearHDR is refused");
+
+    // 16-bit ClearHDR is delivered LINEAR — no compander in the path. Refusing
+    // it would disable the one combination the log branch exists to serve.
+    CHECK(!log_source_is_companded(16, "sensor"), "16-bit ClearHDR is still allowed");
+    CHECK(!log_source_is_companded(16, "auto"), "16-bit auto ClearHDR is still allowed");
+
+    // A 12-bit SDR mode never companded either; gating on depth alone would
+    // refuse it for no reason.
+    for (const char *h : { "off", "", "single-exp" })
+        CHECK(!log_source_is_companded(12, h), "12-bit without ClearHDR is still allowed");
+
+    // WHY NO OTHER GUARD SEES IT. The reported black scales to exactly the
+    // spec's, so worst_off is 0 and the black-level guard passes — correctly,
+    // because there is no black-level discrepancy. Derived here rather than
+    // asserted, so the two guards stay honest about their division of labour.
+    const LogLutParams &p12 = kCases[2].p;                 // 12to10, black 200
+    const int scaled = log_lut_scale_black(p12, 3200.f);   // imx585 reports 3200
+    CHECK(scaled == p12.black_level,
+          "the companded source's black scales to the spec's black EXACTLY");
+    CHECK(std::fabs(static_cast<float>(scaled - p12.black_level))
+              <= log_lut_black_tolerance(p12),
+          "so the black-level guard passes and cannot catch this");
+}
+
 // ── TIER 4: params validation ────────────────────────────────────────────────
 static void test_validation()
 {
@@ -705,6 +743,7 @@ int main()
     test_golden(kCases[2], kFwd12to10, kInv12to10, 10);
 
     test_black_level_guard();
+    test_companded_source_guard();
     test_validation();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);

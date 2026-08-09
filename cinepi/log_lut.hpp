@@ -112,6 +112,39 @@ inline int log_lut_scale_black(const LogLutParams &p, float reported_16bit)
     return static_cast<int>(reported_16bit * src_white / 65535.f + 0.5f);
 }
 
+/* ── is this SOURCE already companded? ──────────────────────────────────────
+ *
+ * Log encoding assumes its input is LINEAR. In 12-bit ClearHDR it is not: the
+ * imx585 companands on-sensor, mapping the 16-bit ClearHDR signal through a
+ * three-segment piecewise-linear curve (CCMP) and storing 12-bit codes. Feeding
+ * those to the mu-law curve compands twice and writes a mu-law
+ * LinearizationTable over the result claiming linear input.
+ *
+ * ** NOTHING ELSE IN THE SCOPE CHAIN CATCHES THIS, AND THE BLACK-LEVEL GUARD
+ * CANNOT. ** CCMP is the identity below its first knee — stored code 700 at
+ * full res, 325 binned — and black sits at 200, well inside that segment. So
+ * the pedestal is genuinely untouched by the compander: the sensor reports 3200
+ * in the 16-bit domain, log_lut_scale_black() correctly scales it to exactly
+ * the 200 the 12to10 spec expects, and worst_off is 0. The guard is right;
+ * there is no black-level discrepancy to find. (A companded black of ~542 was
+ * derived in an early doc and is FALSIFIED — measured 201.4 on mode 2 and 198.7
+ * on mode 3, on a clean lens-cap set.) The defect is entirely in the transfer
+ * ABOVE the knee, so only an explicit HDR-aware test can see it.
+ *
+ * ** TEMPORARY, AND WRITTEN TO BE REPLACED RATHER THAN DELETED. ** Once the
+ * CCMP decompand runs first the combination becomes legal by precomposition —
+ * and the source domain after decompand is SIXTEEN-bit, so it uses the 16to10
+ * spec, never 12to10. Reaching for 12to10 because the file is 12-bit is the
+ * same double-compand hazard in a second form. Deleting this guard without
+ * adding that precomposition reintroduces the original bug. */
+inline bool log_source_is_companded(int source_bits, const std::string &hdr)
+{
+    /* The sensor-side ClearHDR modes, matching how the controller tests it.
+     * "off"/"" and the ISP-side modes never reach the CCMP compander. */
+    const bool clear_hdr = (hdr == "sensor" || hdr == "auto");
+    return clear_hdr && source_bits == 12;
+}
+
 /* How far the reported black may sit from the spec's before it matters: one
  * footroom code (foot/F). Below that the toe is misplaced by less than the
  * quantisation it controls, which also absorbs per-channel jitter. */
