@@ -8,6 +8,7 @@
 #ifndef CINEPI_RECORDER_HPP
 #define CINEPI_RECORDER_HPP
 
+#include <cmath>
 #include <optional>
 
 #include "core/rpicam_app.hpp"
@@ -109,6 +110,31 @@ public:
 	
 	DngEncoder *GetEncoder() { return encoder_.get(); }
 	void StopEncoder() { encoder_.reset(); }
+
+	/* Pixels summed per output sample for the current sensor mode: 1 at full
+	 * res, 4 for 2x2 binning. Derived from the sensor's own active area rather
+	 * than a resolution literal, so it follows the sensor rather than a table
+	 * of magic sizes — the CCMP decompand table is selected on this, and
+	 * selecting on a resolution string is one of the ways to get it backwards.
+	 *
+	 * Rounded per axis, which absorbs a mode that crops slightly inside the
+	 * array (3856/3840 -> 1, 3856/1920 -> 2). Returns 0 when the sensor does
+	 * not report an active area or the mode is empty; callers treat 0 as
+	 * "unknown" and fall through to the linear path. */
+	double SensorBinning(const Mode &mode) const
+	{
+		if (!camera_ || !mode.width || !mode.height)
+			return 0.0;
+		auto area = camera_->properties().get(libcamera::properties::PixelArrayActiveAreas);
+		if (!area || area->empty())
+			return 0.0;
+		const libcamera::Size active = (*area)[0].size();
+		const double h = std::round(static_cast<double>(active.width) / mode.width);
+		const double v = std::round(static_cast<double>(active.height) / mode.height);
+		if (h < 1.0 || v < 1.0)
+			return 0.0;
+		return h * v;
+	}
 
 protected:
 	virtual void createEncoder()

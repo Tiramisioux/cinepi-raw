@@ -24,6 +24,7 @@ endif
 sources = [
   'cinepi_raw.cpp',
   'dng_encoder.cpp',
+  'ccmp_lut.cpp',
   'sharedContextStage.cpp',
   'mjpegPreviewStage.cpp',
   'dualHdmiPreviewStage.cpp',
@@ -92,3 +93,14 @@ log_encode_arg_test = executable('log_encode_arg_test',
            include_directories : [include_directories('..')],
            install : false)
 test('log_encode_arg', log_encode_arg_test)
+
+# Unit tests for the CCMP12 decompand curve. No libcamera deps — it includes only
+# cinepi/ccmp_lut.hpp. The test compares the built table against the golden ones
+# emitted by innomaker585/ccmp12-lut/tools/ccmp_decode.py, so it needs their path
+# at compile time. Run with `meson test`.
+ccmp_lut_test = executable('ccmp_lut_test',
+           '../tests/ccmp_lut_test.cpp',
+           include_directories : [include_directories('..')],
+           cpp_args : ['-DCCMP_GOLDEN_DIR="' + meson.current_source_dir() / '../resources/ccmp_luts' + '"'],
+           install : false)
+test('ccmp_lut', ccmp_lut_test)

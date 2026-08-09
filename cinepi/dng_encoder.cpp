@@ -505,6 +505,58 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
         dng_info.white = (1u << 12) - 1u;
     }
 
+    /* ──  CCMP12 decompand  ───────────────────────────────────────
+     * In 12-bit ClearHDR the imx585 companands on-sensor: the 16-bit ClearHDR
+     * signal goes through a three-segment piecewise-linear curve and 12-bit
+     * codes come out. Written to a DNG as if they were linear those codes
+     * render with the mid-tones crushed magenta — the highlights white-balance
+     * and nothing below them does, because the defect is the transfer curve and
+     * not the gains. A LinearizationTable undoes it inside the file, so a
+     * converter sees linear data and no post step is needed.
+     *
+     * Scope is exactly the two measured modes: ClearHDR ON **and** a 12-bit
+     * sensor mode. 16-bit ClearHDR (modes 4/5) is delivered linear with no
+     * compander in the path, and a 12-bit SDR mode never companded either —
+     * gating on bit depth alone would decompand data that was never companded,
+     * which is the same defect with the sign flipped.
+     *
+     * dng_info.white becomes the table's OUTPUT white level: under a
+     * LinearizationTable a reader applies the curve BEFORE reading the level
+     * tags, so both describe the table's output domain and not the stored
+     * codes. BlackLevel is handled in dng_save(), where the curve is the
+     * authority and the usual metadata rescale must not run.
+     *
+     * FIRST, because decompanding is what makes the data linear and the log
+     * curve below assumes linear input. Today they are mutually exclusive (the
+     * log scope chain refuses a companded source); when P3 precomposes them it
+     * is this order the composition has to follow.
+     *
+     * Anything unmeasured falls through to the ordinary linear path rather than
+     * emitting a mislabelled file. */
+    ccmp_lut_ = nullptr;
+    if (options_ && (options_->hdr == "sensor" || options_->hdr == "auto") &&
+        sensor_mode_bit_depth_ == 12)
+    {
+        std::string err;
+        const CcmpLut *lut = get_ccmp_lut(sensor_binning_, err);
+        if (lut)
+        {
+            ccmp_lut_ = lut;
+            dng_info.bits  = 12;
+            dng_info.white = static_cast<uint32_t>(lut->white_level());
+            console->info("{}  LinearizationTable {} entries, BlackLevel {} WhiteLevel {}",
+                          lut->params().describe(), lut->size(),
+                          lut->black_level(), lut->white_level());
+        }
+        else
+        {
+            /* Loud, because the alternative is a silently magenta take. */
+            console->warn("12-bit ClearHDR without a CCMP decompand table: {}. "
+                          "Writing linear 12-bit codes — the mid-tones will render "
+                          "magenta and no post step recovers them cleanly.", err);
+        }
+    }
+
     /* ──  CineMate Log  ───────────────────────────────────────
      * Resolve the curve here, the one place that knows both depths, and let
      * everything downstream key off log_lut_. dng_info.bits/white feed four
@@ -658,6 +710,32 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
         }
         else
             console->warn("CineMate Log off for this mode: {}", err);
+    }
+
+    /* ──  ONE TAG, ONE TABLE  ─────────────────────────────────────
+     * Both paths write tag 0xC618 and a DNG has exactly one of it, so at most
+     * one may be live. They are mutually exclusive by construction — CCMP
+     * engages only on 12-bit ClearHDR and log_source_is_companded() refuses
+     * exactly that — which makes this unreachable today. It is here because it
+     * is the invariant P3 changes: precomposition makes both legal at once, and
+     * at that point the file must carry the COMPOSED curve, not whichever block
+     * ran last.
+     *
+     * Resolution keeps CCMP, because it is the one the sensor data actually
+     * requires; the log path is the opt-in. Restoring write12bit_ matters —
+     * the log block clears it to take over the row conversion, and the CCMP
+     * path still needs the ordinary 16-container-to-12 packing. */
+    if (ccmp_lut_ && log_lut_)
+    {
+        console->error("both a CCMP decompand and a CineMate Log table resolved for "
+                       "one file; only one LinearizationTable can be written. Keeping "
+                       "the CCMP decompand and disabling log for this mode — this is a "
+                       "bug unless P3 precomposition has landed.");
+        log_lut_       = nullptr;
+        log_src_shift_ = 0;
+        write12bit_    = (bf.bits == 16) && sensor_mode_bit_depth_ != 16;
+        dng_info.bits  = 12;
+        dng_info.white = static_cast<uint32_t>(ccmp_lut_->white_level());
     }
 
     /* ──  White-balance gains & CCM  ──────────────────────────── */
@@ -964,26 +1042,42 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     /* ──  3.  Per-channel black-level  ────────────────────────── */
     uint16_t black[4] {};
     auto ord = bayer_format.order;
-    if (log_lut_)
+    /* WHICHEVER TABLE IS LIVE OWNS THIS TAG. Under a LinearizationTable a reader
+     * applies the curve BEFORE reading BlackLevel, so the tag describes the
+     * table's OUTPUT and the curve — not the metadata — is the authority. Both
+     * branches below also cover the 4096-pedestal fallback further down, which
+     * is a LINEAR-path assumption and wrong under either table. Ordered CCMP
+     * first to match the one-tag-one-table resolution in setup_encoder(). */
+    if (ccmp_lut_)
     {
-        /* Under a LinearizationTable a reader applies the curve BEFORE reading
-         * this tag, so BlackLevel describes the table's OUTPUT — and that output
-         * has exactly one black point: inverse[F] == lp.black_level, by
-         * construction (log_decode_level(F) is BL + 0; asserted for all three
-         * shipped curves in tests/log_lut_test.cpp).
+        /* The decompand's output has one black point: the pedestal the curve was
+         * measured against. The rescale below would be actively wrong —
+         * SensorBlackLevels reports 3200 in the 16-bit domain, and
+         * 3200 * 63265/65535 is 3089 where the curve says 200. It would also
+         * claim a per-channel pedestal the table has already flattened: the
+         * decompand is per stored code and knows nothing about which CFA phase
+         * it came from, so all four channels pass through the same map. */
+        const uint16_t bl = static_cast<uint16_t>(ccmp_lut_->black_level());
+        std::fill(std::begin(black), std::end(black), bl);
+    }
+    else if (log_lut_)
+    {
+        /* The log curve's output has exactly one black point too:
+         * inverse[F] == lp.black_level, by construction (log_decode_level(F) is
+         * BL + 0; asserted for all three shipped curves in
+         * tests/log_lut_test.cpp).
          *
-         * So the curve is the authority here, not the metadata. The reported
-         * per-channel levels do not survive the encode — all four CFA channels
-         * pass through the same single-channel map — and writing them would
-         * claim a per-channel pedestal the table has already flattened, up to
-         * the one footroom code of slack setup_encoder() allows. That is exactly
-         * the shadow range the footroom exists to preserve.
+         * The reported per-channel levels do not survive the encode — all four
+         * CFA channels pass through the same single-channel map — and writing
+         * them would claim a per-channel pedestal the table has already
+         * flattened, up to the one footroom code of slack setup_encoder()
+         * allows. That is exactly the shadow range the footroom exists to
+         * preserve.
          *
          * It is also the only right answer if SensorBlackLevels goes missing:
-         * the 4096-pedestal fallback below is a LINEAR-path assumption and would
-         * write 4096 (16->*) or 256 (12->10) where the curve says 3200 or 200.
-         * setup_encoder() now refuses the log path in that case, so this is
-         * belt-and-braces rather than the only guard. */
+         * the fallback would write 4096 (16->*) or 256 (12->10) where the curve
+         * says 3200 or 200. setup_encoder() now refuses the log path in that
+         * case, so this is belt-and-braces rather than the only guard. */
         std::fill(std::begin(black), std::end(black),
                   static_cast<uint16_t>(log_lut_->params().black_level));
     }
@@ -1049,12 +1143,20 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     uint16_t white16 = static_cast<uint16_t>(dng_info.white);
     ifd.addEntry(0xC61D, TIFF_SHORT, 1, &white16);
 
-    /* LinearizationTable — log only. The inverse table IS the tag's SHORT
-     * payload, no conversion. It is what puts the two levels above into the
-     * right domain: a reader applies this table first, so BlackLevel/WhiteLevel
-     * describe its OUTPUT (linear), not the stored codes. Tag order does not
-     * matter here, sortEntries() below puts the directory in ascending order. */
-    if (log_lut_)
+    /* LinearizationTable — the CCMP decompand, or the log curve, or neither.
+     * Either table IS the tag's SHORT payload, no conversion. It is what puts
+     * the two levels above into the right domain: a reader applies this table
+     * first, so BlackLevel/WhiteLevel describe its OUTPUT (linear), not the
+     * stored codes. Tag order does not matter, sortEntries() below puts the
+     * directory in ascending order.
+     *
+     * A DNG has ONE of this tag, so this chain must stay an if/else and must
+     * stay in the same order as the black-level chain above and the resolution
+     * in setup_encoder(). P3 replaces both arms with the composed curve. */
+    if (ccmp_lut_)
+        ifd.addEntry(0xC618, TIFF_SHORT,
+                     static_cast<uint32_t>(ccmp_lut_->size()), ccmp_lut_->table());
+    else if (log_lut_)
         ifd.addEntry(0xC618, TIFF_SHORT,
                      static_cast<uint32_t>(log_lut_->inverse_size()), log_lut_->inverse());
 

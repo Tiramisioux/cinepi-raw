@@ -129,6 +129,9 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			// 16-bit keep-full-depth decision; options->mode itself stays
 			// redis-mutable and must not be read at setup_encoder time.
 			app.GetEncoder()->setSensorModeBitDepth(options->mode.bit_depth);
+			// Same snapshot, same reason: the CCMP decompand table is selected
+			// on the mode's BINNING, and options->mode is redis-mutable too.
+			app.GetEncoder()->setSensorBinning(app.SensorBinning(options->mode));
 			app.GetEncoder()->reset_encoder();
 			controller.process_stream_info(cfg);
 
