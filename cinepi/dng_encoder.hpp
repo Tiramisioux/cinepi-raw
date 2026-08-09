@@ -18,7 +18,8 @@
 
 #include "encoder/encoder.hpp"
 #include "raw_options.hpp"
-#include "cinepi_frameinfo.hpp"	
+#include "cinepi_frameinfo.hpp"
+#include "ccmp_lut.hpp"
 
 
 class DngEncoder : public Encoder
@@ -36,6 +37,17 @@ public:
 	 * of reading options_->mode.bit_depth live, which the redis subscriber
 	 * thread mutates (a stale value could leak into a mid-reconfigure take). */
 	void setSensorModeBitDepth(unsigned int bits) { sensor_mode_bit_depth_ = bits; }
+
+	/* Pixels summed per output sample — 1 at full res, 4 for 2x2 binning.
+	 * Snapshotted alongside the bit depth above and for the same reason.
+	 *
+	 * This SELECTS THE CCMP DECOMPAND TABLE. The compander's input is the
+	 * binned signal, so the two 12-bit ClearHDR modes put their knees 4x apart
+	 * in the delivered-linear domain and one table cannot serve both. Select on
+	 * binning, never on ClearHDR alone and never on resolution-as-a-string:
+	 * getting it backwards is wrong by 2.6x at knee1 and does not look
+	 * obviously wrong in a render. */
+	void setSensorBinning(double binning) { sensor_binning_ = binning; }
 
 	// Encode the given buffer.
 	void EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us) override;
@@ -205,6 +217,13 @@ private:
 
         bool encoder_initialized_;
         unsigned int sensor_mode_bit_depth_ = 0;
+        double sensor_binning_ = 0.0;
+
+        /* The CCMP decompand table for this configuration, or nullptr when the
+         * mode is not 12-bit ClearHDR. Owned by the process-wide cache in
+         * ccmp_lut.cpp, so this is a borrowed pointer and stays valid. Resolved
+         * once in setup_encoder; everything downstream keys off it. */
+        const CcmpLut *ccmp_lut_ = nullptr;
 	struct DngInfo
 {
 	uint8_t bits;

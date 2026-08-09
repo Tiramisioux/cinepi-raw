@@ -513,6 +513,53 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
         dng_info.white = (1u << 12) - 1u;
     }
 
+    /* ──  CCMP12 decompand  ───────────────────────────────────────
+     * In 12-bit ClearHDR the imx585 companands on-sensor: the 16-bit ClearHDR
+     * signal goes through a three-segment piecewise-linear curve and 12-bit
+     * codes come out. Written to a DNG as if they were linear those codes
+     * render with the mid-tones crushed magenta — the highlights white-balance
+     * and nothing below them does, because the defect is the transfer curve and
+     * not the gains. A LinearizationTable undoes it inside the file, so a
+     * converter sees linear data and no post step is needed.
+     *
+     * Scope is exactly the two measured modes: ClearHDR ON **and** a 12-bit
+     * sensor mode. 16-bit ClearHDR (modes 4/5) is delivered linear with no
+     * compander in the path, and a 12-bit SDR mode never companded either —
+     * gating on bit depth alone would decompand data that was never companded,
+     * which is the same defect with the sign flipped.
+     *
+     * dng_info.white becomes the table's OUTPUT white level: under a
+     * LinearizationTable a reader applies the curve BEFORE reading the level
+     * tags, so both describe the table's output domain and not the stored
+     * codes. BlackLevel is handled in dng_save(), where the curve is the
+     * authority and the usual metadata rescale must not run.
+     *
+     * Anything unmeasured falls through to the ordinary linear path rather than
+     * emitting a mislabelled file. */
+    ccmp_lut_ = nullptr;
+    if (options_ && (options_->hdr == "sensor" || options_->hdr == "auto") &&
+        sensor_mode_bit_depth_ == 12)
+    {
+        std::string err;
+        const CcmpLut *lut = get_ccmp_lut(sensor_binning_, err);
+        if (lut)
+        {
+            ccmp_lut_ = lut;
+            dng_info.bits  = 12;
+            dng_info.white = static_cast<uint32_t>(lut->white_level());
+            console->info("{}  LinearizationTable {} entries, BlackLevel {} WhiteLevel {}",
+                          lut->params().describe(), lut->size(),
+                          lut->black_level(), lut->white_level());
+        }
+        else
+        {
+            /* Loud, because the alternative is a silently magenta take. */
+            console->warn("12-bit ClearHDR without a CCMP decompand table: {}. "
+                          "Writing linear 12-bit codes — the mid-tones will render "
+                          "magenta and no post step recovers them cleanly.", err);
+        }
+    }
+
     /* ──  White-balance gains & CCM  ──────────────────────────── */
     std::fill(std::begin(dng_info.NEUTRAL), std::end(dng_info.NEUTRAL), 1.f);
     Matrix wb(1, 1, 1);
@@ -754,7 +801,26 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     /* ──  3.  Per-channel black-level  ────────────────────────── */
     uint16_t black[4] {};
     auto ord = bayer_format.order;
-    if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
+    if (ccmp_lut_)
+    {
+        /* Under a LinearizationTable a reader applies the curve BEFORE reading
+         * this tag, so BlackLevel describes the table's OUTPUT — and that output
+         * has exactly one black point, the pedestal the curve was measured
+         * against. THE CURVE IS THE AUTHORITY HERE, NOT THE METADATA.
+         *
+         * The rescale below would be actively wrong: SensorBlackLevels reports
+         * 3200 in the 16-bit domain, and 3200 * 63265/65535 is 3089 where the
+         * curve says 200. It would also claim a per-channel pedestal that the
+         * table has already flattened — the decompand is per stored code and
+         * knows nothing about which CFA phase it came from, so all four channels
+         * pass through the same single-channel map.
+         *
+         * The 4096 fallback is a linear-path assumption and is wrong here for
+         * the same reason, which is why this branch comes first and covers both. */
+        const uint16_t bl = static_cast<uint16_t>(ccmp_lut_->black_level());
+        std::fill(std::begin(black), std::end(black), bl);
+    }
+    else if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
     {
         for (int i = 0; i < 4; ++i)
         {
@@ -815,6 +881,16 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(0xC61A, TIFF_RATIONAL, 4, blackRat);
     uint16_t white16 = static_cast<uint16_t>(dng_info.white);
     ifd.addEntry(0xC61D, TIFF_SHORT, 1, &white16);
+
+    /* LinearizationTable — 12-bit ClearHDR only. The decompand table IS the
+     * tag's SHORT payload, no conversion. It is what puts the two levels above
+     * into the right domain: a reader applies this table first, so
+     * BlackLevel/WhiteLevel describe its OUTPUT (linear), not the stored codes.
+     * Tag order does not matter, sortEntries() below puts the directory in
+     * ascending order. */
+    if (ccmp_lut_)
+        ifd.addEntry(0xC618, TIFF_SHORT,
+                     static_cast<uint32_t>(ccmp_lut_->size()), ccmp_lut_->table());
 
     /* colour matrices */
     ifd.addEntry(0xC621, TIFF_SRATIONAL, 9, matrixXY);   /* ColorMatrix1 */
