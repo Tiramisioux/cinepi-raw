@@ -186,6 +186,12 @@ public:
 protected:
 	std::unique_ptr<Options> options_;
 
+	// The camera this app has open, for subclasses that need to read sensor
+	// properties off it. camera_ itself stays private so that opening, closing
+	// and acquiring it remain RPiCamApp's business alone. Null before
+	// OpenCamera() and after CloseCamera().
+	std::shared_ptr<Camera> const &GetCamera() const { return camera_; }
+
 private:
 	template <typename T>
 	class MessageQueue

@@ -123,9 +123,10 @@ public:
 	 * "unknown" and fall through to the linear path. */
 	double SensorBinning(const Mode &mode) const
 	{
-		if (!camera_ || !mode.width || !mode.height)
+		std::shared_ptr<libcamera::Camera> const &camera = GetCamera();
+		if (!camera || !mode.width || !mode.height)
 			return 0.0;
-		auto area = camera_->properties().get(libcamera::properties::PixelArrayActiveAreas);
+		auto area = camera->properties().get(libcamera::properties::PixelArrayActiveAreas);
 		if (!area || area->empty())
 			return 0.0;
 		const libcamera::Size active = (*area)[0].size();
