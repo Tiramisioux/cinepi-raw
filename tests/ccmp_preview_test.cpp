@@ -246,6 +246,39 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
     }
     std::cout << "     worst chroma departure " << worst << "/128 at L=" << worst_at << "\n";
 
+    /* ── the clipped-channel cast ────────────────────────────────────────────
+     *
+     * Observed on hardware after the decompand landed: mid-tones neutral,
+     * overexposed highlights still magenta. Green clips at code 4095 first
+     * because it carries the most light, red and blue keep rising, and the
+     * gains then push them past a green that cannot move.
+     *
+     * Drive a NEUTRAL subject well past green's clip and require the result to
+     * stay neutral. Without desaturateHighlight() this is strongly magenta —
+     * asserted below by turning the correction off, so the test carries its own
+     * proof that it is testing something. */
+    {
+        /* Green clips at L = white; 4x past it puts red under its own clip and
+         * blue near it, which is the middle of the magenta zone. */
+        const double L_clip = static_cast<double>(lut.white_level()) - lut.black_level();
+        const std::vector<uint8_t> raw = make_frame(geom, neutral_patch(L_clip * 4.0), params);
+
+        bool f = false;
+        const Yuv on = render_flat(r, raw, f);
+        check(std::abs(on.u - 128) <= kChromaTol && std::abs(on.v - 128) <= kChromaTol,
+              "a blown neutral highlight stays neutral",
+              "U=" + std::to_string(on.u) + " V=" + std::to_string(on.v) + " Y=" + std::to_string(on.y));
+        check(on.y >= 235, "and reads as white", "Y=" + std::to_string(on.y));
+
+        CcmpPreviewColour off = colour;
+        off.highlight_rolloff = 0.0;
+        r.setColour(off);
+        const Yuv bad = render_flat(r, raw, f);
+        check(std::abs(bad.v - 128) > 3 * kChromaTol, "and is magenta without the correction",
+              "U=" + std::to_string(bad.u) + " V=" + std::to_string(bad.v));
+        r.setColour(colour);
+    }
+
     /* Black in, black out. The table's output carries the +200 pedestal and the
      * renderer has to take it off; if it does not, the blacks lift AND the gains
      * scale a constant, which is a cast in the shadows. */

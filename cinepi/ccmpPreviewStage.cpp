@@ -121,6 +121,8 @@ public:
 	{
 		colour_.exposure = params.get<double>("exposure", colour_.exposure);
 		colour_.gamma = params.get<double>("gamma", colour_.gamma);
+		/* 0 puts the clipped-channel magenta back, which is the A/B. */
+		colour_.highlight_rolloff = params.get<double>("highlightRolloff", colour_.highlight_rolloff);
 	}
 
 	void Configure() override;
@@ -229,10 +231,11 @@ void ccmpPreviewStage::Configure()
 	lores_bytes_ = static_cast<size_t>(lores_info.stride) * lores_info.height * 3 / 2;
 	enabled_ = true;
 
-	console->info("ccmpPreview: {} -> {}x{} preview, b={}, exposure {:.2f} gamma {:.2f} {}",
+	console->info("ccmpPreview: {} -> {}x{} preview, b={}, exposure {:.2f} gamma {:.2f} "
+				  "highlightRolloff {:.3f} {}",
 				  lut->params().describe(), geom.out_width, geom.out_height,
 				  static_cast<long long>(binning), colour_.exposure, colour_.gamma,
-				  colour_.rec709 ? "Rec709" : "Rec601");
+				  colour_.highlight_rolloff, colour_.rec709 ? "Rec709" : "Rec601");
 }
 
 bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)

@@ -127,6 +127,13 @@ struct CcmpPreviewColour
     double exposure = 1.0;
     double gamma = 2.2;
 
+    /* The top fraction of RAW full scale over which a pixel ramps to fully
+     * desaturated — see desaturateHighlight(). 0.02 means the correction is
+     * inert until a channel is within 2% of the clip code. Widen it for a
+     * softer approach to white; 0 disables the correction and puts the
+     * clipped-channel magenta back. */
+    double highlight_rolloff = 0.02;
+
     /* Which YUV matrix the display expects. The caller reads it off the lores
      * stream's ColorSpace rather than assuming; getting it wrong is a small but
      * real hue shift, and a preview that exists to judge colour should not have
@@ -223,6 +230,20 @@ public:
                 gamma_[i] = static_cast<float>(std::pow(x, 1.0 / g));
             }
             gamma_built_ = g;
+        }
+
+        /* 0 disables the correction: it makes the blend factor identically 0,
+         * so the inner loop needs no special case and the A/B against the
+         * uncorrected render is one number in the post-process file. */
+        if (colour.highlight_rolloff > 1e-6)
+        {
+            hl_lo_ = static_cast<float>(1.0 - colour.highlight_rolloff);
+            hl_scale_ = static_cast<float>(1.0 / colour.highlight_rolloff);
+        }
+        else
+        {
+            hl_lo_ = 1.f;
+            hl_scale_ = 0.f;
         }
 
         if (colour.rec709)
@@ -337,11 +358,63 @@ private:
         if (green > 1)
             cam[CCMP_PREVIEW_G] /= static_cast<float>(green);
 
+        /* How close the most-exposed channel is to the sensor's clip, measured
+         * BEFORE the gains and the matrix — see desaturateHighlight() for why
+         * it cannot be measured after them. */
+        const float peak = std::max(std::max(s[0], s[1]), std::max(s[2], s[3]));
+
+        float lin[3];
         for (int row = 0; row < 3; ++row)
-        {
-            const float lin = m_[row * 3 + 0] * cam[0] + m_[row * 3 + 1] * cam[1] + m_[row * 3 + 2] * cam[2];
-            out[row] = gammaEncode(lin);
-        }
+            lin[row] = m_[row * 3 + 0] * cam[0] + m_[row * 3 + 1] * cam[1] + m_[row * 3 + 2] * cam[2];
+
+        desaturateHighlight(lin, peak);
+
+        for (int row = 0; row < 3; ++row)
+            out[row] = gammaEncode(lin[row]);
+    }
+
+    /* ── the clipped-channel cast ─────────────────────────────────────────────
+     *
+     * The decompand fixes the transfer, but it cannot un-clip. For a NEUTRAL
+     * highlight the three channels reach code 4095 at different scene levels,
+     * because green carries the most light: green pins first, red and blue keep
+     * rising, and the gains then multiply an R and a B that are still moving
+     * against a G that is not. R and B overshoot G and the blown area goes
+     * magenta — the same hue as the original defect, from a different cause, and
+     * it survives the decompand untouched.
+     *
+     * The zone runs from where G clips to where R clips, about 1.3 stops at the
+     * shipping gains.
+     *
+     * ** THE TRIGGER IS RAW SATURATION, AND IT CANNOT BE ANYTHING ELSE. ** The
+     * tempting test is "did any channel come out of the matrix above 1", since
+     * that is true throughout the zone. It is also true of a SATURATED COLOUR
+     * THAT NEVER CLIPPED: a pure red at 79% of raw full scale leaves the 2.5x
+     * gain and the CCM's 1.9 diagonal at 1.5, and testing the output would
+     * render a bright red practical as white. Clipping is a property of the
+     * sensor, so it has to be read where the sensor wrote it — `peak` is the
+     * largest of the quad's four samples in the table's normalised domain,
+     * taken before the gains and the matrix touch anything.
+     *
+     * Blending toward the maximum drives a blown pixel to neutral, which then
+     * clamps to white. That is what a monitoring image should show: blown reads
+     * as white, not as a colour. A highlight that is genuinely one colour also
+     * whitens once it CLIPS, which is what every raw converter does and is the
+     * accepted trade — past clipping the hue is not measured data. The
+     * distinction this keeps is between clipped and merely bright.
+     *
+     * This is a PREVIEW-only correction. It has no counterpart in the DNG and
+     * must not acquire one: the file's job is to carry what was recorded,
+     * clipped channels included, so a grade can reconstruct them. */
+    void desaturateHighlight(float lin[3], float peak) const
+    {
+        if (peak <= hl_lo_)
+            return;
+
+        const float s = std::min(1.f, (peak - hl_lo_) * hl_scale_);
+        const float mx = std::max(lin[0], std::max(lin[1], lin[2]));
+        for (int i = 0; i < 3; ++i)
+            lin[i] += s * (mx - lin[i]);
     }
 
     float gammaEncode(float lin) const
@@ -393,6 +466,8 @@ private:
     float m_[9] = { 1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f };
     float gamma_[kGammaSize] = {};
     double gamma_built_ = 0.0;   /* 0 = never built, and no valid gamma is 0 */
+    float hl_lo_ = 0.98f;        /* raw level where desaturation starts       */
+    float hl_scale_ = 50.f;      /* 1/highlight_rolloff; 0 = correction off   */
     float y_[3] = {};
     float cb_[3] = {};
     float cr_[3] = {};
