@@ -133,6 +133,14 @@ public:
 	void OpenCamera();
 	void CloseCamera();
 
+	// Insert a post-processing stage at the front of the chain if the
+	// post-process file did not name it. Call after OpenCamera(), which is
+	// where that file is read.
+	void EnsureFirstPostProcessingStage(std::string const &name)
+	{
+		post_processor_.EnsureFirstStage(name);
+	}
+
 	void ConfigureViewfinder();
 	void ConfigureStill(unsigned int flags = FLAG_STILL_NONE);
 	void ConfigureVideo(unsigned int flags = FLAG_VIDEO_NONE, uint8_t thumbnailFactor = 0);

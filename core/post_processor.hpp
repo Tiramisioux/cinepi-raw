@@ -38,6 +38,13 @@ public:
 
 	void Read(std::string const &filename);
 
+	// Put `name` at the front of the chain unless the post-process file already
+	// placed it somewhere. For a stage that corrects the frame other stages then
+	// consume, where being first is a correctness requirement rather than a
+	// preference, and where the file that would otherwise order it is written by
+	// an installer and so cannot be relied on to have been updated.
+	void EnsureFirstStage(std::string const &name);
+
 	void SetCallback(PostProcessorCallback callback);
 
 	void AdjustConfig(std::string const &use_case, StreamConfiguration *config);

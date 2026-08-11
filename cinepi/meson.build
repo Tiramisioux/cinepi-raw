@@ -26,6 +26,7 @@ sources = [
   'dng_encoder.cpp',
   'ccmp_lut.cpp',
   'sharedContextStage.cpp',
+  'ccmpPreviewStage.cpp',
   'mjpegPreviewStage.cpp',
   'dualHdmiPreviewStage.cpp',
   'cinepi_controller.cpp',
@@ -104,3 +105,13 @@ ccmp_lut_test = executable('ccmp_lut_test',
            cpp_args : ['-DCCMP_GOLDEN_DIR="' + meson.current_source_dir() / '../resources/ccmp_luts' + '"'],
            install : false)
 test('ccmp_lut', ccmp_lut_test)
+
+# Unit tests for the CCMP12 preview renderer — the raw-Bayer path that keeps the
+# HDMI/MJPEG previews out of the magenta the DNG's LinearizationTable already
+# fixes. No libcamera deps: ccmp_preview.hpp is pure by construction, which is
+# what lets the decompand-before-gains ordering be asserted off-device.
+ccmp_preview_test = executable('ccmp_preview_test',
+           '../tests/ccmp_preview_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('ccmp_preview', ccmp_preview_test)

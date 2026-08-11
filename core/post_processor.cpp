@@ -41,6 +41,31 @@ void PostProcessor::Read(std::string const &filename)
 	}
 }
 
+void PostProcessor::EnsureFirstStage(std::string const &name)
+{
+	// An explicit entry in the post-process file wins, wherever it put the
+	// stage: the file is how the stage is tuned, and silently moving a stage
+	// the user positioned would make that file a lie.
+	for (auto const &stage : stages_)
+	{
+		if (name == stage->Name())
+			return;
+	}
+
+	PostProcessingStage *stage = createPostProcessingStage(name.c_str());
+	if (!stage)
+	{
+		LOG(1, "No post processing stage found for \"" << name << "\"");
+		return;
+	}
+
+	// Defaults only — there is no file entry to read, by definition.
+	boost::property_tree::ptree empty;
+	stage->Read(empty);
+	stages_.insert(stages_.begin(), StagePtr(stage));
+	LOG(1, "Inserted post processing stage \"" << name << "\" at the front of the chain");
+}
+
 PostProcessingStage *PostProcessor::createPostProcessingStage(char const *name)
 {
 	auto it = GetPostProcessingStages().find(std::string(name));

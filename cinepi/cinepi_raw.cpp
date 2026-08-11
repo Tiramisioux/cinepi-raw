@@ -43,6 +43,16 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 	app.SetMetadataReadyCallback(std::bind(&Output::MetadataReady, output.get(), _1));
 
 	app.OpenCamera();
+
+	// 12-bit ClearHDR reaches the ISP still companded, so every preview and the
+	// DNG thumbnail render magenta while the recorded DNG — which carries a
+	// LinearizationTable — does not. ccmpPreview re-renders the lores frame from
+	// the raw Bayer with the decompand applied, and has to run before the stages
+	// that consume that frame. Inserted here rather than left to the
+	// post-process JSON because that file is written by the Cinemate installer,
+	// so an existing Pi would not have the entry. The stage no-ops on every
+	// other sensor mode.
+	app.EnsureFirstPostProcessingStage("ccmpPreview");
         //app.ConfigureViewfinder();
 	app.StartEncoder();
 	std::vector<std::shared_ptr<libcamera::Camera>> cameras = app.GetCameras();
