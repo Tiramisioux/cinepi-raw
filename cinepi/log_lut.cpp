@@ -216,6 +216,62 @@ const LogLut *get_log_lut(int source_bits, int target_bits, std::string &err)
     return &it->second.lut;
 }
 
+namespace
+{
+
+struct ComposedCacheEntry
+{
+    LogLut lut;
+    bool ok = false;
+    std::string err;
+};
+
+std::mutex g_composed_cache_mutex;
+/* std::map, not unordered_map: same reason as g_cache above -- a pointer
+ * handed out earlier must stay valid when a later key is inserted. */
+std::map<std::pair<int, double>, ComposedCacheEntry> g_composed_cache;
+
+} // namespace
+
+const LogLut *get_ccmp_composed_log_lut(int target_bits, double binning, std::string &err)
+{
+    const std::pair<int, double> key(target_bits, binning);
+
+    /* Nests inside get_log_lut()'s and get_ccmp_lut()'s own locks below, never
+     * the reverse, so this cannot deadlock against them. */
+    std::lock_guard<std::mutex> lock(g_composed_cache_mutex);
+
+    auto it = g_composed_cache.find(key);
+    if (it == g_composed_cache.end())
+    {
+        ComposedCacheEntry entry;
+        std::string target_err;
+        const LogLut *target = get_log_lut(16, target_bits, target_err);
+        std::string decompand_err;
+        const CcmpLut *decompand = get_ccmp_lut(binning, decompand_err);
+
+        if (!target)
+            entry.err = "no 16-to-" + std::to_string(target_bits) + " log spec: " + target_err;
+        else if (!decompand)
+            entry.err = "no CCMP decompand for binning " + std::to_string(binning) +
+                        ": " + decompand_err;
+        else if (!entry.lut.build_ccmp_composed(target->params(), *decompand))
+            entry.err = "composed table build failed for target " +
+                        std::to_string(target_bits) + " / binning " + std::to_string(binning);
+        else
+            entry.ok = true;
+
+        it = g_composed_cache.emplace(key, std::move(entry)).first;
+    }
+
+    if (!it->second.ok)
+    {
+        err = it->second.err;
+        return nullptr;
+    }
+    return &it->second.lut;
+}
+
 int preload_log_luts(int target_bits, std::string &summary)
 {
     std::ostringstream out;

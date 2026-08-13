@@ -106,6 +106,19 @@ ccmp_lut_test = executable('ccmp_lut_test',
            install : false)
 test('ccmp_lut', ccmp_lut_test)
 
+# Unit tests for the CCMP12 decompand composed with CineMate Log (12-bit
+# ClearHDR log-encode, P3). No libcamera / jsoncpp deps — it includes only
+# cinepi/log_lut.hpp (which pulls in cinepi/ccmp_lut.hpp). The test compares
+# the composed table against the golden ones emitted by
+# innomaker585/ccmp12-lut/tools/compose_log.py, so it needs their path at
+# compile time. Run with `meson test`.
+ccmp_log_compose_test = executable('ccmp_log_compose_test',
+           '../tests/ccmp_log_compose_test.cpp',
+           include_directories : [include_directories('..')],
+           cpp_args : ['-DCCMP_LOG_GOLDEN_DIR="' + meson.current_source_dir() / '../resources/ccmp_log_luts' + '"'],
+           install : false)
+test('ccmp_log_compose', ccmp_log_compose_test)
+
 # Unit tests for the CCMP12 preview renderer — the raw-Bayer path that keeps the
 # HDMI/MJPEG previews out of the magenta the DNG's LinearizationTable already
 # fixes. No libcamera deps: ccmp_preview.hpp is pure by construction, which is

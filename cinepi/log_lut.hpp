@@ -40,6 +40,8 @@
 #ifndef CINEPI_LOG_LUT_HPP
 #define CINEPI_LOG_LUT_HPP
 
+#include "cinepi/ccmp_lut.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -117,26 +119,30 @@ inline int log_lut_scale_black(const LogLutParams &p, float reported_16bit)
  * Log encoding assumes its input is LINEAR. In 12-bit ClearHDR it is not: the
  * imx585 companands on-sensor, mapping the 16-bit ClearHDR signal through a
  * three-segment piecewise-linear curve (CCMP) and storing 12-bit codes. Feeding
- * those to the mu-law curve compands twice and writes a mu-law
- * LinearizationTable over the result claiming linear input.
+ * those to the mu-law curve directly (as if it were a plain 12-bit linear
+ * source) would compand twice and write a mu-law LinearizationTable over the
+ * result claiming linear input.
  *
  * ** NOTHING ELSE IN THE SCOPE CHAIN CATCHES THIS, AND THE BLACK-LEVEL GUARD
  * CANNOT. ** CCMP is the identity below its first knee — stored code 700 at
  * full res, 325 binned — and black sits at 200, well inside that segment. So
  * the pedestal is genuinely untouched by the compander: the sensor reports 3200
  * in the 16-bit domain, log_lut_scale_black() correctly scales it to exactly
- * the 200 the 12to10 spec expects, and worst_off is 0. The guard is right;
- * there is no black-level discrepancy to find. (A companded black of ~542 was
- * derived in an early doc and is FALSIFIED — measured 201.4 on mode 2 and 198.7
- * on mode 3, on a clean lens-cap set.) The defect is entirely in the transfer
- * ABOVE the knee, so only an explicit HDR-aware test can see it.
+ * the 200 the 12to10 spec expects, and worst_off is 0. The black-level guard is
+ * right; there is no black-level discrepancy to find. (A companded black of
+ * ~542 was derived in an early doc and is FALSIFIED — measured 201.4 on mode 2
+ * and 198.7 on mode 3, on a clean lens-cap set.) The defect is entirely in the
+ * transfer ABOVE the knee, so only an explicit HDR-aware test can see it.
  *
- * ** TEMPORARY, AND WRITTEN TO BE REPLACED RATHER THAN DELETED. ** Once the
- * CCMP decompand runs first the combination becomes legal by precomposition —
- * and the source domain after decompand is SIXTEEN-bit, so it uses the 16to10
- * spec, never 12to10. Reaching for 12to10 because the file is 12-bit is the
- * same double-compand hazard in a second form. Deleting this guard without
- * adding that precomposition reintroduces the original bug. */
+ * This function only ANSWERS the question; it does not by itself refuse
+ * anything. dng_encoder.cpp's setup_encoder() uses it to choose between two
+ * paths: a plain source (get_log_lut(src_bits, target, ...), the ordinary
+ * 12to10/16to10/16to12 specs) or a companded one, which composes instead of
+ * refusing — get_ccmp_composed_log_lut(target, sensor_binning_, ...) decompands
+ * to 16-bit linear FIRST, then applies the 16-to-target curve, so it always
+ * uses 16to10 (today's only composed target), never 12to10. Reaching for
+ * 12to10 because the file is 12-bit is the double-compand hazard in a second
+ * form, and is exactly what get_ccmp_composed_log_lut() exists to avoid. */
 inline bool log_source_is_companded(int source_bits, const std::string &hdr)
 {
     /* The sensor-side ClearHDR modes, matching how the controller tests it.
@@ -228,6 +234,44 @@ public:
         return true;
     }
 
+    /* Compose a CCMP decompand with THIS target log curve, for a companded
+     * 12-bit ClearHDR source (see log_source_is_companded()). Unlike build(),
+     * forward_ is not indexed by a `target.source_bits`-wide linear sample —
+     * it is indexed by the STORED 12-bit CCMP code, decompanded to `target`'s
+     * domain first: forward_[C] = log_encode_code(target.black_level +
+     * ccmp_decode_code(C, decompand.params()), target).
+     *
+     * inverse_/params_ are exactly what build(target) would produce. That is
+     * the point of precomposition: the DNG's LinearizationTable and level
+     * tags describe the LOG curve's own domain unchanged, because after
+     * decompanding that genuinely is the domain the data is in. `target` is
+     * in practice always a 16-bit spec (16to10 or 16to12) — the domain after
+     * decompand — never one keyed on the companded 12-bit source.
+     *
+     * Returns false and leaves the LUT empty if either input is invalid. */
+    bool build_ccmp_composed(const LogLutParams &target, const CcmpLut &decompand)
+    {
+        forward_.clear();
+        inverse_.clear();
+        params_ = LogLutParams{};
+        if (!target.valid() || !decompand.valid())
+            return false;
+        params_ = target;
+
+        forward_.resize(decompand.size());
+        for (size_t c = 0; c < forward_.size(); ++c)
+        {
+            const double L        = ccmp_decode_code(static_cast<double>(c), decompand.params());
+            const double absolute = target.black_level + L;
+            forward_[c]           = static_cast<uint16_t>(log_encode_code(absolute, target));
+        }
+
+        inverse_.resize(static_cast<size_t>(1) << target.target_bits);
+        for (size_t c = 0; c < inverse_.size(); ++c)
+            inverse_[c] = static_cast<uint16_t>(log_decode_level(static_cast<int>(c), target));
+        return true;
+    }
+
     bool valid() const { return !forward_.empty(); }
     const LogLutParams &params() const { return params_; }
 
@@ -306,5 +350,12 @@ const LogLut *get_log_lut(int source_bits, int target_bits, std::string &err);
  * back, for the startup log. Returns the number of usable source depths; on 0,
  * `summary` explains why. */
 int preload_log_luts(int target_bits, std::string &summary);
+
+/* Cached, process-wide, same convention as get_log_lut(): the CCMP decompand
+ * for `binning` composed with the 16-to-`target_bits` log curve (see
+ * LogLut::build_ccmp_composed()). Needs both get_log_lut(16, target_bits, ...)
+ * and get_ccmp_lut(binning, ...) to succeed; nullptr with `err` set otherwise.
+ * A failed build is cached too, like get_log_lut(). Thread-safe. */
+const LogLut *get_ccmp_composed_log_lut(int target_bits, double binning, std::string &err);
 
 #endif /* CINEPI_LOG_LUT_HPP */

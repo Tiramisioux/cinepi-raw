@@ -586,6 +586,15 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
         const int src_bits = static_cast<int>(sensor_mode_bit_depth_);
         unsigned shift     = 0;
 
+        /* The source must be LINEAR, and 12-bit ClearHDR is not — it is
+         * CCMP-companded on-sensor (see log_source_is_companded()). It is
+         * still a valid log source, but only via composition: decompand to
+         * 16-bit linear FIRST, then apply the 16-to-`target` curve, never a
+         * spec keyed on the companded 12-bit domain (there is no such thing
+         * as a linear 12to10 reading of CCMP data). Resolved below, once the
+         * row shape confirms this is a normalisable source at all. */
+        const bool companded = log_source_is_companded(src_bits, options_->hdr);
+
         /* Which curve is keyed on the SENSOR mode depth, not bf.bits. On PiSP
          * every raw stream arrives in a 16-bit container, so a 12-bit mode is
          * SRGGB16 carrying its 12 significant bits MSB-aligned — measured on
@@ -597,19 +606,11 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
         if (src_bits != 16 && src_bits != 12)
             err = "needs a 16- or 12-bit sensor mode (this one is " +
                   std::to_string(src_bits) + "-bit)";
-        /* The source must be LINEAR, and 12-bit ClearHDR is not — it is
-         * CCMP-companded on-sensor. See log_source_is_companded(): no other
-         * guard here can see this, including the black-level one, because CCMP
-         * leaves the pedestal alone and only bends the transfer above its first
-         * knee. Refuse UNTIL the decompand runs first; this guard is meant to be
-         * replaced by that precomposition, not deleted. */
-        else if (log_source_is_companded(src_bits, options_->hdr))
-            err = "12-bit ClearHDR is CCMP-companded on-sensor and log-encoding "
-                  "it would compand twice. Unsupported until the CCMP decompand "
-                  "runs first — after which the source domain is 16-bit and the "
-                  "spec is 16to10, never 12to10. Recording linear 12-bit instead";
         /* Which row shapes: only the ones the loop in dng_save() can normalise
-         * to right-justified src_bits, and nothing else. */
+         * to right-justified src_bits, and nothing else. Companding doesn't
+         * change the wire format, only the code VALUES, so this classification
+         * is identical whether or not `companded` is true — 12-bit ClearHDR
+         * rows are shaped exactly like plain 12-bit SDR rows. */
         else if (bf.compressed && src_bits != 16)
             err = "COMP1 rows decode to a 16-bit domain, not " + std::to_string(src_bits);
         else if (bf.packed && (bf.bits != 12 || src_bits != 12))
@@ -625,7 +626,26 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
                       std::to_string(src_bits) + "-bit domain";
         }
 
-        if (err.empty())
+        /* Composed is keyed on the CCMP decompand for this binning, not on
+         * src_bits/target directly — see get_ccmp_composed_log_lut(). Only
+         * target 10 has a composed spec today (there is no 16to12 composition
+         * wired up); anything else refuses exactly as before P3. */
+        bool composed = false;
+        if (err.empty() && companded)
+        {
+            if (target != 10)
+                err = "12-bit ClearHDR is CCMP-companded on-sensor; only "
+                      "--log-encode 10 composes with the decompand today "
+                      "(target " + std::to_string(target) + " has no composed spec)";
+            else
+            {
+                lut      = get_ccmp_composed_log_lut(target, sensor_binning_, err);
+                composed = (lut != nullptr);
+                if (!lut)
+                    err = "12-bit ClearHDR log-encode needs the CCMP decompand: " + err;
+            }
+        }
+        else if (err.empty())
             lut = get_log_lut(src_bits, target, err);
 
         /* The loaded spec, not the flag, decides the real depths. load_log_lut()
@@ -633,16 +653,19 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
          * cross-checks the depths the file declares against the pair it was
          * asked for — and the row path below only has packers for 12 and 10. So
          * refuse a spec that disagrees, instead of encoding against one domain
-         * and labelling the file with another. */
+         * and labelling the file with another. A composed lut's params() are
+         * the curve AFTER decompand (source_bits 16), not src_bits (12) — that
+         * mismatch is the whole point of composing, not an error to catch. */
         if (lut)
         {
             const LogLutParams &lp = lut->params();
+            const int expected_source_bits = composed ? 16 : src_bits;
             if (lp.target_bits != target)
                 err = "spec targets " + std::to_string(lp.target_bits) +
                       " bit, expected " + std::to_string(target);
-            else if (lp.source_bits != src_bits)
+            else if (lp.source_bits != expected_source_bits)
                 err = "spec sources " + std::to_string(lp.source_bits) +
-                      " bit, expected " + std::to_string(src_bits);
+                      " bit, expected " + std::to_string(expected_source_bits);
             else if (lp.target_bits != 12 && lp.target_bits != 10)
                 err = "no packer for " + std::to_string(lp.target_bits) + "-bit codes";
 
@@ -707,6 +730,13 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
             write12bit_    = false;       /* the log path owns the row conversion */
             dng_info.bits  = lut->params().target_bits;
             dng_info.white = lut->params().white_level;
+            /* Named explicitly so a hardware session can grep for composition the
+             * same way it already greps for the CCMP decompand's own line — the
+             * generic "LinearizationTable N entries" log further down (present
+             * either way) does not by itself say whether CCMP composed into it. */
+            if (composed)
+                console->info("CineMate Log: 12-bit ClearHDR (CCMP) composed with "
+                              "{}", lut->params().describe());
         }
         else
             console->warn("CineMate Log off for this mode: {}", err);
@@ -714,29 +744,22 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
 
     /* ──  ONE TAG, ONE TABLE  ─────────────────────────────────────
      * Both paths write tag 0xC618 and a DNG has exactly one of it, so at most
-     * one may be live. They are mutually exclusive by construction — CCMP
-     * engages only on 12-bit ClearHDR and log_source_is_companded() refuses
-     * exactly that — which makes this unreachable today. It is here because it
-     * is the invariant P3 changes: precomposition makes both legal at once, and
-     * at that point the file must carry the COMPOSED curve, not whichever block
-     * ran last.
-     *
-     * Resolution keeps CCMP, because it is the one the sensor data actually
-     * requires; the log path is the opt-in. Restoring write12bit_ matters —
-     * the log block clears it to take over the row conversion, and the CCMP
-     * path still needs the ordinary 16-container-to-12 packing. */
-    if (ccmp_lut_ && log_lut_)
-    {
-        console->error("both a CCMP decompand and a CineMate Log table resolved for "
-                       "one file; only one LinearizationTable can be written. Keeping "
-                       "the CCMP decompand and disabling log for this mode — this is a "
-                       "bug unless P3 precomposition has landed.");
-        log_lut_       = nullptr;
-        log_src_shift_ = 0;
-        write12bit_    = (bf.bits == 16) && sensor_mode_bit_depth_ != 16;
-        dng_info.bits  = 12;
-        dng_info.white = static_cast<uint32_t>(ccmp_lut_->white_level());
-    }
+     * one may be live. ccmp_lut_ and a non-composed log_lut_ ARE mutually
+     * exclusive by construction: log_source_is_companded() is true under
+     * exactly the same condition (12-bit sensor mode + --hdr sensor/auto) that
+     * resolves ccmp_lut_ above, so whenever both would be non-null the log
+     * block above has already taken the composed branch, never the plain
+     * get_log_lut() one. The one legitimate way to see both non-null at once
+     * is a successfully composed log_lut_ — which already carries the right
+     * dng_info.bits/white/write12bit_ from the assignment above, and the
+     * black-level and tag-emission chains later in this file are ordered LOG
+     * first for exactly this reason. Nothing to resolve here; the check below
+     * is a tripwire in case that invariant is ever broken by a future edit. */
+    if (ccmp_lut_ && log_lut_ && write12bit_)
+        console->error("both a CCMP decompand and a non-composed CineMate Log "
+                       "table resolved for one file with write12bit_ still set — "
+                       "the composed path always clears it. This should be "
+                       "unreachable; investigate before trusting this recording.");
 
     /* ──  White-balance gains & CCM  ──────────────────────────── */
     std::fill(std::begin(dng_info.NEUTRAL), std::end(dng_info.NEUTRAL), 1.f);
@@ -1046,26 +1069,23 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
      * applies the curve BEFORE reading BlackLevel, so the tag describes the
      * table's OUTPUT and the curve — not the metadata — is the authority. Both
      * branches below also cover the 4096-pedestal fallback further down, which
-     * is a LINEAR-path assumption and wrong under either table. Ordered CCMP
-     * first to match the one-tag-one-table resolution in setup_encoder(). */
-    if (ccmp_lut_)
+     * is a LINEAR-path assumption and wrong under either table.
+     *
+     * Ordered LOG first. The two are not independent alternatives: when 12-bit
+     * ClearHDR is log-encoded, log_lut_ is the CCMP decompand COMPOSED with the
+     * log curve (setup_encoder(), get_ccmp_composed_log_lut()) and ccmp_lut_ is
+     * also non-null alongside it — but tag 0xC618 carries the composed curve's
+     * own (unmodified) 16-to-target inverse table, so the tags describing it
+     * must be the LOG curve's, not CCMP's. Log off is the only case ccmp_lut_
+     * is checked at all. */
+    if (log_lut_)
     {
-        /* The decompand's output has one black point: the pedestal the curve was
-         * measured against. The rescale below would be actively wrong —
-         * SensorBlackLevels reports 3200 in the 16-bit domain, and
-         * 3200 * 63265/65535 is 3089 where the curve says 200. It would also
-         * claim a per-channel pedestal the table has already flattened: the
-         * decompand is per stored code and knows nothing about which CFA phase
-         * it came from, so all four channels pass through the same map. */
-        const uint16_t bl = static_cast<uint16_t>(ccmp_lut_->black_level());
-        std::fill(std::begin(black), std::end(black), bl);
-    }
-    else if (log_lut_)
-    {
-        /* The log curve's output has exactly one black point too:
+        /* The log curve's output has exactly one black point:
          * inverse[F] == lp.black_level, by construction (log_decode_level(F) is
          * BL + 0; asserted for all three shipped curves in
-         * tests/log_lut_test.cpp).
+         * tests/log_lut_test.cpp). Composed or not — a composed log_lut_'s
+         * params() are the target curve's own (e.g. 16to10's BL 3200), which is
+         * exactly the domain its embedded table actually decodes to.
          *
          * The reported per-channel levels do not survive the encode — all four
          * CFA channels pass through the same single-channel map — and writing
@@ -1080,6 +1100,18 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
          * case, so this is belt-and-braces rather than the only guard. */
         std::fill(std::begin(black), std::end(black),
                   static_cast<uint16_t>(log_lut_->params().black_level));
+    }
+    else if (ccmp_lut_)
+    {
+        /* The decompand's output has one black point: the pedestal the curve was
+         * measured against. The rescale below would be actively wrong —
+         * SensorBlackLevels reports 3200 in the 16-bit domain, and
+         * 3200 * 63265/65535 is 3089 where the curve says 200. It would also
+         * claim a per-channel pedestal the table has already flattened: the
+         * decompand is per stored code and knows nothing about which CFA phase
+         * it came from, so all four channels pass through the same map. */
+        const uint16_t bl = static_cast<uint16_t>(ccmp_lut_->black_level());
+        std::fill(std::begin(black), std::end(black), bl);
     }
     else if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
     {
@@ -1143,22 +1175,24 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     uint16_t white16 = static_cast<uint16_t>(dng_info.white);
     ifd.addEntry(0xC61D, TIFF_SHORT, 1, &white16);
 
-    /* LinearizationTable — the CCMP decompand, or the log curve, or neither.
-     * Either table IS the tag's SHORT payload, no conversion. It is what puts
-     * the two levels above into the right domain: a reader applies this table
-     * first, so BlackLevel/WhiteLevel describe its OUTPUT (linear), not the
-     * stored codes. Tag order does not matter, sortEntries() below puts the
+    /* LinearizationTable — the log curve (composed with the CCMP decompand
+     * when the source is 12-bit ClearHDR, see setup_encoder()), or the plain
+     * CCMP decompand alone when log is off, or neither. Either table IS the
+     * tag's SHORT payload, no conversion. It is what puts the two levels
+     * above into the right domain: a reader applies this table first, so
+     * BlackLevel/WhiteLevel describe its OUTPUT (linear), not the stored
+     * codes. Tag order does not matter, sortEntries() below puts the
      * directory in ascending order.
      *
      * A DNG has ONE of this tag, so this chain must stay an if/else and must
-     * stay in the same order as the black-level chain above and the resolution
-     * in setup_encoder(). P3 replaces both arms with the composed curve. */
-    if (ccmp_lut_)
-        ifd.addEntry(0xC618, TIFF_SHORT,
-                     static_cast<uint32_t>(ccmp_lut_->size()), ccmp_lut_->table());
-    else if (log_lut_)
+     * stay in the same order as the black-level chain above and the
+     * resolution in setup_encoder() — log first, same reasoning as there. */
+    if (log_lut_)
         ifd.addEntry(0xC618, TIFF_SHORT,
                      static_cast<uint32_t>(log_lut_->inverse_size()), log_lut_->inverse());
+    else if (ccmp_lut_)
+        ifd.addEntry(0xC618, TIFF_SHORT,
+                     static_cast<uint32_t>(ccmp_lut_->size()), ccmp_lut_->table());
 
     /* colour matrices */
     ifd.addEntry(0xC621, TIFF_SRATIONAL, 9, matrixXY);   /* ColorMatrix1 */
