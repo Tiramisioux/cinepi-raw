@@ -175,6 +175,16 @@ CinePiOptions::CinePiOptions()
                 ("same-hdmi",
                         value<bool>()->default_value(false)->implicit_value(true),
                         "Force preview and GUI to share the same HDMI output")
+                ("hdr",
+                        value<std::string>(&hdr)->default_value("off")->implicit_value("auto"),
+                        "Enable High Dynamic Range, where supported: \"off\", \"auto\", \"sensor\", or "
+                        "\"single-exp\" (PiSP single-exposure multiframe HDR).\n"
+                        "On imx585, \"sensor\" (or \"auto\") is ClearHDR: it switches the sensor to its "
+                        "16-bit-linear HDR mode at launch, which is what CineMate's \"set hdr sensor\" "
+                        "enables. It requires a 12-bit camera mode (--mode ...:12:P) -- AE/AWB gate on "
+                        "12-bit sensor stats and stop working above that. Switching --hdr changes the "
+                        "sensor's mode list, so it needs a process restart; the ClearHDR threshold/blend/"
+                        "gain knobs (CineMate's \"set hdr profile\") apply live on top and don't.")
                 ("log-encode",
                         value<int>()->implicit_value(kLogEncodeDefaultBits, "12"),
                         "Log-encode recorded DNGs with CineMate Log at 10 or 12 bit\n"
