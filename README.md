@@ -89,6 +89,12 @@ sudo ldconfig
 ```shell
 git clone https://github.com/Tiramisioux/cinepi-raw.git && cd cinepi-raw && mkdir build && cd build && sudo meson setup && sudo ninja && cd ../.. && sudo meson install -C cinepi-raw/build && sudo ldconfig
 ```
+
+The `-Dtest=false` in the `libcamera` step above is that project's own build option — this
+repo's `meson.build` has no `test` option at all. The `cinepi` unit tests
+(`cinepi/meson.build`) are built unconditionally by the `meson setup && ninja` above like any
+other target; nothing here disables them.
+
 ### for pi 4:
 
 ```shell
