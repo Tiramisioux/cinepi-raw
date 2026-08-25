@@ -1,0 +1,94 @@
+# Everything a pull request can be checked against without a Raspberry Pi.
+#
+# Read-only by design: nothing here publishes, pushes or comments.
+#
+# Why this does not run `meson test`: the project's own meson.build requires
+# libcamera unconditionally, before any subdir is even entered --
+#   libcamera_dep = dependency('libcamera', required : true)   # meson.build:35
+# -- and there is no subprojects/*.wrap to fetch it, so `meson setup` on a
+# plain ubuntu-latest runner aborts at configure time with "Dependency
+# libcamera not found", regardless of which target you actually want to
+# build. Building libcamera from source just to run seven pure-C++ unit
+# tests is the multi-minute Pi-build this workflow exists to avoid.
+#
+# What runs instead: each of the seven cinepi/meson.build test() targets
+# (see lines 66-130) includes exactly one project header plus the C++
+# standard library -- no libcamera, no Redis, no rpicam-apps -- so they are
+# compiled and run directly with g++, bypassing meson setup entirely. This
+# was verified by hand before writing this workflow: all seven build and
+# pass on plain x86-64 Linux with nothing but g++.
+#
+# If meson setup ever stops requiring libcamera unconditionally (or a wrap
+# is added), switch this job back to `meson setup build && meson test -C
+# build --print-errorlogs` -- that stays the project's own, more thorough
+# entry point.
+
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  test:
+    name: unit tests (g++)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Golden-file tests read fixtures relative to CCMP_GOLDEN_DIR /
+      # CCMP_LOG_GOLDEN_DIR. Values taken from cinepi/meson.build (the
+      # `cpp_args` on ccmp_lut_test and ccmp_log_compose_test), not retyped:
+      # meson resolves them relative to cinepi/, i.e. ../resources/ccmp_luts
+      # and ../resources/ccmp_log_luts from that directory -- the same
+      # resources/ccmp_luts and resources/ccmp_log_luts used here from the
+      # repo root.
+      - name: Build and run the seven cinepi unit tests
+        run: |
+          set -euo pipefail
+          fail=0
+
+          build_and_run() {
+            local name="$1"; shift
+            echo "::group::${name}"
+            if g++ -std=c++17 -Wall -Wextra -I. -O1 "$@" \
+                 "tests/${name}_test.cpp" -o "/tmp/${name}_test"; then
+              if ! "/tmp/${name}_test"; then
+                echo "FAIL: ${name} (test run)"
+                fail=1
+              fi
+            else
+              echo "FAIL: ${name} (compile)"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+
+          build_and_run phase_lock_core
+          build_and_run dng_pack
+          build_and_run log_lut
+          build_and_run log_encode_arg
+          build_and_run ccmp_lut \
+            -DCCMP_GOLDEN_DIR="\"${PWD}/resources/ccmp_luts\""
+          build_and_run ccmp_log_compose \
+            -DCCMP_LOG_GOLDEN_DIR="\"${PWD}/resources/ccmp_log_luts\""
+          build_and_run ccmp_preview
+
+          exit "$fail"
+
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          find . -name '*.sh' -not -path './.git/*' -print0 \
+            | xargs -0 shellcheck -f gcc
