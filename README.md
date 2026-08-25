@@ -7,6 +7,21 @@ License
 
 The source code is made available under the simplified [BSD 2-Clause license](https://spdx.org/licenses/BSD-2-Clause.html).
 
+## Tests and CI
+
+`cinepi/meson.build` defines seven pure-C++ unit tests (no libcamera, no Redis, no
+rpicam-apps dependency) — the project's own, most thorough entry point:
+
+```bash
+meson test -C build --print-errorlogs
+```
+
+`.github/workflows/checks.yml` runs on every pull request: since `meson setup` requires
+libcamera unconditionally even to configure, and there's no `subprojects/*.wrap` to fetch it,
+CI instead compiles and runs each of the seven test targets directly with `g++`, bypassing
+meson setup entirely — no Raspberry Pi or libcamera build needed to keep this green. A
+shellcheck job runs alongside it.
+
 # How to install
 
 ## 0 . Prerequisites
@@ -14,7 +29,7 @@ The source code is made available under the simplified [BSD 2-Clause license](ht
 If you run Raspberry Pi OS Lite, begin by installing the following packages:
 
 ```bash
-sudo apt install -y python-pip git python3-jinja2 ffmpeg
+sudo apt install -y python3-pip git python3-jinja2 ffmpeg
 ````
 
 ## Install libcamera
