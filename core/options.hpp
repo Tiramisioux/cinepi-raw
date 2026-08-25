@@ -184,6 +184,10 @@ struct Options
 			 "Height of viewfinder frames from the camera (distinct from the preview window size)")
 			("tuning-file", value<std::string>(&tuning_file)->default_value("-"),
 			 "Name of camera tuning file to use, omit this option for libcamera default behaviour")
+			("max-pixel-rate", value<double>(&max_pixel_rate)->default_value(0.0),
+			 "PiSP pixel-rate ceiling in MPix/s, matching the RP1 clock this board booted with: "
+			 "380 stock, 580 with the rp1-overclock overlay. Omit for the libcamera default. "
+			 "Setting this above what the hardware can drain corrupts wide modes silently")
 			("lores-width", value<unsigned int>(&lores_width)->default_value(0),
 			 "Width of low resolution frames (use 0 to omit low resolution stream")
 			("lores-height", value<unsigned int>(&lores_height)->default_value(0),
@@ -261,6 +265,7 @@ struct Options
 	unsigned int viewfinder_width;
 	unsigned int viewfinder_height;
 	std::string tuning_file;
+	double max_pixel_rate;
 	bool qt_preview;
 	unsigned int lores_width;
 	unsigned int lores_height;

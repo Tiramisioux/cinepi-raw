@@ -193,6 +193,20 @@ bool Options::Parse(int argc, char *argv[])
 	if (tuning_file != "-")
 		setenv("LIBCAMERA_RPI_TUNING_FILE", tuning_file.c_str(), 1);
 
+	// The PiSP pixel-rate ceiling travels the same way, and for the same
+	// reason: only the IPA consumes it, and the environment is the only
+	// channel into the IPA. It must be set before initCameraManager() below,
+	// because the controller resolves its hardware config on first use.
+	//
+	// Passed rather than probed. A CM5 on 6.12.93 has no rp1 node in
+	// /proc/device-tree to read the clock from, and the overlay that requests
+	// 300MHz actually yields 333.33MHz -- so both the obvious auto-detections
+	// fail, and they fail silently back to the stock rate. Cinemate sets this
+	// from the same switch that enables the overlay, so the advertised ceiling
+	// and the hardware regime cannot disagree.
+	if (max_pixel_rate > 0.0)
+		setenv("LIBCAMERA_RPI_MAX_PIXEL_RATE", std::to_string(max_pixel_rate).c_str(), 1);
+
 	if (hdr != "off" && hdr != "single-exp" && hdr != "sensor" && hdr != "auto")
 		throw std::runtime_error("Invalid HDR option provided: " + hdr);
 
@@ -510,6 +524,11 @@ void Options::Print() const
 	std::cerr << "    viewfinder-width: " << viewfinder_width << std::endl;
 	std::cerr << "    viewfinder-height: " << viewfinder_height << std::endl;
 	std::cerr << "    tuning-file: " << (tuning_file == "-" ? "(libcamera)" : tuning_file) << std::endl;
+	std::cerr << "    max-pixel-rate: ";
+	if (max_pixel_rate > 0.0)
+		std::cerr << max_pixel_rate << " MPix/s" << std::endl;
+	else
+		std::cerr << "(libcamera default)" << std::endl;
 	std::cerr << "    lores-width: " << lores_width << std::endl;
 	std::cerr << "    lores-height: " << lores_height << std::endl;
 	if (afMode_index != -1)
