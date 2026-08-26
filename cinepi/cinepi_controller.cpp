@@ -36,6 +36,7 @@ static constexpr uint32_t IMX585_CID_BASE           = V4L2_CID_USER_BASE + 0x200
 static constexpr uint32_t IMX585_CID_HDR_DATASEL_TH = IMX585_CID_BASE + 0; /* u16[2], 0..4095 */
 static constexpr uint32_t IMX585_CID_HDR_DATASEL_BK = IMX585_CID_BASE + 1; /* menu, 0..8 */
 static constexpr uint32_t IMX585_CID_HDR_GAIN_ADDER = IMX585_CID_BASE + 5; /* menu, 0..5 */
+static constexpr uint32_t IMX585_CID_HCG_ENABLE     = IMX585_CID_BASE + 6; /* bool, SDR only */
 
 /* Probe /dev/v4l-subdevN for the sensor that exposes the ClearHDR controls. */
 static int open_imx585_subdev()
@@ -272,6 +273,19 @@ void CinePIController::sync(){
                 int val = std::clamp(std::stoi(*v), 0, 5);
                 if (set_imx585_hdr_ctrl(IMX585_CID_HDR_GAIN_ADDER, val, nullptr))
                     console->info("ClearHDR gain adder restored to menu index {}", val);
+            } catch (...) {}
+        }
+    }
+
+    // ── HCG is the mirror image: an SDR-only conversion-gain control the driver
+    //    force-disables in ClearHDR. Restore it only for SDR launches so a
+    //    persisted 1 never fights the driver's own HDR handling.
+    if (options_->hdr != "sensor" && options_->hdr != "auto") {
+        if (auto v = redis_->get(CONTROL_KEY_HCG); v && !v->empty()) {
+            try {
+                int val = std::clamp(std::stoi(*v), 0, 1);
+                if (set_imx585_hdr_ctrl(IMX585_CID_HCG_ENABLE, val, nullptr))
+                    console->info("HCG restored to {}", val);
             } catch (...) {}
         }
     }
@@ -713,6 +727,19 @@ void CinePIController::mainThread(){
                         console->info("ClearHDR gain adder set to menu index {}", v);
                     else
                         console->warn("ClearHDR gain adder: no imx585 ClearHDR subdev control found");
+                } catch (...) {}
+            }
+        }},
+        { CONTROL_KEY_HCG, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                try {
+                    int v = std::clamp(std::stoi(*r), 0, 1);
+                    if (options_->hdr == "sensor" || options_->hdr == "auto")
+                        console->warn("HCG is SDR-only; stored for the next SDR launch (ClearHDR forces it off)");
+                    else if (set_imx585_hdr_ctrl(IMX585_CID_HCG_ENABLE, v, nullptr))
+                        console->info("HCG {}", v ? "enabled" : "disabled");
+                    else
+                        console->warn("HCG: no imx585 subdev control found");
                 } catch (...) {}
             }
         }},

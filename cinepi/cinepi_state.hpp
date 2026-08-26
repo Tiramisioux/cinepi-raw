@@ -51,6 +51,7 @@
 #define CONTROL_KEY_HDR_THRESHOLD_HIGH "hdr_threshold_high" // 0..4095 — HG→LG data-selection threshold, high
 #define CONTROL_KEY_HDR_BLEND "hdr_blend"           // 0..8 — HG/LG blending mode (driver menu index)
 #define CONTROL_KEY_HDR_GAIN_ADDER "hdr_gain_adder" // 0..5 — LG gain adder menu index (default 2 = +12 dB)
+#define CONTROL_KEY_HCG "hcg"                       // 0/1 — SDR high conversion gain (imx585; the driver force-disables it in ClearHDR)
 
 // Closed-loop frame-rate phase lock (sigma-delta VBLANK dither). Off by default.
 #define CONTROL_KEY_PHASE_LOCK "fps_phase_lock"   // 0/1 enable
