@@ -21,8 +21,12 @@ sudo apt install -y python3-pip git python3-jinja2 ffmpeg
 Build dependencies first:
 
 ```shell
-sudo apt install -y python3-pip git python3-jinja2 libboost-dev libgnutls28-dev openssl pybind11-dev qtbase5-dev libqt5core5a meson cmake python3-yaml python3-ply libglib2.0-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libavdevice59
+sudo apt install -y python3-pip git python3-jinja2 libboost-dev libgnutls28-dev openssl pybind11-dev qtbase5-dev libqt5core5a meson cmake python3-yaml python3-ply libglib2.0-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libavdevice59 libyaml-dev
 ```
+
+`libyaml-dev` matters: without the system libyaml, libcamera's meson falls back to building
+the bundled yaml-0.2.5 subproject, which does not compile under Bookworm's GCC 12 with
+`-Werror`.
 
 ```shell
 sudo apt-get install --reinstall libtiff5-dev && sudo ln -sf $(find /usr/lib -name "libtiff.so" | head -n 1) /usr/lib/aarch64-linux-gnu/libtiff.so.5 && export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH && sudo ldconfig
@@ -363,14 +367,15 @@ The log should show `Selected sensor format: 3856x2180-SRGGB16_1X16` and
 
 ### 12-bit ClearHDR (CCMP12)
 
-With `--hdr sensor` and a **12-bit** mode (`--mode 3856:2180:12:P`) the sensor
+With `--hdr sensor` and a **12-bit** mode (`--mode 3856:2180:12:U`) the sensor
 still merges HG and LG internally, but outputs a CCMP-companded 12-bit frame
 instead of 16-bit linear:
 
 - **AE and AWB keep working** — the ISP statistics gate only trips at 16-bit, so this is the ClearHDR mode for auto exposure. (Statistics are computed on the companded signal, so treat auto exposure as approximate.)
 - The DNG carries the CCMP decompand curve as its `LinearizationTable`, so raw apps decode it back to linear automatically — same mechanism as CineMate Log.
 - `--log-encode 10` works here too: the encoder composes the CCMP decompand with the 16→10 log curve into one table. Target 12 is refused (no composed spec).
-- Frame rates are the same as 16-bit ClearHDR; files are 12-bit-sized (≈ 12.6 MB per 4K frame vs ≈ 16.9 MB). The 16-bit mode remains the quality path.
+- Frame rates are the same as 16-bit ClearHDR; files are 12-bit-sized (≈ 12.6 MB per 4K frame vs ≈ 16.9 MB), and ≈ 10.5 MB with `--log-encode 10`. The 16-bit mode remains the quality path.
+- Use the **unpacked** token (`:12:U`). The CCMP preview stage cannot address a CSI2-packed (`:12:P`) raw as 16-bit samples and disables itself, leaving a magenta preview — the recorded DNGs are still correct, but the monitor is not.
 
 ### Live ClearHDR knobs (Redis)
 
