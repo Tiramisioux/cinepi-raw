@@ -171,9 +171,17 @@ void ccmpPreviewStage::Configure()
 	if (!options)
 		return;
 
+	/* Frozen here, once, rather than read again below: options->mode is a
+	 * live pointer into the controller's redis-mutable state, and raw_info
+	 * (fetched a few lines down) is the actual validated stream. Deriving
+	 * gate 1 and geom.raw_shift from two reads of the same mutable field taken
+	 * at different times is exactly the race cinepi_raw.cpp's encoder
+	 * snapshot exists to avoid — see its comment for the full reasoning. */
+	const Mode requested_mode = options->mode;
+
 	/* Gate 1 — the scope. Silent, because every SDR and 16-bit mode lands here
 	 * on every reconfigure and none of them is a problem. */
-	if (!(options->hdr == "sensor" || options->hdr == "auto") || options->mode.bit_depth != 12)
+	if (!(options->hdr == "sensor" || options->hdr == "auto") || requested_mode.bit_depth != 12)
 		return;
 
 	StreamInfo raw_info, lores_info;
@@ -185,6 +193,11 @@ void ccmpPreviewStage::Configure()
 					  raw_stream_ ? "lores" : "raw");
 		return;
 	}
+
+	if (requested_mode.width != raw_info.width || requested_mode.height != raw_info.height)
+		console->warn("ccmpPreview: requested mode {}x{} does not match the configured raw "
+					   "stream {}x{}; using the configured stream for binning.",
+					   requested_mode.width, requested_mode.height, raw_info.width, raw_info.height);
 
 	if (lores_info.pixel_format != libcamera::formats::YUV420)
 	{
@@ -205,8 +218,9 @@ void ccmpPreviewStage::Configure()
 	/* Gate 2 — a MEASURED decompand table for this mode's binning. Same call
 	 * and same refusal as the encoder: a binning factor with no measured anchor
 	 * is an unvalidated mode, and the register-only curve is wrong by 21 L
-	 * through the mid-tones. */
-	const double binning = static_cast<CinePIRecorder *>(app_)->SensorBinning(options->mode);
+	 * through the mid-tones. Keyed on the actual configured raw stream
+	 * (raw_info), not the requested mode — see SensorBinning()'s comment. */
+	const double binning = static_cast<CinePIRecorder *>(app_)->SensorBinning(raw_info.width, raw_info.height);
 	std::string err;
 	const CcmpLut *lut = get_ccmp_lut(binning, err);
 	if (!lut)
@@ -222,7 +236,7 @@ void ccmpPreviewStage::Configure()
 	/* Detail 2 in ccmp_preview.hpp: PiSP hands the 12-bit mode over MSB-aligned
 	 * in a 16-bit word, so the sensor's own code is `px >> 4`. Derived from the
 	 * container rather than hardcoded, so a 12-in-12 stream reads correctly too. */
-	geom.raw_shift = raw_format.container - options->mode.bit_depth;
+	geom.raw_shift = raw_format.container - requested_mode.bit_depth;
 	std::memcpy(geom.cfa, raw_format.cfa, sizeof(geom.cfa));
 	geom.mono = raw_format.mono;
 	geom.out_width = lores_info.width;
