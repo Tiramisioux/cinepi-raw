@@ -366,6 +366,86 @@ void run_common()
         check(false, "configure for the CFA check", err);
 }
 
+/* ── mono: no CFA ────────────────────────────────────────────────────────────
+ *
+ * The imx585 mono sensor presents R16/R12 to ccmpPreviewStage — same 12-in-16
+ * container as the colour sensor's SBGGR16/12, but with no CFA. Faking a
+ * Bayer pattern here would put the whole signal in one channel; the fix is a
+ * quad-average into luminance instead, with white balance and the CCM forced
+ * to identity because a mono tuning has neither measured. */
+void run_mono()
+{
+    std::cout << "\nmono (no CFA)\n";
+
+    CcmpParams params;
+    if (!ccmp_params_for_binning(1.0, params))
+    {
+        check(false, "mono params for binning");
+        return;
+    }
+    CcmpLut lut;
+    std::string err;
+    if (!lut.build(params, &err))
+    {
+        check(false, "mono lut.build", err);
+        return;
+    }
+
+    CcmpPreviewGeometry geom = geometry_for(1928, 1090, 640, 360);
+    geom.mono = true;
+    CcmpPreviewRenderer r;
+    if (!r.configure(geom, lut, &err))
+    {
+        check(false, "mono configure", err);
+        return;
+    }
+
+    /* Skewed gains and a wildly non-identity CCM — exactly what a mono
+     * tuning does NOT have. Gating setColour on geom.mono rather than on
+     * these values is the point of the test: if it were gated on the gains
+     * instead, this frame would still come out with a colour cast. */
+    CcmpPreviewColour colour;
+    colour.r_gain = 3.0;
+    colour.b_gain = 0.4;
+    colour.ccm[0] = 2.5;
+    colour.ccm[4] = 0.3;
+    colour.ccm[8] = 4.0;
+    r.setColour(colour);
+
+    /* Four DIFFERENT codes in one quad — a genuine per-photosite luminance
+     * spread, which is what a mono sensor actually delivers (no two adjacent
+     * photosites read identically). Averaging is the only correct treatment;
+     * splitting them across three channels the way the CFA path does would
+     * leave a cast. */
+    const double levels[4] = { 200.0, 2000.0, 5000.0, 9000.0 };
+    std::vector<uint8_t> raw(geom.raw_stride * geom.raw_height, 0);
+    uint16_t code[4];
+    for (int i = 0; i < 4; ++i)
+        code[i] = static_cast<uint16_t>(store(levels[i], params) << geom.raw_shift);
+    for (unsigned y = 0; y < geom.raw_height; ++y)
+    {
+        uint16_t *row = reinterpret_cast<uint16_t *>(raw.data() + static_cast<size_t>(y) * geom.raw_stride);
+        for (unsigned x = 0; x < geom.raw_width; ++x)
+            row[x] = code[(y & 1u) * 2 + (x & 1u)];
+    }
+
+    bool flat = false;
+    const Yuv px = render_flat(r, raw, flat);
+    check(flat, "mono quad renders flat");
+    check(std::abs(px.u - 128) <= 1 && std::abs(px.v - 128) <= 1,
+          "no CFA means no chroma, regardless of skewed gains/CCM",
+          "U=" + std::to_string(px.u) + " V=" + std::to_string(px.v));
+
+    /* Exposure is the one colour.* field mono still honours — it is not part
+     * of the identity guard, only the gains and the CCM are. */
+    CcmpPreviewColour bright = colour;
+    bright.exposure = 2.0;
+    r.setColour(bright);
+    const Yuv px2 = render_flat(r, raw, flat);
+    check(px2.y > px.y, "exposure still moves a mono render",
+          "Y1=" + std::to_string(px.y) + " Y2=" + std::to_string(px2.y));
+}
+
 } // namespace
 
 int main()
@@ -375,6 +455,7 @@ int main()
     run_mode(4.0, "2x2 binned 1928x1090", 1928, 1090);
     run_mode(1.0, "full res 3856x2180", 3856, 2180);
     run_common();
+    run_mono();
 
     std::cout << "\n" << (g_failures ? "FAILED " : "PASSED ") << g_failures << " failure(s)\n";
     return g_failures ? 1 : 0;

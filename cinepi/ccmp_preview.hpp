@@ -85,8 +85,15 @@ struct CcmpPreviewGeometry
     size_t raw_stride = 0;    /* bytes per raw row                              */
     unsigned raw_shift = 4;   /* >> to reach the sensor's own code (detail 2)   */
 
-    /* Quad positions in raster order: (0,0) (1,0) (0,1) (1,1). */
+    /* Quad positions in raster order: (0,0) (1,0) (0,1) (1,1). Ignored when
+     * mono is set. */
     unsigned cfa[4] = { CCMP_PREVIEW_R, CCMP_PREVIEW_G, CCMP_PREVIEW_G, CCMP_PREVIEW_B };
+
+    /* No CFA to demosaic — the mono sensor's R16/R12. quadRgb averages the
+     * whole quad into one luminance instead of splitting it by cfa[], and
+     * setColour treats white balance and the CCM as identity: a mono tuning
+     * has no measured gains or matrix for either to come from. */
+    bool mono = false;
 
     unsigned out_width = 0;
     unsigned out_height = 0;
@@ -211,11 +218,26 @@ public:
      * matrix, which is applied to values that have ALREADY been through lin_. */
     void setColour(const CcmpPreviewColour &colour)
     {
-        const double gains[3] = { colour.r_gain, 1.0, colour.b_gain };
-        for (int row = 0; row < 3; ++row)
-            for (int col = 0; col < 3; ++col)
-                m_[row * 3 + col] =
-                    static_cast<float>(colour.ccm[row * 3 + col] * gains[col] * colour.exposure);
+        /* Mono has no AWB gains and no CCM — the tuning file carries neither,
+         * so colour.r_gain/b_gain/ccm here are whatever the non-mono default
+         * happens to be, not a measurement. Gate on geom_.mono, the format
+         * fact, rather than on the gain values themselves (a color sensor can
+         * legitimately report unity gains too). Exposure still applies, so a
+         * neutral quad stays neutral and only brightens/darkens. */
+        if (geom_.mono)
+        {
+            for (int row = 0; row < 3; ++row)
+                for (int col = 0; col < 3; ++col)
+                    m_[row * 3 + col] = (row == col) ? static_cast<float>(colour.exposure) : 0.f;
+        }
+        else
+        {
+            const double gains[3] = { colour.r_gain, 1.0, colour.b_gain };
+            for (int row = 0; row < 3; ++row)
+                for (int col = 0; col < 3; ++col)
+                    m_[row * 3 + col] =
+                        static_cast<float>(colour.ccm[row * 3 + col] * gains[col] * colour.exposure);
+        }
 
         /* Only on change: this is called per frame and the table is 4096 pow()
          * calls, while gamma comes from the post-process file and does not move
@@ -342,21 +364,34 @@ private:
             lin_[r1[sx + 1] >> geom_.raw_shift],
         };
 
-        /* Two greens per quad; the other two positions are one sample each. */
-        float cam[3] = { 0.f, 0.f, 0.f };
-        int green = 0;
-        for (int i = 0; i < 4; ++i)
+        float cam[3];
+        if (geom_.mono)
         {
-            if (geom_.cfa[i] == CCMP_PREVIEW_G)
-            {
-                cam[CCMP_PREVIEW_G] += s[i];
-                ++green;
-            }
-            else
-                cam[geom_.cfa[i]] = s[i];
+            /* No CFA: the quad is four luminance samples, not one colour per
+             * position. Averaging them (rather than picking a fake Bayer
+             * channel) is what keeps the signal in all three output channels
+             * — see the struct comment on CcmpPreviewGeometry::mono. */
+            const float mean = 0.25f * (s[0] + s[1] + s[2] + s[3]);
+            cam[CCMP_PREVIEW_R] = cam[CCMP_PREVIEW_G] = cam[CCMP_PREVIEW_B] = mean;
         }
-        if (green > 1)
-            cam[CCMP_PREVIEW_G] /= static_cast<float>(green);
+        else
+        {
+            /* Two greens per quad; the other two positions are one sample each. */
+            cam[0] = cam[1] = cam[2] = 0.f;
+            int green = 0;
+            for (int i = 0; i < 4; ++i)
+            {
+                if (geom_.cfa[i] == CCMP_PREVIEW_G)
+                {
+                    cam[CCMP_PREVIEW_G] += s[i];
+                    ++green;
+                }
+                else
+                    cam[geom_.cfa[i]] = s[i];
+            }
+            if (green > 1)
+                cam[CCMP_PREVIEW_G] /= static_cast<float>(green);
+        }
 
         /* How close the most-exposed channel is to the sensor's clip, measured
          * BEFORE the gains and the matrix — see desaturateHighlight() for why

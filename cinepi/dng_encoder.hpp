@@ -32,11 +32,12 @@ public:
 	/* NEW – let the controller push µs-since-epoch for each frame */
     void setWallClockTimestamp(uint64_t us);   // µs since 1970-01-01
 
-	/* Sensor-mode bit depth, snapshotted on the event-loop thread right after
-	 * ConfigureVideo/selectMode synced options->mode to the real sensor mode.
-	 * setup_encoder keys its 16-bit keep-full-depth decision off this instead
-	 * of reading options_->mode.bit_depth live, which the redis subscriber
-	 * thread mutates (a stale value could leak into a mid-reconfigure take). */
+	/* Sensor-mode bit depth, snapshotted on the event-loop thread in the same
+	 * statement as the validated raw StreamConfiguration (cinepi_raw.cpp,
+	 * immediately after StartCamera()). setup_encoder keys its 16-bit
+	 * keep-full-depth decision and the CCMP gate off this instead of reading
+	 * options_->mode.bit_depth live, which the redis subscriber thread
+	 * mutates (a stale value could leak into a mid-reconfigure take). */
 	void setSensorModeBitDepth(unsigned int bits) { sensor_mode_bit_depth_ = bits; }
 
 	/* Pixels summed per output sample — 1 at full res, 4 for 2x2 binning.

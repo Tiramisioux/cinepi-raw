@@ -117,21 +117,30 @@ public:
 	 * of magic sizes — the CCMP decompand table is selected on this, and
 	 * selecting on a resolution string is one of the ways to get it backwards.
 	 *
+	 * Takes the actual configured raw stream's dimensions, NOT options_->mode.
+	 * options_->mode is redis-mutable (the controller thread can rewrite it
+	 * mid-frame for the next resolution change) and, separately, selectMode()'s
+	 * own nearest-mode match is not guaranteed to be what the camera actually
+	 * negotiated. A caller that already has the validated StreamConfiguration
+	 * (app.RawStream()->configuration(), or the StreamInfo derived from it)
+	 * should pass its width/height straight through — see cinepi_raw.cpp and
+	 * ccmpPreviewStage.cpp for the two call sites this replaced.
+	 *
 	 * Rounded per axis, which absorbs a mode that crops slightly inside the
 	 * array (3856/3840 -> 1, 3856/1920 -> 2). Returns 0 when the sensor does
-	 * not report an active area or the mode is empty; callers treat 0 as
+	 * not report an active area or the size is empty; callers treat 0 as
 	 * "unknown" and fall through to the linear path. */
-	double SensorBinning(const Mode &mode) const
+	double SensorBinning(unsigned int width, unsigned int height) const
 	{
 		std::shared_ptr<libcamera::Camera> const &camera = GetCamera();
-		if (!camera || !mode.width || !mode.height)
+		if (!camera || !width || !height)
 			return 0.0;
 		auto area = camera->properties().get(libcamera::properties::PixelArrayActiveAreas);
 		if (!area || area->empty())
 			return 0.0;
 		const libcamera::Size active = (*area)[0].size();
-		const double h = std::round(static_cast<double>(active.width) / mode.width);
-		const double v = std::round(static_cast<double>(active.height) / mode.height);
+		const double h = std::round(static_cast<double>(active.width) / width);
+		const double v = std::round(static_cast<double>(active.height) / height);
 		if (h < 1.0 || v < 1.0)
 			return 0.0;
 		return h * v;
