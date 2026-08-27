@@ -128,3 +128,12 @@ ccmp_preview_test = executable('ccmp_preview_test',
            include_directories : [include_directories('..')],
            install : false)
 test('ccmp_preview', ccmp_preview_test)
+
+# Unit tests for the CCMP12 attach gate (cinepi/ccmp_gate.hpp) -- whether
+# dng_encoder.cpp's setup_encoder() should even consider a decompand table,
+# including the round-2 sensor_mode_trusted refusal. No libcamera deps.
+ccmp_gate_test = executable('ccmp_gate_test',
+           '../tests/ccmp_gate_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('ccmp_gate', ccmp_gate_test)

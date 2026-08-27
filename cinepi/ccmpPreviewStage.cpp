@@ -195,9 +195,19 @@ void ccmpPreviewStage::Configure()
 	}
 
 	if (requested_mode.width != raw_info.width || requested_mode.height != raw_info.height)
+	{
+		/* Refuse rather than decompand data the requested mode doesn't
+		 * actually describe — same reasoning as ccmp_gate.hpp on the encoder
+		 * side: requested_mode.bit_depth (already checked == 12 above) is a
+		 * snapshot of the REQUEST, and on a mismatch it cannot be trusted to
+		 * describe what raw_info actually is. Decompanding a stream that may
+		 * be genuinely linear 16-bit would render worse than the plain ISP
+		 * preview it's replacing, not just fail to fix it. */
 		console->warn("ccmpPreview: requested mode {}x{} does not match the configured raw "
-					   "stream {}x{}; using the configured stream for binning.",
+					   "stream {}x{}; refusing to decompand — preview stays magenta.",
 					   requested_mode.width, requested_mode.height, raw_info.width, raw_info.height);
+		return;
+	}
 
 	if (lores_info.pixel_format != libcamera::formats::YUV420)
 	{
