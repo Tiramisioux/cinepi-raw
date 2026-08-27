@@ -120,6 +120,10 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 			app.StartCamera();
 			controller.cameraRunning = true;
+			// The restart reset ScalerCrop to full frame; clear the zoom
+			// dedup baseline so cinemate's switch-complete republish of the
+			// operator's zoom is applied instead of dropped as a duplicate.
+			controller.resetZoomDedup();
 
 			libcamera::StreamConfiguration const &cfg = app.RawStream()->configuration();
 			console->info("Raw stream: {}x{} : {} : {}", cfg.size.width, cfg.size.height, cfg.stride, cfg.pixelFormat.toString());
@@ -175,6 +179,8 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			console->error("No camera frames received for 3s, attempting a camera restart!!!");
 			app.StopCamera();
 			app.StartCamera();
+			// This restart also comes up with a full-frame ScalerCrop.
+			controller.resetZoomDedup();
 			continue;
 		}
 		if (msg.type != CinePIRecorder::MsgType::RequestComplete)
