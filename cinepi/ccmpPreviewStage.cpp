@@ -66,15 +66,21 @@ namespace {
 
 struct RawFormat
 {
-	unsigned cfa[4];      /* quad order (0,0) (1,0) (0,1) (1,1) */
+	unsigned cfa[4];      /* quad order (0,0) (1,0) (0,1) (1,1); unused when mono */
 	unsigned container;   /* bits in the storage word */
+	bool mono;            /* no CFA — a mono sensor's R16/R12, see below */
 };
 
 /* Only the unpacked containers. A CSI2P-packed raw is 12 bits straddling byte
  * boundaries and cannot be indexed as uint16; the imx585 ClearHDR modes run on
  * Pi 5 / PiSP, which delivers unpacked, so rather than carry an unpacked-on-
  * the-fly path that nothing exercises, an unexpected format disables the stage
- * loudly and the ISP preview stands. */
+ * loudly and the ISP preview stands.
+ *
+ * R16/R12 are the mono sensor's unpacked 12-bit-in-16 / 12-bit containers —
+ * the same physical layout as SBGGR16/SBGGR12, but with no CFA: the imx585
+ * mono tuning has no AWB/CCM, so faking a Bayer pattern here would put the
+ * whole signal in one channel instead of rendering it as luminance. */
 bool lookupRawFormat(const libcamera::PixelFormat &fmt, RawFormat &out)
 {
 	using namespace libcamera::formats;
@@ -82,9 +88,11 @@ bool lookupRawFormat(const libcamera::PixelFormat &fmt, RawFormat &out)
 	static const unsigned GRBG[4] = { CCMP_PREVIEW_G, CCMP_PREVIEW_R, CCMP_PREVIEW_B, CCMP_PREVIEW_G };
 	static const unsigned BGGR[4] = { CCMP_PREVIEW_B, CCMP_PREVIEW_G, CCMP_PREVIEW_G, CCMP_PREVIEW_R };
 	static const unsigned GBRG[4] = { CCMP_PREVIEW_G, CCMP_PREVIEW_B, CCMP_PREVIEW_R, CCMP_PREVIEW_G };
+	static const unsigned MONO[4] = { CCMP_PREVIEW_R, CCMP_PREVIEW_R, CCMP_PREVIEW_R, CCMP_PREVIEW_R };
 
 	const unsigned *cfa = nullptr;
 	unsigned container = 0;
+	bool mono = false;
 
 	if (fmt == SRGGB16) { cfa = RGGB; container = 16; }
 	else if (fmt == SGRBG16) { cfa = GRBG; container = 16; }
@@ -94,12 +102,15 @@ bool lookupRawFormat(const libcamera::PixelFormat &fmt, RawFormat &out)
 	else if (fmt == SGRBG12) { cfa = GRBG; container = 12; }
 	else if (fmt == SBGGR12) { cfa = BGGR; container = 12; }
 	else if (fmt == SGBRG12) { cfa = GBRG; container = 12; }
+	else if (fmt == R16) { cfa = MONO; container = 16; mono = true; }
+	else if (fmt == R12) { cfa = MONO; container = 12; mono = true; }
 
 	if (!cfa)
 		return false;
 
 	std::memcpy(out.cfa, cfa, sizeof(out.cfa));
 	out.container = container;
+	out.mono = mono;
 	return true;
 }
 
@@ -213,6 +224,7 @@ void ccmpPreviewStage::Configure()
 	 * container rather than hardcoded, so a 12-in-12 stream reads correctly too. */
 	geom.raw_shift = raw_format.container - options->mode.bit_depth;
 	std::memcpy(geom.cfa, raw_format.cfa, sizeof(geom.cfa));
+	geom.mono = raw_format.mono;
 	geom.out_width = lores_info.width;
 	geom.out_height = lores_info.height;
 	geom.out_stride = lores_info.stride;
