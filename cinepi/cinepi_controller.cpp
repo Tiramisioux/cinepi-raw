@@ -388,17 +388,13 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     }
 
     /* ────────────────────────────────────────────────────────────── */
-    /*  1. One-off buffer-pool size announcement                     */
+    /*  1. One-off buffer-pool size announcement (queued in step 5)  */
     /* ────────────────────────────────────────────────────────────── */
-    if (!buffer_size_sent_ && app_->GetEncoder()->initialized())
-    {
-        redis_->set("buffer_size",
-                    std::to_string(app_->GetEncoder()->maxRamBuffers()));
-        buffer_size_sent_ = true;
-    }
+    const bool announce_buffer_size =
+        !buffer_size_sent_ && app_->GetEncoder()->initialized();
 
     /* ────────────────────────────────────────────────────────────── */
-    /*  2. Publish live stats                                        */
+    /*  2. Build live stats                                          */
     /* ────────────────────────────────────────────────────────────── */
     Json::Value data;
     data["framerate"]  = completed_request->framerate;
@@ -413,13 +409,11 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     data["framesInFlight"]  = static_cast<Json::Int64>(app_->GetEncoder()->getFramesInFlight());
     data["timestamp"]  = static_cast<Json::Int64>(epoch_ns);   // ← TOD ns
     data["cameraPort"] = options_->CamPort();                  // cam0 / cam1 — disambiguates the shared cp_stats channel
-    redis_->publish(CHANNEL_STATS, data.toStyledString());
 
-    /* cache per-camera timestamp key (TOD ns) */
+    /* per-camera timestamp key (TOD ns) */
     const char *ts_key = (options_->CamPort() == "cam1")
                            ? "timestamp_cam1"
                            : "timestamp_cam0";
-    redis_->set(ts_key, std::to_string(epoch_ns));
 
     /* ────────────────────────────────────────────────────────────── */
     /*  3. Feed encoder with µs-since-epoch (for DNG time-code)      */
@@ -427,7 +421,7 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     app_->GetEncoder()->setWallClockTimestamp(epoch_ns / 1'000ULL); // µs
 
     /* ────────────────────────────────────────────────────────────── */
-    /*  4. Keep last encoder BCD time-code in Redis                  */
+    /*  4. Last encoder BCD time-code (written to Redis in step 5)   */
     /* ────────────────────────────────────────────────────────────── */
     auto &tc_bcd = app_->GetEncoder()->originationTimeCode;
 
@@ -443,14 +437,67 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
        << std::setw(2) << ff;
 
     const char *tc_key = (options_->CamPort() == "cam1") ? "tc_cam1" : "tc_cam0";
-    redis_->set(tc_key, tc.str());
 
     /* ────────────────────────────────────────────────────────────── */
-    /*  5. Closed-loop frame-rate phase lock. References the Pi wall    */
+    /*  5. One pipelined Redis round trip for the whole frame:        */
+    /*     stats publish + timestamp/tc SETs (+ one-off buffer_size)  */
+    /*     + the fps_user and is_recording GETs that used to be       */
+    /*     separate blocking calls here and in triggerRec().          */
+    /*     This runs on the capture thread, so collapsing 4-6 round   */
+    /*     trips into 1 keeps Redis stalls off the frame path.        */
+    /* ────────────────────────────────────────────────────────────── */
+    OptionalString fps_user;
+    rec_flag_prefetch_valid_ = false;
+    try
+    {
+        auto pipe = redis_->pipeline(false);   // borrow the pooled connection
+        pipe.publish(CHANNEL_STATS, data.toStyledString())
+            .set(ts_key, std::to_string(epoch_ns))
+            .set(tc_key, tc.str());
+        if (announce_buffer_size)
+            pipe.set("buffer_size",
+                     std::to_string(app_->GetEncoder()->maxRamBuffers()));
+        pipe.get("fps_user")
+            .get("is_recording");
+        auto replies = pipe.exec();
+
+        const std::size_t base = announce_buffer_size ? 4 : 3;
+        fps_user           = replies.get<OptionalString>(base);
+        rec_flag_prefetch_ = replies.get<OptionalString>(base + 1);
+        rec_flag_prefetch_valid_ = true;
+        if (announce_buffer_size)
+            buffer_size_sent_ = true;
+        if (frame_pipe_failing_)
+        {
+            console->info("per-frame Redis pipeline recovered");
+            frame_pipe_failing_ = false;
+        }
+    }
+    catch (const Error &err)
+    {
+        /* Redis briefly unavailable: keep capturing — stats/timecode resume
+         * on the next frame, and triggerRec() holds the current record state
+         * (see rec_flag_prefetch_valid_). Warn once per outage so a
+         * PERSISTENT failure (e.g. a WRONGTYPE reply on every GET while the
+         * rest of Redis works) stays visible at the default log level;
+         * repeats stay at debug to avoid frame-rate log spam.              */
+        if (!frame_pipe_failing_)
+        {
+            console->warn("per-frame Redis pipeline failed — live stats and the "
+                          "record safety-net are degraded until it recovers: {}",
+                          err.what());
+            frame_pipe_failing_ = true;
+        }
+        else
+            console->debug("per-frame Redis pipeline still failing: {}", err.what());
+    }
+
+    /* ────────────────────────────────────────────────────────────── */
+    /*  6. Closed-loop frame-rate phase lock. References the Pi wall    */
     /*     clock (FrameWallClock = the audio clock, computed above).    */
     /*     No-op unless enabled; suppressed on the --sync client.       */
     /* ────────────────────────────────────────────────────────────── */
-    updatePhaseLock(static_cast<int64_t>(epoch_ns));
+    updatePhaseLock(static_cast<int64_t>(epoch_ns), fps_user);
 }
 
 
@@ -820,8 +867,25 @@ void CinePIController::mainThread(){
         if (it != handlers.end()) {
             it->second(r);
         }
-        
-        redis_->bgsave();
+
+        /* Debounced RDB snapshot. This used to run unconditionally, forking
+         * redis-server and rewriting dump.rdb on the SD card for EVERY control
+         * message — a rotary-encoder burst meant a fork storm while recording.
+         * One save per minute keeps operator-seeded keys (the launch-config
+         * contract) persistent across power cuts with a ≤60 s window; the
+         * distro redis.conf save policy backstops the trailing edge of a
+         * burst. bgsave_done_ guarantees the first message saves — see the
+         * member note: a zero time_point is the boot epoch, not "long ago". */
+        auto now = std::chrono::steady_clock::now();
+        if (!bgsave_done_ || now - last_bgsave_ >= std::chrono::seconds(60)) {
+            try {
+                redis_->bgsave();
+                last_bgsave_ = now;
+                bgsave_done_ = true;
+            } catch (const Error &err) {
+                console->debug("bgsave failed: {}", err.what());
+            }
+        }
     });
 
     sub.subscribe(CHANNEL_CONTROLS);
@@ -857,18 +921,20 @@ void CinePIController::mainThread(){
 /*  suppressed on the --sync client, where rpi.sync owns the VBLANK to   */
 /*  hold the relative A->B genlock. Inferred from options_->sync.        */
 /* ------------------------------------------------------------------ */
-void CinePIController::updatePhaseLock(int64_t refTsNs)
+void CinePIController::updatePhaseLock(int64_t refTsNs, const OptionalString &fpsUser)
 {
     /* I/O lives here; the control law is the pure phaseLockStep() in
      * phase_lock_core.hpp (unit-tested in tests/phase_lock_core_test.cpp).
      *
      * Target = operator's NOMINAL fps (fps_user), read each frame so an fps change
-     * re-arms the lock. The reference clock is the Pi wall clock (FrameWallClock),
-     * passed in as refTsNs by process(). The --sync client role suppresses the
-     * lock so libcamera rpi.sync owns that sensor's VBLANK on a genlock rig. */
+     * re-arms the lock — fetched by process()'s pipelined batch and passed in, so
+     * the freshness is unchanged but the dedicated per-frame GET is gone. The
+     * reference clock is the Pi wall clock (FrameWallClock), passed in as refTsNs
+     * by process(). The --sync client role suppresses the lock so libcamera
+     * rpi.sync owns that sensor's VBLANK on a genlock rig. */
     double target = pllState_.targetFps;
-    if (auto v = redis_->get("fps_user"); v && !v->empty()) {
-        try { target = std::stod(*v); } catch (...) {}
+    if (fpsUser && !fpsUser->empty()) {
+        try { target = std::stod(*fpsUser); } catch (...) {}
     }
 
     const bool roleClient = (options_->sync == 2);
@@ -886,9 +952,16 @@ void CinePIController::updatePhaseLock(int64_t refTsNs)
         app_->SetControls(cl);
     }
 
-    /* Telemetry for the test harness (only when the servo actually ran). */
+    /* Telemetry for the test harness (only when the servo actually ran) —
+     * both SETs share one pipelined round trip on the capture thread. */
     if (res.servoRan) {
-        redis_->set("pll_phase_err_us", std::to_string(std::lround(res.phaseErrUs)));
-        redis_->set("pll_req_dur_us", std::to_string(res.durUs));
+        try {
+            auto pipe = redis_->pipeline(false);
+            pipe.set("pll_phase_err_us", std::to_string(std::lround(res.phaseErrUs)))
+                .set("pll_req_dur_us", std::to_string(res.durUs));
+            pipe.exec();
+        } catch (const Error &err) {
+            console->debug("phase-lock telemetry write failed: {}", err.what());
+        }
     }
 }

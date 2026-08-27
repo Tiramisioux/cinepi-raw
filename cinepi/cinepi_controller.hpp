@@ -112,7 +112,10 @@ class CinePIController : public CinePIState
         // the --sync client, where libcamera rpi.sync owns that sensor's VBLANK to
         // hold the relative A->B lock. Role is inferred from options_->sync, so the
         // same phase_lock setting works for single and dual with no per-camera key.
-        void updatePhaseLock(int64_t refTsNs);
+        // fpsUser is the operator's nominal fps ("fps_user"), fetched fresh each
+        // frame as part of process()'s pipelined Redis batch so an fps change
+        // still re-arms the lock without a dedicated per-frame GET.
+        void updatePhaseLock(int64_t refTsNs, const OptionalString &fpsUser);
 
         void process_stream_info(libcamera::StreamConfiguration const &cfg){
 
@@ -143,7 +146,15 @@ class CinePIController : public CinePIState
         const std::string port = options_->CamPort();
         if (port.empty())
             return true;                         // unlabelled single camera
-        auto v = redis_->get("record_cams");
+        OptionalString v;
+        try { v = redis_->get("record_cams"); }
+        catch (const Error &) {
+            /* Redis unreachable in the window between a record edge and this
+             * gate read: fall back to the legacy both-record default rather
+             * than letting the exception kill the process (or a sensor sit
+             * the take out). Recording too much beats recording nothing.   */
+            return true;
+        }
         if (!v || v->empty())
             return true;                         // legacy: no gate published
         const std::string &sel = *v;
@@ -193,8 +204,20 @@ class CinePIController : public CinePIState
         }
 
         /* ── 2.  Safety-net: act on Redis level changes only. ─────────────── */
+        /* The flag rides process()'s pipelined batch (same frame, no extra
+         * round trip). Fall back to a direct GET only if that batch didn't
+         * run or failed; if Redis is unreachable, hold the current record
+         * state this frame rather than misreading the outage as a stop.     */
+        OptionalString v;
+        if (rec_flag_prefetch_valid_)
+            v = rec_flag_prefetch_;
+        else
+        {
+            try { v = redis_->get("is_recording"); }
+            catch (const Error &) { return 0; }
+        }
         int rec_flag = 0;
-        if (auto v = redis_->get("is_recording"); v && !v->empty())
+        if (v && !v->empty())
             rec_flag = std::stoi(*v);               // 0 or 1
 
         /* ── first invocation: establish baseline, possibly join late. ────── */
@@ -291,6 +314,27 @@ class CinePIController : public CinePIState
         cinepi::PhaseLockState  pllState_{};              // per-frame servo state
 
         int baseline_flag_{0};          // remembers last seen is_recording level
+
+        // "is_recording" fetched by process()'s pipelined batch each frame,
+        // consumed by triggerRec() immediately after (both capture thread).
+        // valid_ is false whenever the batch didn't run or failed this frame.
+        OptionalString rec_flag_prefetch_;
+        bool rec_flag_prefetch_valid_ = false;
+
+        // Outage-edge logging for the per-frame pipeline (capture thread
+        // only): warn once when it starts failing, info once on recovery,
+        // debug in between — a PERSISTENT failure must be visible at the
+        // default log level without spamming at frame rate.
+        bool frame_pipe_failing_ = false;
+
+        // Debounce for the RDB snapshot after control changes (subscriber
+        // thread only). bgsave_done_ forces the very first control message
+        // to save: a value-initialised steady_clock time_point is the BOOT
+        // epoch on Linux, so a bare 60 s comparison would silently skip
+        // every save in the first minute of uptime — exactly the boot
+        // window where cinemate seeds the launch-config keys.
+        bool bgsave_done_ = false;
+        std::chrono::steady_clock::time_point last_bgsave_{};
 
         std::shared_ptr<spdlog::logger> console;
 
