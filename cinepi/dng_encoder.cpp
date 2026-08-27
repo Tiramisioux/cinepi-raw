@@ -1317,14 +1317,34 @@ void DngEncoder::encodeThread(int num)
             if (!tc_origin_set_)
             {
                 /* First frame of clip: capture wall-clock HH:MM:SS origin. */
+                /* SMPTE frame base = round(fps), taken from the CONFIGURED rate.
+                 *
+                 * This deliberately does not derive the base from the measured
+                 * FrameDuration metadata.  At a half-integer rate the nominal
+                 * duration lands exactly on the rounding boundary (24.5 fps ->
+                 * 40816.33 µs), and the sensor quantises frame duration to whole
+                 * line-times, which differ per sensor mode.  Rounding the
+                 * measured value therefore flipped the base between 24 and 25
+                 * purely on which mode was active -- observed on hardware at
+                 * 24.5 fps in two sessions that read the same binary and
+                 * disagreed, which cost a day chasing a phantom regression.
+                 *
+                 * options_->framerate is the same source the 0xC764 FrameRate
+                 * tag already uses (see fpsRat above), so the tag and the frame
+                 * base now agree by construction.  std::lround is
+                 * half-away-from-zero, matching cinepi_sound.cpp's
+                 * nominalTimecodeFramerate() so the WAV and the DNG cannot
+                 * disagree either (F-253).
+                 *
+                 * FrameDuration stays as the fallback for the case where no
+                 * rate was configured.  It is in MICROSECONDS (40000 µs @ 25
+                 * fps), so fps = 1e6 / fd -- using 1e9 here would give 25000
+                 * (1000x too high) and ~999 phantom TC holes per frame. */
                 int fps_int = 24;
-                /* libcamera FrameDuration is in MICROSECONDS (40000 µs @ 25fps),
-                 * so fps = 1e6 / fd.  Using 1e9 here gives 25000 (1000× too high):
-                 * raw_elapsed = round(40000 * 25000 / 1e6) = 1000 → ~999 phantom
-                 * holes per frame.  The pre-fix path derived this same value as
-                 * fpsRat[0]/fpsRat[1] = round(1e9/fd)/1000, i.e. exactly 1e6/fd. */
-                if (auto fd = encode_item.met.get(controls::FrameDuration); fd && *fd > 0)
-                    fps_int = static_cast<int>(1'000'000.0 / static_cast<double>(*fd) + 0.5);
+                if (options_->framerate && *options_->framerate > 0.f)
+                    fps_int = static_cast<int>(std::lround(*options_->framerate));
+                else if (auto fd = encode_item.met.get(controls::FrameDuration); fd && *fd > 0)
+                    fps_int = static_cast<int>(std::lround(1'000'000.0 / static_cast<double>(*fd)));
                 if (fps_int <= 0) fps_int = 24;
 
                 /* Prefer wall-clock for the HH:MM:SS display origin; fall back
