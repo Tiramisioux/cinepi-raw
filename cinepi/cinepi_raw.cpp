@@ -120,10 +120,6 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 			app.StartCamera();
 			controller.cameraRunning = true;
-			// The restart reset ScalerCrop to full frame; clear the zoom
-			// dedup baseline so cinemate's switch-complete republish of the
-			// operator's zoom is applied instead of dropped as a duplicate.
-			controller.resetZoomDedup();
 
 			libcamera::StreamConfiguration const &cfg = app.RawStream()->configuration();
 			console->info("Raw stream: {}x{} : {} : {}", cfg.size.width, cfg.size.height, cfg.stride, cfg.pixelFormat.toString());
@@ -141,7 +137,14 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			const unsigned int requested_height = options->mode.height;
 			const unsigned int requested_bit_depth = options->mode.bit_depth;
 
-			if (requested_width != cfg.size.width || requested_height != cfg.size.height)
+			// Whether the frozen values above can be believed to describe the
+			// stream cfg actually is. False on a dims mismatch: setSensorModeBitDepth()
+			// still gets requested_bit_depth below (it has nothing else to snapshot),
+			// but the encoder must not trust that value for the CCMP gate or the
+			// 16-bit keep-full-depth decision — see setSensorModeTrusted()'s comment
+			// and cinepi/ccmp_gate.hpp.
+			const bool mode_trusted = (requested_width == cfg.size.width && requested_height == cfg.size.height);
+			if (!mode_trusted)
 				console->warn("Requested mode {}x{} does not match the configured raw stream "
 							   "{}x{}; using the configured stream for binning and bit depth.",
 							   requested_width, requested_height, cfg.size.width, cfg.size.height);
@@ -164,6 +167,9 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			// on the BINNING of the stream the camera actually configured —
 			// cfg.size, not the (possibly since-mutated) requested mode.
 			app.GetEncoder()->setSensorBinning(app.SensorBinning(cfg.size.width, cfg.size.height));
+			// Tell the encoder whether the two snapshots above can be
+			// believed at all — see setSensorModeTrusted()'s comment.
+			app.GetEncoder()->setSensorModeTrusted(mode_trusted);
 			app.GetEncoder()->reset_encoder();
 			controller.process_stream_info(cfg);
 
@@ -197,8 +203,6 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			console->error("No camera frames received for 3s, attempting a camera restart!!!");
 			app.StopCamera();
 			app.StartCamera();
-			// This restart also comes up with a full-frame ScalerCrop.
-			controller.resetZoomDedup();
 			continue;
 		}
 		if (msg.type != CinePIRecorder::MsgType::RequestComplete)

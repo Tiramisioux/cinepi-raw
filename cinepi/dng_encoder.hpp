@@ -51,6 +51,18 @@ public:
 	 * obviously wrong in a render. */
 	void setSensorBinning(double binning) { sensor_binning_ = binning; }
 
+	/* Whether the bit-depth/binning snapshots above actually describe the
+	 * stream setup_encoder() is about to configure. False when
+	 * cinepi_raw.cpp found the requested mode's dimensions did not match the
+	 * validated raw StreamConfiguration — the snapshots are still whatever
+	 * was requested, not what the camera configured, so a 12-bit request
+	 * landing on a genuinely 16-bit sensor mode must not be believed. See
+	 * ccmp_gate.hpp for what this gates and why. Defaults to true: absent a
+	 * call to this setter (only cinepi_raw.cpp calls it, once per
+	 * reconfigure), the snapshots are trusted exactly as before this flag
+	 * existed. */
+	void setSensorModeTrusted(bool trusted) { sensor_mode_trusted_ = trusted; }
+
 	// Encode the given buffer.
 	void EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us) override;
 	void EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const &info, size_t losize, void *lomem, StreamInfo const &loinfo, int64_t timestamp_us, CompletedRequest::ControlList const &metadata);
@@ -237,6 +249,7 @@ private:
         bool encoder_initialized_;
         unsigned int sensor_mode_bit_depth_ = 0;
         double sensor_binning_ = 0.0;
+        bool sensor_mode_trusted_ = true;
 
         /* The CCMP decompand table for this configuration, or nullptr when the
          * mode is not 12-bit ClearHDR. Owned by the process-wide cache in

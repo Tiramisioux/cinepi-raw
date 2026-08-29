@@ -5,6 +5,7 @@
  * options.cpp - common program options helpers
  */
 #include <algorithm>
+#include <chrono>
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
@@ -13,6 +14,7 @@
 #include <map>
 #include <string>
 #include <sys/ioctl.h>
+#include <thread>
 
 #include <libcamera/formats.h>
 #include <libcamera/logging.h>
@@ -104,8 +106,22 @@ static int xioctl(int fd, unsigned long ctl, void *arg)
 	return ret;
 }
 
-static bool set_subdev_hdr_ctrl(int en)
+// Returns true once some subdev CONFIRMS the control reads back as `en` --
+// either it was already there, or the write just landed. `changed_out`, if
+// given, is set when a write was actually needed (the caller uses this to
+// decide whether the camera manager needs resetting).
+//
+// The two outcomes this deliberately does NOT conflate: "already at the
+// target, nothing to do" and "tried to write but the sensor didn't take it"
+// used to both return false from here, so a caller checking only the return
+// value could not tell a confirmed no-op from a silent failure. That
+// conflation is exactly how a wide_dynamic_range=1 request could fail with
+// nothing to show for it -- see Options::Parse()'s caller for the failure
+// mode this produces on the sensor (the driver's invalid-combo gate serving
+// a BLC pedestal fill while cinepi-raw believes ClearHDR is engaged).
+static bool set_subdev_hdr_ctrl(int en, bool *changed_out = nullptr)
 {
+	bool confirmed = false;
 	bool changed = false;
 	// Currently this does not exist in libcamera, so go directly to V4L2.
 	// Sensor-agnostic probe: only the camera sensor subdev exposes
@@ -122,15 +138,25 @@ static bool set_subdev_hdr_ctrl(int en)
 			continue;
 
 		v4l2_control ctrl { V4L2_CID_WIDE_DYNAMIC_RANGE, en };
-		if (!xioctl(fd, VIDIOC_G_CTRL, &ctrl) && ctrl.value != en)
+		if (!xioctl(fd, VIDIOC_G_CTRL, &ctrl))
 		{
-			ctrl.value = en;
-			if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
-				changed = true;
+			if (ctrl.value == en)
+				confirmed = true;
+			else
+			{
+				ctrl.value = en;
+				if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
+				{
+					changed = true;
+					confirmed = true;
+				}
+			}
 		}
 		close(fd);
 	}
-	return changed;
+	if (changed_out)
+		*changed_out = changed;
+	return confirmed;
 }
 
 bool Options::Parse(int argc, char *argv[])
@@ -231,8 +257,34 @@ bool Options::Parse(int argc, char *argv[])
 		// each subdev for the control, so listing the sensor here is the only gate needed.
 		if ((hdr == "sensor" || hdr == "auto") && (cam_id == "imx708" || cam_id == "imx585"))
 		{
-			// Turn on sensor HDR.  Reset the camera manager if we have switched the value of the control.
-			if (set_subdev_hdr_ctrl(1))
+			// Turn on sensor HDR. set_subdev_hdr_ctrl(0) above and
+			// initCameraManager() just before it can leave the subdev
+			// briefly unable to accept a mode-list-changing control -- the
+			// write fails with nothing to show for it except a false
+			// return, and proceeding anyway used to leave the sensor's WDR
+			// combiner off while cinepi-raw requested a 12-bit ClearHDR
+			// pixel format regardless. That is the driver's invalid-combo
+			// case: it serves a BLC pedestal fill (~200), not real data,
+			// and every downstream ClearHDR knob (thresholds, blend, gain
+			// adder) is inert against it. Retry briefly for the transient
+			// case; refuse to launch as ClearHDR for the persistent one
+			// rather than silently recording pedestal fill.
+			bool changed = false;
+			bool confirmed = set_subdev_hdr_ctrl(1, &changed);
+			for (int attempt = 0; !confirmed && attempt < 4; ++attempt)
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				confirmed = set_subdev_hdr_ctrl(1, &changed);
+			}
+			if (!confirmed)
+				throw std::runtime_error(
+					"imx585/imx708 ClearHDR: sensor did not accept wide_dynamic_range=1 "
+					"after retrying -- refusing to launch with --hdr " + hdr +
+					" while the sensor's combiner is still off (this is the invalid-combo "
+					"BLC-fill defect, not a software problem; retry the launch)");
+			// Reset the camera manager only when the value actually changed --
+			// an already-true readback needs no reset, same as before.
+			if (changed)
 			{
 				cameras.clear();
 				app_->initCameraManager();

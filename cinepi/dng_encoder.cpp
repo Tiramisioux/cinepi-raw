@@ -26,9 +26,10 @@
 #include <sched.h>
 #include <sys/resource.h>
  
- #include "dng_encoder.hpp"        
- #include "utils.hpp"               
- #include "ifd_builder.hpp"         
+ #include "dng_encoder.hpp"
+ #include "utils.hpp"
+ #include "ifd_builder.hpp"
+ #include "ccmp_gate.hpp"
  
  #include <sys/mman.h>              
  #include <sys/types.h>
@@ -497,8 +498,19 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      * (--keep16 used to force full depth for the SDR case too; it was removed
      * because the 4 bits it preserved are padding, so it only ever bought a
      * ~33% larger file carrying the same information. --log-encode is the one
-     * output-depth control now.) */
-    write12bit_ = (bf.bits == 16) && sensor_mode_bit_depth_ != 16;
+     * output-depth control now.)
+     *
+     * !sensor_mode_trusted_ forces this false, i.e. keeps the full 16-bit
+     * container, regardless of what sensor_mode_bit_depth_ claims. The two
+     * ways this decision can be wrong are not symmetric: believing a stale
+     * "12" and packing down throws away real 16-bit data (bf.bits == 16, so
+     * the container genuinely carries it) with no way to get it back;
+     * believing a stale "16" and keeping the container when the mode was
+     * really a 12-in-16 SDR stream just stores four already-known-zero
+     * padding bits, which is what the untrusted branch below already accepts
+     * doing on every ordinary reconfigure. Fail toward the non-destructive
+     * side, same reasoning as the CCMP gate just below. */
+    write12bit_ = sensor_mode_trusted_ && (bf.bits == 16) && sensor_mode_bit_depth_ != 16;
 
     if (write12bit_) {
         dng_info.bits  = 12;
@@ -532,10 +544,15 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      * is this order the composition has to follow.
      *
      * Anything unmeasured falls through to the ordinary linear path rather than
-     * emitting a mislabelled file. */
+     * emitting a mislabelled file.
+     *
+     * sensor_mode_trusted_ is the round-2 addition (ccmp_gate.hpp): a request
+     * whose dimensions didn't match the validated raw stream cannot be
+     * believed to be 12-bit just because sensor_mode_bit_depth_ says so — see
+     * that header for the full reasoning and the observed hardware failure it
+     * closes. */
     ccmp_lut_ = nullptr;
-    if (options_ && (options_->hdr == "sensor" || options_->hdr == "auto") &&
-        sensor_mode_bit_depth_ == 12)
+    if (options_ && ccmp_gate_should_consider(options_->hdr, sensor_mode_bit_depth_, sensor_mode_trusted_))
     {
         std::string err;
         const CcmpLut *lut = get_ccmp_lut(sensor_binning_, err);
@@ -555,6 +572,19 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
                           "Writing linear 12-bit codes — the mid-tones will render "
                           "magenta and no post step recovers them cleanly.", err);
         }
+    }
+    else if (options_ && (options_->hdr == "sensor" || options_->hdr == "auto") &&
+             sensor_mode_bit_depth_ == 12 && !sensor_mode_trusted_)
+    {
+        /* Reachable only because sensor_mode_trusted_ is false -- hdr scope
+         * and bit depth alone would have considered this. Same loud warning
+         * as the "no measured table" case above, naming the actual reason:
+         * the requested mode did not match what the camera configured, so
+         * the frozen "12" cannot be trusted. */
+        console->warn("12-bit ClearHDR requested but the requested mode did not match the "
+                      "configured raw stream; skipping the CCMP decompand table rather than "
+                      "risk mislabelling. Writing linear 12-bit codes — the mid-tones will "
+                      "render magenta and no post step recovers them cleanly.");
     }
 
     /* ──  CineMate Log  ───────────────────────────────────────
