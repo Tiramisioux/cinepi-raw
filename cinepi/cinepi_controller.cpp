@@ -795,7 +795,10 @@ void CinePIController::mainThread(){
                 return;
 
             /* ─────────── 0. parse & deduplicate ─────────── */
-            static double last_z = 1.0;                         // remember previous
+            /* last_zoom_ is the last zoom APPLIED to the ISP, not the last
+             * value seen — a camera restart resets ScalerCrop, so the main
+             * loop clears this baseline (resetZoomDedup) after StartCamera. */
+            double last_z = last_zoom_.load();
             double z = std::clamp(std::stod(*r), 0.10, 25.0);   // keep sane range
 
             console->debug("ZOOM raw='{}'  parsed={:.3f}  prev={:.3f}",
@@ -805,7 +808,7 @@ void CinePIController::mainThread(){
                 console->debug("… duplicate – ignored");
                 return;
             }
-            last_z = z;
+            last_zoom_.store(z);
             options_->SetZoom(z);                               // store for CLI / save
 
             /* ─────────── 1. active sensor area ──────────── */

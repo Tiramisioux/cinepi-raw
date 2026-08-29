@@ -134,6 +134,15 @@ class CinePIController : public CinePIState
             return cameraInit_.exchange(false);
         }
 
+        // Call after every StartCamera(): a camera (re)start resets the ISP's
+        // ScalerCrop to full frame, so the zoom handler's dedup baseline must
+        // follow (1.0 = no zoom applied). Otherwise re-publishing the
+        // operator's pre-switch zoom compares equal to the stale baseline and
+        // is dropped, and the crop can never be reprogrammed — the same
+        // defect class as cinemate's shutter_a set_value dedup after a mode
+        // switch (cinemate fix/mode-switch-control-reapply).
+        void resetZoomDedup() { last_zoom_.store(1.0); }
+
     // ── Dual-sensor record gate ─────────────────────────────────────────────
     // Which sensor(s) record the current take is published by cinemate in the
     // Redis key `record_cams` (tokens: "cam0", "cam1", "cam0+cam1", "both").
@@ -335,6 +344,11 @@ class CinePIController : public CinePIState
         // window where cinemate seeds the launch-config keys.
         bool bgsave_done_ = false;
         std::chrono::steady_clock::time_point last_bgsave_{};
+
+        // Last zoom actually applied to the ISP — the CONTROL_KEY_ZOOM
+        // handler's dedup baseline. Written by the Redis subscriber thread,
+        // reset from the main loop via resetZoomDedup(), hence atomic.
+        std::atomic<double> last_zoom_{1.0};
 
         std::shared_ptr<spdlog::logger> console;
 
