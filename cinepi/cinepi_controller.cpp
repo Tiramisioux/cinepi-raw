@@ -259,12 +259,16 @@ void CinePIController::sync(){
             uint16_t pair[2] = { parse_hdr_threshold(low_v), parse_hdr_threshold(high_v) };
             if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
                 console->info("ClearHDR data-selection threshold restored to {},{}", pair[0], pair[1]);
+            else
+                console->warn("ClearHDR threshold restore: no imx585 ClearHDR subdev control found");
         }
         if (auto v = redis_->get(CONTROL_KEY_HDR_BLEND); v && !v->empty()) {
             try {
                 int val = std::clamp(std::stoi(*v), 0, 8);
                 if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_BK, val, nullptr))
                     console->info("ClearHDR blending mode restored to {}", val);
+                else
+                    console->warn("ClearHDR blend restore: no imx585 ClearHDR subdev control found");
             } catch (...) {}
         }
         if (auto v = redis_->get(CONTROL_KEY_HDR_GAIN_ADDER); v && !v->empty()) {
@@ -272,6 +276,8 @@ void CinePIController::sync(){
                 int val = std::clamp(std::stoi(*v), 0, 5);
                 if (set_imx585_hdr_ctrl(IMX585_CID_HDR_GAIN_ADDER, val, nullptr))
                     console->info("ClearHDR gain adder restored to menu index {}", val);
+                else
+                    console->warn("ClearHDR gain adder restore: no imx585 ClearHDR subdev control found");
             } catch (...) {}
         }
     }
