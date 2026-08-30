@@ -96,6 +96,45 @@ static uint16_t parse_hdr_threshold(const std::optional<std::string>& v)
     }
 }
 
+/* Build the IMX585_CID_HDR_DATASEL_TH u16[2] from the two Redis keys, in the
+ * order the driver writes them (imx585.c:1532-1534, write site :1472-1474):
+ *
+ *     th[0] -> EXP_TH_H (0x36D0)   high-gain saturation cutoff
+ *     th[1] -> EXP_TH_L (0x36D4)   high-gain "low" cutoff
+ *
+ * so hdr_threshold_HIGH belongs in th[0] and hdr_threshold_LOW in th[1].
+ * That matches what both keys have always been documented to mean --
+ * hdr_threshold_high is "the raw level above which the sensor reads pure
+ * low-gain", which is precisely the HG saturation cutoff.
+ *
+ * These were passed the other way round until 2026-08-30: every call site
+ * built { low, high }, so hdr_threshold_low landed in EXP_TH_H. Confirmed on
+ * hardware by writing low=3000/high=500 and reading the registers back --
+ * 0x36D0 came back 3000 and 0x36D4 came back 500.
+ *
+ * Returns false, writing nothing, when the pair would violate the sensor's
+ * EXP_TH_H >= EXP_TH_L constraint. The driver is explicit that the spec marks
+ * EXP_TH_H < EXP_TH_L as "Prohibited -- the sensor enters an invalid state and
+ * only outputs the BLC pedestal", and escaping that state needs a large light
+ * transient at the sensor, so refusing the write is much cheaper than making
+ * it. Note this is reachable from the documented usage: setting only one of
+ * the two keys leaves the other parsing as 0.
+ */
+static bool build_hdr_threshold_pair(const std::optional<std::string>& low_v,
+                                     const std::optional<std::string>& high_v,
+                                     uint16_t pair[2])
+{
+    const uint16_t low = parse_hdr_threshold(low_v);
+    const uint16_t high = parse_hdr_threshold(high_v);
+
+    if (high < low)
+        return false;
+
+    pair[0] = high;   /* EXP_TH_H */
+    pair[1] = low;    /* EXP_TH_L */
+    return true;
+}
+
 void CinePIController::sync(){
     // getAllKeysAndValuesFromRedis();
 
@@ -256,9 +295,16 @@ void CinePIController::sync(){
         auto low_v = redis_->get(CONTROL_KEY_HDR_THRESHOLD_LOW);
         auto high_v = redis_->get(CONTROL_KEY_HDR_THRESHOLD_HIGH);
         if ((low_v && !low_v->empty()) || (high_v && !high_v->empty())) {
-            uint16_t pair[2] = { parse_hdr_threshold(low_v), parse_hdr_threshold(high_v) };
-            if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
-                console->info("ClearHDR data-selection threshold restored to {},{}", pair[0], pair[1]);
+            uint16_t pair[2];
+            if (!build_hdr_threshold_pair(low_v, high_v, pair))
+                console->warn("ClearHDR threshold restore refused: hdr_threshold_high ({}) is "
+                              "below hdr_threshold_low ({}). EXP_TH_H < EXP_TH_L is a prohibited "
+                              "sensor state that outputs only the black-level pedestal. Leaving "
+                              "the driver's own pair in place. Set both keys, or neither.",
+                              parse_hdr_threshold(high_v), parse_hdr_threshold(low_v));
+            else if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
+                console->info("ClearHDR data-selection threshold restored to "
+                              "EXP_TH_H={}, EXP_TH_L={}", pair[0], pair[1]);
             else
                 console->warn("ClearHDR threshold restore: no imx585 ClearHDR subdev control found");
         }
@@ -514,6 +560,28 @@ void CinePIController::mainThread(){
 
     using MessageHandler = std::function<void(const std::optional<std::string>&)>;
 
+    /* Both threshold keys write the same u16[2] sensor control, so whichever
+     * one changed, the other is read alongside it and the pair goes out
+     * together. Shared so the EXP_TH_H >= EXP_TH_L guard cannot drift between
+     * the two handlers. */
+    auto apply_hdr_thresholds = [this](const std::optional<std::string>& low_v,
+                                       const std::optional<std::string>& high_v) {
+        uint16_t pair[2];
+        if (!build_hdr_threshold_pair(low_v, high_v, pair)) {
+            console->warn("ClearHDR threshold rejected: hdr_threshold_high ({}) is below "
+                          "hdr_threshold_low ({}). EXP_TH_H < EXP_TH_L is a prohibited sensor "
+                          "state that outputs only the black-level pedestal, and clearing it "
+                          "needs a light transient at the sensor. Sensor left unchanged.",
+                          parse_hdr_threshold(high_v), parse_hdr_threshold(low_v));
+            return;
+        }
+        if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
+            console->info("ClearHDR data-selection threshold set to EXP_TH_H={}, EXP_TH_L={}",
+                          pair[0], pair[1]);
+        else
+            console->warn("ClearHDR threshold: no imx585 ClearHDR subdev control found");
+    };
+
     std::unordered_map<std::string, MessageHandler> handlers = {
         { CONTROL_KEY_RAW_CROP, [this](const std::optional<std::string>& r) {
             std::unordered_map<std::string, std::string> m;
@@ -729,23 +797,13 @@ void CinePIController::mainThread(){
         { CONTROL_KEY_PLL_DEADBAND, [this](const std::optional<std::string>& r) {
             if(r && !r->empty()) { try { pllParams_.deadbandUs = std::stod(*r); } catch (...) {} }
         }},
-        { CONTROL_KEY_HDR_THRESHOLD_LOW, [this](const std::optional<std::string>& r) {
-            if(r && !r->empty()) {
-                uint16_t pair[2] = { parse_hdr_threshold(r), parse_hdr_threshold(redis_->get(CONTROL_KEY_HDR_THRESHOLD_HIGH)) };
-                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
-                    console->info("ClearHDR data-selection threshold set to {},{}", pair[0], pair[1]);
-                else
-                    console->warn("ClearHDR threshold: no imx585 ClearHDR subdev control found");
-            }
+        { CONTROL_KEY_HDR_THRESHOLD_LOW, [apply_hdr_thresholds, this](const std::optional<std::string>& r) {
+            if(r && !r->empty())
+                apply_hdr_thresholds(r, redis_->get(CONTROL_KEY_HDR_THRESHOLD_HIGH));
         }},
-        { CONTROL_KEY_HDR_THRESHOLD_HIGH, [this](const std::optional<std::string>& r) {
-            if(r && !r->empty()) {
-                uint16_t pair[2] = { parse_hdr_threshold(redis_->get(CONTROL_KEY_HDR_THRESHOLD_LOW)), parse_hdr_threshold(r) };
-                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
-                    console->info("ClearHDR data-selection threshold set to {},{}", pair[0], pair[1]);
-                else
-                    console->warn("ClearHDR threshold: no imx585 ClearHDR subdev control found");
-            }
+        { CONTROL_KEY_HDR_THRESHOLD_HIGH, [apply_hdr_thresholds, this](const std::optional<std::string>& r) {
+            if(r && !r->empty())
+                apply_hdr_thresholds(redis_->get(CONTROL_KEY_HDR_THRESHOLD_LOW), r);
         }},
         { CONTROL_KEY_HDR_BLEND, [this](const std::optional<std::string>& r) {
             if(r && !r->empty()) {
