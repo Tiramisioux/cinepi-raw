@@ -422,7 +422,7 @@ for s in /dev/v4l-subdev*; do
   v4l2-ctl -d "$s" --list-ctrls 2>/dev/null | grep -q wide_dynamic_range && echo "$s"
 done
 
-v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_data_selection_threshold=500,3000
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_data_selection_threshold=4095,0
 v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_data_blending_mode=2
 v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_gain_adder_db=1
 v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl wide_dynamic_range=1   # ClearHDR on — restart cinepi-raw afterwards
@@ -431,6 +431,14 @@ v4l2-ctl -d /dev/v4l-subdev2 --list-ctrls-menus                # inspect ranges 
 
 `wide_dynamic_range` changes the sensor's mode list, so flip it before
 launching (or relaunch after). The three knob controls apply live.
+
+`hdr_data_selection_threshold` takes `EXP_TH_H,EXP_TH_L` — high first. The
+first value must be >= the second: `EXP_TH_H < EXP_TH_L` is a prohibited
+sensor state that outputs only the black-level pedestal, and this raw-v4l2
+path bypasses the guard cinepi-raw applies to the Redis keys. A value set
+this way also outlives cinepi-raw restarts: the driver replays cached
+control values at every stream start, so only a module reload or an
+explicit rewrite clears it.
 
 ## Tests and CI
 
