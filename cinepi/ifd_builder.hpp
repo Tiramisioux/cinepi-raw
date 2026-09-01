@@ -126,8 +126,12 @@ public:
                   });
     }
 
-    /* materialise the directory + data into the MemoryBuffer          */
-    void build(MemoryBuffer &memBuf)
+    /* materialise the directory + data into the MemoryBuffer.
+       Returns the byte offset of the "next IFD" field this call wrote, so a
+       caller chaining a second IFD can come back and patch it once the next
+       IFD's own offset is known — the field is left at 0 (end of chain)
+       otherwise, exactly as before this method returned anything.          */
+    uint32_t build(MemoryBuffer &memBuf)
     {
         const uint16_t n = static_cast<uint16_t>(entries_.size());
 
@@ -138,6 +142,7 @@ public:
            until we have computed every value/offset                   */
         write_uint16(memBuf, n);
         memBuf.offset += n * sizeof(IFDEntry);   /* 12 bytes each      */
+        const uint32_t nextIfdFieldOffset = memBuf.offset;
         write_uint32(memBuf, 0);                 /* next-IFD = 0       */
 
         /* where does the extra area begin?                            */
@@ -211,6 +216,8 @@ public:
         /* finally append the extra data                                   */
         if (!extraData.empty())
             write_pod(memBuf, extraData.data(), extraData.size());
+
+        return nextIfdFieldOffset;
     }
 
     uint32_t baseOffset{0};  /* for callers who still want to patch it */

@@ -834,6 +834,12 @@ void CinePIController::mainThread(){
         { CONTROL_KEY_THUMBNAIL, [this](const std::optional<std::string>& r) {
             if(r) {
                 options_->thumbnail = stoi(*r);
+                /* dng_save()'s per-frame buffer is sized once in
+                 * setup_encoder() from thumbnail's mode at that moment (C9
+                 * Phase 0). Restart on every change, same as
+                 * CONTROL_KEY_THUMBNAIL_SIZE below, so a live flip can never
+                 * outrun that reservation and overflow mid-take. */
+                cameraInit_ = true;
             }
         }},
         { CONTROL_KEY_THUMBNAIL_SIZE, [this](const std::optional<std::string>& r) {

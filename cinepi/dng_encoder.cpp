@@ -818,21 +818,52 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     Matrix cam_xyz = (rgb2xyz * ccm * wb).Inv();
     std::copy(std::begin(cam_xyz.m), std::end(cam_xyz.m), dng_info.CAM_XYZ);
 
-    /* ──  Thumbnail (mono 8-bit Y-plane)  ─────────────────────── */
-    dng_info.thumbWidth           = lo_cfg.size.width;
-    dng_info.thumbHeight          = lo_cfg.size.height;
-    dng_info.thumbSamplesPerPixel = 1;
-    dng_info.thumbBitsPerSample   = 8;
-    dng_info.thumbPhotometric     = PHOTOMETRIC_MINISBLACK;   /* = 1 */
+    /* ──  Thumbnail (0 off / 1 mono / 2 colour) — sized here, once, so the
+     * buffer-size reservation below always matches what dng_save() will
+     * actually write. thumbnail changing camera-restarts (cameraInit_ = true
+     * in cinepi_controller.cpp, matching thumbnail_size's existing behaviour)
+     * specifically so a live redis flip can never outrun this reservation and
+     * silently overflow the per-frame buffer mid-take. thumbnail_size is a
+     * downscale divisor of the lores plane (1 = full 1272x720, 2 = half, …),
+     * clamped to >= 1, rounded to even for the colour path's 2x2 chroma. No
+     * lores stream (lo_cfg empty) forces the thumbnail off regardless of the
+     * option, since there is nothing to source it from. */
+    {
+        const int mode    = options_ ? options_->thumbnail : 0;
+        const int divisor = std::max(1, options_ ? options_->thumbnailSize : 1);
+        const bool haveLores = lo_cfg.size.width > 0 && lo_cfg.size.height > 0;
+
+        dng_info.thumbType = static_cast<uint8_t>((haveLores && (mode == 1 || mode == 2)) ? mode : 0);
+
+        if (dng_info.thumbType)
+        {
+            dng_info.thumbWidth  = static_cast<uint16_t>(std::max<uint32_t>(2, (lo_cfg.size.width  / divisor) & ~1u));
+            dng_info.thumbHeight = static_cast<uint16_t>(std::max<uint32_t>(2, (lo_cfg.size.height / divisor) & ~1u));
+            dng_info.thumbSamplesPerPixel = (dng_info.thumbType == 2) ? 3 : 1;
+            dng_info.thumbBitsPerSample   = 8;
+            dng_info.thumbPhotometric     = (dng_info.thumbType == 2) ? PHOTOMETRIC_RGB
+                                                                       : PHOTOMETRIC_MINISBLACK;
+        }
+        else
+        {
+            dng_info.thumbWidth = dng_info.thumbHeight = 0;
+            dng_info.thumbSamplesPerPixel = dng_info.thumbBitsPerSample = dng_info.thumbPhotometric = 0;
+        }
+    }
 
     /* ──  Buffer sizing  ──────────────────────────────────────── */
     /* 64 KB covers the IFD and its out-of-line payloads; log adds an 8 KB
-     * LinearizationTable on top of that. Worth stating explicitly: an overflow
-     * here does not crash, write_pod() throws and the frame is dropped without
-     * a pixel of evidence. */
+     * LinearizationTable on top of that, and an embedded thumbnail adds its
+     * own pixel bytes on top of that again. Worth stating explicitly: an
+     * overflow here does not crash, write_pod() throws and the frame is
+     * dropped without a pixel of evidence. */
     const uint32_t frame = ((cfg.size.width * dng_info.bits + 7) / 8) * cfg.size.height;
+    const uint32_t thumb_bytes = dng_info.thumbType
+        ? static_cast<uint32_t>(dng_info.thumbWidth) * dng_info.thumbHeight * dng_info.thumbSamplesPerPixel
+        : 0u;
     const uint32_t tail_slack =
-        64 * 1024 + (log_lut_ ? static_cast<uint32_t>(log_lut_->inverse_size() * sizeof(uint16_t)) : 0u);
+        64 * 1024 + (log_lut_ ? static_cast<uint32_t>(log_lut_->inverse_size() * sizeof(uint16_t)) : 0u)
+                  + thumb_bytes;
     dng_info.buffer_size = align_up(frame + tail_slack, ONE_MB);
 
     /* ──  Static strings & misc  ──────────────────────────────── */
@@ -886,7 +917,12 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     console->info("Encoder configured – {}×{} {}-bit, buffer {} MB",
                   cfg.size.width, cfg.size.height,
                   dng_info.bits, dng_info.buffer_size / ONE_MB);
-    console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
+    if (dng_info.thumbType)
+        console->info("DNG writer: embedded {} thumbnail {}x{} ({} B/frame)",
+                      dng_info.thumbType == 2 ? "colour" : "mono",
+                      dng_info.thumbWidth, dng_info.thumbHeight, thumb_bytes);
+    else
+        console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
     if (log_lut_)
         console->info("{}  LinearizationTable {} entries", log_lut_->params().describe(),
                       log_lut_->inverse_size());
@@ -901,15 +937,16 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                             const uint8_t                      *mem_buf,
                             const uint8_t                      *raw,
                             const StreamInfo                   &info,
-                            [[maybe_unused]] const uint8_t     *lomem,
-                            [[maybe_unused]] const StreamInfo  &loinfo,
-                            [[maybe_unused]] size_t             losize,
+                            const uint8_t                      *lomem,
+                            const StreamInfo                   &loinfo,
+                            size_t                               losize,
                             const libcamera::ControlList       &metadata,
                             int64_t                             timestamp_us,
                             int64_t                             tc_frame_count)
 {
     thread_local std::vector<uint8_t> rowBuf;
     thread_local std::vector<uint16_t> row16Buf;
+    thread_local std::vector<uint8_t> thumbRowBuf;
     const auto format_it = bayer_formats.find(info.pixel_format);
     if (format_it == bayer_formats.end())
         throw std::runtime_error("Unsupported Bayer format " + info.pixel_format.toString());
@@ -1310,7 +1347,92 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     strftime(dateStr, sizeof(dateStr), "%Y:%m:%d %H:%M:%S", lt);
     ifd.addEntry(0x9003, TIFF_ASCII, 20, dateStr);
 
-    ifd.sortEntries(); ifd.build(buf);
+    ifd.sortEntries();
+    const uint32_t ifd0NextOffset = ifd.build(buf);
+
+    /* ──  6. Embedded lores thumbnail — IFD1, chained after IFD0  ───────
+     * Decision 7 (2026-09-01): chain as IFD1 rather than move the raw image
+     * to a SubIFD, so IFD0 stays exactly what every existing CineMate DNG
+     * reader already expects. thumbType is 0 whenever the toggle is off or
+     * no lores stream exists (set once in setup_encoder(), see there for
+     * why it does not re-read live) — in that case nothing below runs, buf
+     * is untouched by this block, IFD0's next-IFD field is left at the 0
+     * IFDBuilder::build() already wrote, and the header patch below is
+     * identical to what dng_save() has always written. That is what makes
+     * thumbnail=0 byte-identical. */
+    if (dng_info.thumbType && lomem && losize > 0)
+    {
+        const uint32_t tw = dng_info.thumbWidth;
+        const uint32_t th = dng_info.thumbHeight;
+        const uint32_t srcStride = loinfo.stride;
+        const uint8_t *yPlane = lomem;
+        const uint32_t cStride = srcStride / 2;
+        const uint8_t *uPlane = lomem + srcStride * loinfo.height;
+        const uint8_t *vPlane = uPlane + cStride * (loinfo.height / 2);
+
+        const uint32_t thumbOff = buf.offset;
+        thumbRowBuf.resize(static_cast<size_t>(tw) * dng_info.thumbSamplesPerPixel);
+
+        for (uint32_t oy = 0; oy < th; ++oy)
+        {
+            const uint32_t sy = oy * loinfo.height / th;
+
+            if (dng_info.thumbType == 1)   /* mono: nearest-neighbour Y only */
+            {
+                for (uint32_t ox = 0; ox < tw; ++ox)
+                {
+                    const uint32_t sx = ox * loinfo.width / tw;
+                    thumbRowBuf[ox] = yPlane[sy * srcStride + sx];
+                }
+            }
+            else   /* colour: nearest-neighbour Y + 2x2-subsampled U/V -> RGB */
+            {
+                const uint32_t cy = sy / 2;
+                for (uint32_t ox = 0; ox < tw; ++ox)
+                {
+                    const uint32_t sx = ox * loinfo.width / tw;
+                    const uint32_t cx = sx / 2;
+                    const int Y = yPlane[sy * srcStride + sx];
+                    const int U = uPlane[cy * cStride + cx] - 128;
+                    const int V = vPlane[cy * cStride + cx] - 128;
+                    /* BT.601, Q16 fixed point */
+                    const int r = Y + ((91881 * V) >> 16);
+                    const int g = Y - ((22554 * U + 46802 * V) >> 16);
+                    const int b = Y + ((116130 * U) >> 16);
+                    uint8_t *px = &thumbRowBuf[3 * ox];
+                    px[0] = static_cast<uint8_t>(std::clamp(r, 0, 255));
+                    px[1] = static_cast<uint8_t>(std::clamp(g, 0, 255));
+                    px[2] = static_cast<uint8_t>(std::clamp(b, 0, 255));
+                }
+            }
+            write_pod(buf, thumbRowBuf.data(), thumbRowBuf.size());
+        }
+
+        const uint32_t thumbBytes = buf.offset - thumbOff;
+
+        IFDBuilder ifdThumb(tw, th);
+        ifdThumb.baseOffset = buf.usedSize;
+
+        uint32_t subfileType = 1;   /* reduced-resolution/preview image */
+        uint16_t bps[3] = {8, 8, 8};
+        ifdThumb.addEntry(254, TIFF_LONG , 1, &subfileType);
+        ifdThumb.addEntry(256, TIFF_LONG , 1, &tw);
+        ifdThumb.addEntry(257, TIFF_LONG , 1, &th);
+        ifdThumb.addEntry(258, TIFF_SHORT, dng_info.thumbSamplesPerPixel, bps);
+        ifdThumb.addEntry(259, TIFF_SHORT, 1, &dng_info.compression);
+        ifdThumb.addEntry(262, TIFF_SHORT, 1, &dng_info.thumbPhotometric);
+        ifdThumb.addEntry(273, TIFF_LONG , 1, &thumbOff);
+        ifdThumb.addEntry(277, TIFF_SHORT, 1, &dng_info.thumbSamplesPerPixel);
+        ifdThumb.addEntry(278, TIFF_LONG , 1, &th);
+        ifdThumb.addEntry(279, TIFF_LONG , 1, &thumbBytes);
+        ifdThumb.addEntry(284, TIFF_SHORT, 1, &planar);
+
+        ifdThumb.sortEntries();
+        ifdThumb.build(buf);
+
+        /* chain IFD0 -> IFD1 (IFD1's own next-IFD field is left at 0) */
+        *reinterpret_cast<uint32_t*>(buf.buffer + ifd0NextOffset) = ifdThumb.baseOffset;
+    }
 
     /* patch TIFF header with IFD-0 offset */
     *reinterpret_cast<uint32_t*>(buf.buffer + 4) = ifd.baseOffset;
