@@ -250,7 +250,7 @@ void CinePIController::sync(){
         thumbnail_size_ = stoi(*thumbnail_size);
     }else{
         thumbnail_size_ = CP_DEF_THUMBNAIL_SIZE;
-        redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_size_));
+        redis_->set(CONTROL_KEY_THUMBNAIL_SIZE, to_string(thumbnail_size_));
     }
 
     console->critical(10);
