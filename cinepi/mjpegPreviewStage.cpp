@@ -56,6 +56,14 @@ private:
 
 #define NAME "mjpegPreview"
 
+// The stream is published under two targets. "/stream" is the documented one;
+// "/" is here because that is what an operator actually types when told the
+// clean preview is "on port 8000", and nadjieb routes on the exact request
+// target, so a bare host:8000 was a bodyless 404 with no index and no
+// redirect.
+static constexpr char const *STREAM_PATH = "/stream";
+static constexpr char const *ROOT_PATH = "/";
+
 char const *mjpegStreamStage::Name() const
 {
     return NAME;
@@ -185,6 +193,16 @@ void mjpegStreamStage::Configure()
         streamer_ = std::make_unique<MJPEGStreamer>();
         try {
             streamer_->start(port_, 8);
+            // Register both targets before the first frame exists. nadjieb
+            // only learns a path when something is published to it, and
+            // 404s anything it does not know -- so opening the clean preview
+            // during boot or a camera restart hit a dead 404 page, and a
+            // plain browser navigation (unlike the GUI's <img>) has no retry
+            // to recover with. Publishing an empty buffer creates the topic
+            // with no clients and queues nothing, so a client that connects
+            // early is accepted and simply waits for the first real frame.
+            streamer_->publish(STREAM_PATH, std::string());
+            streamer_->publish(ROOT_PATH, std::string());
             return;
         } catch (std::exception const &e) {
             streamer_.reset();
@@ -225,7 +243,11 @@ bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
     console->trace("Sending JPEG buffer size: {}", jpegBuffer.size());
 
     auto startPublish = std::chrono::high_resolution_clock::now();
-    streamer_->publish("/stream", std::string(jpegBuffer.begin(), jpegBuffer.end()));
+    // Built once and published twice; nadjieb copies into each topic's buffer,
+    // and a ~15 kB frame at 25 fps is well under a megabyte a second.
+    std::string const payload(jpegBuffer.begin(), jpegBuffer.end());
+    streamer_->publish(STREAM_PATH, payload);
+    streamer_->publish(ROOT_PATH, payload);
     auto endPublish = std::chrono::high_resolution_clock::now();
 
     // Logging the durations
