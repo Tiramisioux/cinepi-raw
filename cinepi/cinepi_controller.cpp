@@ -865,14 +865,28 @@ void CinePIController::mainThread(){
             buffer_size_sent_ = false;
         }},
         { CONTROL_KEY_THUMBNAIL, [this](const std::optional<std::string>& r) {
-            if(r) {
-                options_->thumbnail = stoi(*r);
+            /* Bare stoi() on a live redis value with no guard: an empty
+             * string or anything non-numeric (a stray manual `redis-cli
+             * set thumbnail xyz`, or a boot-seed that skipped validation)
+             * throws std::invalid_argument uncaught, from inside a pub/sub
+             * callback -- matching the try/catch + !empty() shape every
+             * other live numeric knob here already uses (CONTROL_KEY_HDR_
+             * BLEND etc.). dng_save() clamps to 0..2 regardless, but a
+             * value that never reaches options_->thumbnail at all is
+             * safer than trusting the write path to clamp what should
+             * never have parsed. */
+            if(r && !r->empty()) {
+                try {
+                    options_->thumbnail = std::clamp(stoi(*r), 0, 2);
+                } catch (...) {}
             }
         }},
         { CONTROL_KEY_THUMBNAIL_SIZE, [this](const std::optional<std::string>& r) {
-            if(r) {
-                options_->thumbnailSize = stoi(*r);
-                cameraInit_ = true;
+            if(r && !r->empty()) {
+                try {
+                    options_->thumbnailSize = std::clamp(stoi(*r), 0, 12);
+                    cameraInit_ = true;
+                } catch (...) {}
             }
         }},
         { "log_level", [this](const std::optional<std::string>& r) {
