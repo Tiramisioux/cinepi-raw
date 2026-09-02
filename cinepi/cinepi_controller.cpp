@@ -22,7 +22,13 @@ using namespace std::chrono;
 #define CP_DEF_SHUTTER 50
 #define CP_DEF_AWB 1
 #define CP_DEF_COMPRESS 0
-#define CP_DEF_THUMBNAIL 1
+// 0 off. Now that this key means something, a standalone cinepi-raw run
+// (no CineMate seeding image_capture.thumbnail=0 into redis before launch),
+// a flushed redis, or a start before that seed runs would otherwise write
+// mono thumbnails into every frame by default -- contradicting both repos'
+// docs, which say off by default, and every cost figure in the plan, which
+// treats "on" as an operator opt-in pending hardware verification.
+#define CP_DEF_THUMBNAIL 0
 // thumbnail_size is a right-shift applied to the lores plane inside
 // dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 0 is
 // the default: it is what every size/cost figure in the C9 plan and
