@@ -825,6 +825,22 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.thumbBitsPerSample   = 8;
     dng_info.thumbPhotometric     = PHOTOMETRIC_MINISBLACK;   /* = 1 */
 
+    /* Worst-case (colour) thumbnail bytes, reserved in dng_info.buffer_size
+     * below regardless of the current `thumbnail` mode: CONTROL_KEY_THUMBNAIL
+     * has a live pub/sub handler with no restart, so the mode can flip 0->2
+     * between here and the next setup_encoder() call, and sizing against
+     * today's mode would let that live toggle overflow the buffer.
+     * CONTROL_KEY_THUMBNAIL_SIZE's handler does set cameraInit_ (restart),
+     * so it IS safe to size against thumbnailSize's value right now. */
+    /* Clamped, not just floored: thumbnailSize reaches here via a bare
+     * stoi() on the live redis handler with no range check, and an
+     * unclamped shift is undefined behaviour on a 32-bit width/height once
+     * it reaches the type's bit width. 12 already collapses 1272 to 0. */
+    const int thumb_shift = options_ ? std::clamp(options_->thumbnailSize, 0, 12) : 0;
+    const uint32_t thumb_reserved_bytes =
+        std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift) *
+        std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift) * 3u;   /* 3 B/px: colour */
+
     /* ──  Buffer sizing  ──────────────────────────────────────── */
     /* 64 KB covers the IFD and its out-of-line payloads; log adds an 8 KB
      * LinearizationTable on top of that. Worth stating explicitly: an overflow
@@ -832,7 +848,8 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      * a pixel of evidence. */
     const uint32_t frame = ((cfg.size.width * dng_info.bits + 7) / 8) * cfg.size.height;
     const uint32_t tail_slack =
-        64 * 1024 + (log_lut_ ? static_cast<uint32_t>(log_lut_->inverse_size() * sizeof(uint16_t)) : 0u);
+        64 * 1024 + (log_lut_ ? static_cast<uint32_t>(log_lut_->inverse_size() * sizeof(uint16_t)) : 0u)
+        + thumb_reserved_bytes;
     dng_info.buffer_size = align_up(frame + tail_slack, ONE_MB);
 
     /* ──  Static strings & misc  ──────────────────────────────── */
@@ -1314,6 +1331,100 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
     /* patch TIFF header with IFD-0 offset */
     *reinterpret_cast<uint32_t*>(buf.buffer + 4) = ifd.baseOffset;
+
+    /* ──  6.  Thumbnail (IFD1, chained after IFD0)  ────────────────
+     * Open decision 7, settled 2026-09-01: chained as IFD1 rather than
+     * IFD0-with-raw-in-a-SubIFD. IFD0 above is untouched by this block --
+     * same bytes, same offset, same next-IFD field left at 0 -- whenever
+     * `thumbnail` is 0 or the lores stream is absent, which is what makes
+     * the off position a genuine no-op. `thumbnail`'s live pub/sub handler
+     * has no restart, so it is read fresh every frame here rather than
+     * cached from setup_encoder(). */
+    const int thumb_mode = options_ ? options_->thumbnail : 0;
+    if ((thumb_mode == 1 || thumb_mode == 2) &&
+        lomem && losize && loinfo.width && loinfo.height && loinfo.stride)
+    {
+        const bool colour = (thumb_mode == 2);
+        const int shift = std::clamp(options_->thumbnailSize, 0, 12);   /* see setup_encoder() */
+        const uint32_t tw = std::max<uint32_t>(1, loinfo.width  >> shift);
+        const uint32_t th = std::max<uint32_t>(1, loinfo.height >> shift);
+        const uint16_t spp = colour ? 3 : 1;
+
+        /* lomem is planar YUV420 (I420): Y at lomem, stride loinfo.stride;
+         * U at lomem + stride*height, chroma stride stride/2; V right after
+         * U's plane. Same layout ccmp_preview.hpp writes into this same
+         * buffer. Mono only ever touches Y; colour does a BT.601 YUV->RGB
+         * convert per sampled pixel -- there is no cheaper colour thumbnail
+         * without shipping a YCbCr reader nothing else in this codebase (or
+         * its pane) has. */
+        const uint32_t ys = loinfo.stride;
+        const uint32_t cs = ys / 2;
+        const uint8_t *uplane = colour ? (lomem + static_cast<size_t>(ys) * loinfo.height) : nullptr;
+        const uint8_t *vplane = colour ? (uplane + static_cast<size_t>(cs) * (loinfo.height / 2)) : nullptr;
+
+        const uint32_t thumbOff = buf.offset;
+        std::vector<uint8_t> thumbRow(static_cast<size_t>(tw) * spp);
+
+        for (uint32_t y = 0; y < th; ++y)
+        {
+            const uint32_t srcY = std::min(y << shift, loinfo.height - 1);
+            const uint8_t *yrow = lomem + static_cast<size_t>(srcY) * ys;
+
+            if (!colour)
+            {
+                for (uint32_t x = 0; x < tw; ++x)
+                    thumbRow[x] = yrow[std::min(x << shift, loinfo.width - 1)];
+            }
+            else
+            {
+                const uint8_t *urow = uplane + static_cast<size_t>(srcY / 2) * cs;
+                const uint8_t *vrow = vplane + static_cast<size_t>(srcY / 2) * cs;
+                for (uint32_t x = 0; x < tw; ++x)
+                {
+                    const uint32_t srcX = std::min(x << shift, loinfo.width - 1);
+                    const int Y = yrow[srcX];
+                    const int U = urow[srcX / 2] - 128;
+                    const int V = vrow[srcX / 2] - 128;
+                    /* BT.601, fixed-point (Q16) */
+                    const int r = Y + ((91881 * V) >> 16);
+                    const int g = Y - ((22554 * U + 46802 * V) >> 16);
+                    const int b = Y + ((116130 * U) >> 16);
+                    thumbRow[3 * x + 0] = static_cast<uint8_t>(std::clamp(r, 0, 255));
+                    thumbRow[3 * x + 1] = static_cast<uint8_t>(std::clamp(g, 0, 255));
+                    thumbRow[3 * x + 2] = static_cast<uint8_t>(std::clamp(b, 0, 255));
+                }
+            }
+            write_pod(buf, thumbRow.data(), thumbRow.size());
+        }
+        const uint32_t thumbSize = buf.offset - thumbOff;
+
+        IFDBuilder ifd1(tw, th);
+        ifd1.baseOffset = buf.usedSize;
+
+        uint32_t subfileType = 1;                 /* thumbnail/reduced-res image */
+        uint16_t bitsArr[3]  = {8, 8, 8};          /* one per sample, TIFF-spec count */
+        uint16_t compression1 = COMPRESSION_NONE;
+        uint16_t phot1 = colour ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK;
+        uint16_t planar1 = 1;
+
+        ifd1.addEntry(254, TIFF_LONG , 1  , &subfileType);
+        ifd1.addEntry(256, TIFF_LONG , 1  , &tw);
+        ifd1.addEntry(257, TIFF_LONG , 1  , &th);
+        ifd1.addEntry(258, TIFF_SHORT, spp, bitsArr);
+        ifd1.addEntry(259, TIFF_SHORT, 1  , &compression1);
+        ifd1.addEntry(262, TIFF_SHORT, 1  , &phot1);
+        ifd1.addEntry(273, TIFF_LONG , 1  , &thumbOff);
+        ifd1.addEntry(277, TIFF_SHORT, 1  , &spp);
+        ifd1.addEntry(278, TIFF_LONG , 1  , &th);
+        ifd1.addEntry(279, TIFF_LONG , 1  , &thumbSize);
+        ifd1.addEntry(284, TIFF_SHORT, 1  , &planar1);
+
+        ifd1.sortEntries(); ifd1.build(buf);
+
+        /* chain IFD0 -> IFD1 */
+        *reinterpret_cast<uint32_t*>(buf.buffer + ifd.nextIfdFieldOffset) = ifd1.baseOffset;
+    }
+
     return buf.usedSize;
 }
 

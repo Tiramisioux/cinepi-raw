@@ -23,7 +23,13 @@ using namespace std::chrono;
 #define CP_DEF_AWB 1
 #define CP_DEF_COMPRESS 0
 #define CP_DEF_THUMBNAIL 1
-#define CP_DEF_THUMBNAIL_SIZE 3
+// thumbnail_size is a right-shift applied to the lores plane inside
+// dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 0 is
+// the default: it is what every size/cost figure in the C9 plan and
+// GATES.md assumes (the 1272x720 lores frame, unscaled). The redis value
+// found resident pre-feature (PI-008: thumbnail_size=50) predates any
+// consumer of this key and is not a default worth preserving.
+#define CP_DEF_THUMBNAIL_SIZE 0
 
 /* ── imx585 ClearHDR live knobs ─────────────────────────────────────────────
  * The knobs are custom V4L2 controls on the sensor subdev; their IDs mirror
