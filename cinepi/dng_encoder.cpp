@@ -1446,6 +1446,17 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         }
         const uint32_t thumbSize = buf.offset - thumbOff;
 
+        /* TIFF 6.0 requires every IFD to start on a word (2-byte, here
+         * kept to the stricter 4-byte) boundary. The strip is tw*th*spp
+         * bytes with no padding of its own, so an odd byte count -- mono
+         * at an odd width, or any width*3 that lands odd -- would
+         * otherwise leave IFD1 on an odd offset. */
+        if (buf.offset & 3)
+        {
+            static const uint8_t zeros[4] = {0, 0, 0, 0};
+            write_pod(buf, zeros, 4 - (buf.offset & 3));
+        }
+
         IFDBuilder ifd1(tw, th);
         ifd1.baseOffset = buf.usedSize;
 
