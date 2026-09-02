@@ -11,6 +11,7 @@
  #include <iostream>                // debugging, std::cerr
  #include <libcamera/control_ids.h> // metadata.get(controls::...)
  #include <libcamera/formats.h>     // libcamera::formats::
+ #include <libcamera/color_space.h> // loinfo.colour_space->ycbcrEncoding
  #include <cmath>
 #include <cstring>
 #include <cerrno>
@@ -1353,17 +1354,41 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         /* lomem is planar YUV420 (I420): Y at lomem, stride loinfo.stride;
          * U at lomem + stride*height, chroma stride stride/2; V right after
          * U's plane. Same layout ccmp_preview.hpp writes into this same
-         * buffer. Mono only ever touches Y; colour does a BT.601 YUV->RGB
-         * convert per sampled pixel -- there is no cheaper colour thumbnail
-         * without shipping a YCbCr reader nothing else in this codebase (or
-         * its pane) has. */
+         * buffer.
+         *
+         * The lores stream is STUDIO-RANGE (Y 16-235, chroma 16-240):
+         * rpicam_app.cpp's ConfigureVideo picks colorSpace Rec709 for any
+         * stream >=1280 wide or >=720 tall, which is every CineMate launch
+         * (lores height is capped at 720 by sensor_detect._calc_lores()),
+         * and this codebase's own preview path already treats that stream
+         * as limited range -- ccmp_preview.hpp's setYuvCoeffs() bakes in
+         * the same 219/224 scaling with a Y=16/UV=128 black point. Copying
+         * codes verbatim (mono) or decoding with full-range coefficients
+         * (colour, as this used to) puts black at code 16 (~6% grey) with
+         * white at 235, plus a 601-vs-709 hue error in colour. Fixed here
+         * by expanding range (mono) and by decoding with the matrix that
+         * actually matches the stream's own encoding (colour) -- read off
+         * loinfo.colour_space the same way ccmpPreviewStage.cpp reads it
+         * for the *display* path, rather than assumed. */
+        const bool rec709 = loinfo.colour_space &&
+                            loinfo.colour_space->ycbcrEncoding == libcamera::ColorSpace::YcbcrEncoding::Rec709;
+        /* Fixed-point (Q16), ITU-R BT.601-7 / BT.709-6 limited-range
+         * constants -- e.g. R = 1.164*(Y-16) + 1.596*Cr (601) or
+         * 1.164*(Y-16) + 1.793*Cr (709), Cr/Cb already centred on 128. */
+        constexpr int32_t kY   = 76285;                        /* 1.164, both spaces  */
+        const     int32_t kVR  = rec709 ? 117506 : 104598;      /* Cr -> R             */
+        const     int32_t kUG  = rec709 ?  -13960 :  -25690;    /* Cb -> G             */
+        const     int32_t kVG  = rec709 ?  -34941 :  -53295;    /* Cr -> G             */
+        const     int32_t kUB  = rec709 ?  138412 :  132202;    /* Cb -> B             */
+
         const uint32_t ys = loinfo.stride;
         const uint32_t cs = ys / 2;
         const uint8_t *uplane = colour ? (lomem + static_cast<size_t>(ys) * loinfo.height) : nullptr;
         const uint8_t *vplane = colour ? (uplane + static_cast<size_t>(cs) * (loinfo.height / 2)) : nullptr;
 
         const uint32_t thumbOff = buf.offset;
-        std::vector<uint8_t> thumbRow(static_cast<size_t>(tw) * spp);
+        thread_local std::vector<uint8_t> thumbRow;
+        thumbRow.resize(static_cast<size_t>(tw) * spp);
 
         for (uint32_t y = 0; y < th; ++y)
         {
@@ -1372,8 +1397,21 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
             if (!colour)
             {
-                for (uint32_t x = 0; x < tw; ++x)
-                    thumbRow[x] = yrow[std::min(x << shift, loinfo.width - 1)];
+                if (shift == 0)
+                {
+                    /* Full-resolution mono: one row is a contiguous read,
+                     * only the range expansion per sample. */
+                    for (uint32_t x = 0; x < tw; ++x)
+                        thumbRow[x] = static_cast<uint8_t>(
+                            std::clamp((static_cast<int>(yrow[x]) - 16) * 255 / 219, 0, 255));
+                }
+                else
+                {
+                    for (uint32_t x = 0; x < tw; ++x)
+                        thumbRow[x] = static_cast<uint8_t>(std::clamp(
+                            (static_cast<int>(yrow[std::min(x << shift, loinfo.width - 1)]) - 16) * 255 / 219,
+                            0, 255));
+                }
             }
             else
             {
@@ -1382,13 +1420,13 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                 for (uint32_t x = 0; x < tw; ++x)
                 {
                     const uint32_t srcX = std::min(x << shift, loinfo.width - 1);
-                    const int Y = yrow[srcX];
-                    const int U = urow[srcX / 2] - 128;
-                    const int V = vrow[srcX / 2] - 128;
-                    /* BT.601, fixed-point (Q16) */
-                    const int r = Y + ((91881 * V) >> 16);
-                    const int g = Y - ((22554 * U + 46802 * V) >> 16);
-                    const int b = Y + ((116130 * U) >> 16);
+                    const int32_t Yn = static_cast<int32_t>(yrow[srcX]) - 16;
+                    const int32_t U  = static_cast<int32_t>(urow[srcX / 2]) - 128;
+                    const int32_t V  = static_cast<int32_t>(vrow[srcX / 2]) - 128;
+                    const int32_t y0 = kY * Yn;
+                    const int r = (y0 + kVR * V) >> 16;
+                    const int g = (y0 + kUG * U + kVG * V) >> 16;
+                    const int b = (y0 + kUB * U) >> 16;
                     thumbRow[3 * x + 0] = static_cast<uint8_t>(std::clamp(r, 0, 255));
                     thumbRow[3 * x + 1] = static_cast<uint8_t>(std::clamp(g, 0, 255));
                     thumbRow[3 * x + 2] = static_cast<uint8_t>(std::clamp(b, 0, 255));
