@@ -244,6 +244,7 @@ private:
      *      buffer was sized but before the take that uses it starts). */
     int thumb_mode_  = 0;   /* 0 off / 1 mono / 2 colour, this take     */
     int thumb_shift_ = 0;   /* clamp(thumbnailSize, 0, 12), this take   */
+    bool thumb_lores_warned_ = false;  /* one warning per take, not per frame */
 
     /* ──  Reusable encoded-buffer pool  ───────────────────── */
     std::vector<uint8_t *> buffer_pool_;

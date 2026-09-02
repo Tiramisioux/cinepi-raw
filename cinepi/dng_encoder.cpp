@@ -835,6 +835,7 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      * collapses 1272 to 0. */
     thumb_mode_  = options_ ? options_->thumbnail : 0;
     thumb_shift_ = options_ ? std::clamp(options_->thumbnailSize, 0, 12) : 0;
+    thumb_lores_warned_ = false;   /* one warning per take, re-armed here */
 
     /* Bytes this take's thumbnail actually needs -- 0 when off, so a take
      * recorded with the toggle off gets none of this reserved, not the
@@ -907,7 +908,14 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     console->info("Encoder configured – {}×{} {}-bit, buffer {} MB",
                   cfg.size.width, cfg.size.height,
                   dng_info.bits, dng_info.buffer_size / ONE_MB);
-    console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
+    if (thumb_mode_ == 0)
+        console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
+    else
+        console->info("DNG writer: embedded lores thumbnail {} at {}x{} (shift {})",
+                      thumb_mode_ == 2 ? "colour" : "mono",
+                      std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift_),
+                      std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift_),
+                      thumb_shift_);
     if (log_lut_)
         console->info("{}  LinearizationTable {} entries", log_lut_->params().describe(),
                       log_lut_->inverse_size());
@@ -1352,8 +1360,32 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
      * frames, and the buffer_size reservation in setup_encoder() (sized
      * against this same snapshot) could be overflowed by a mode that
      * changed after it was computed. */
-    if ((thumb_mode_ == 1 || thumb_mode_ == 2) &&
-        lomem && losize && loinfo.width && loinfo.height && loinfo.stride)
+    /* losize was previously only checked non-zero, then U/V addresses
+     * were derived from stride and height regardless -- a short or
+     * differently-shaped buffer (a mis-set lores format, a mid-stream
+     * reconfigure this take's snapshot predates) would read past it.
+     * Require the exact byte count the layout below assumes, and the
+     * pixel format that layout assumes too. */
+    const bool thumb_want = (thumb_mode_ == 1 || thumb_mode_ == 2);
+    const bool thumb_lores_ok = thumb_want &&
+        lomem && loinfo.width && loinfo.height && loinfo.stride &&
+        loinfo.pixel_format == libcamera::formats::YUV420 &&
+        losize >= (thumb_mode_ == 2
+            ? static_cast<size_t>(loinfo.stride) * loinfo.height
+              + 2 * static_cast<size_t>(loinfo.stride / 2) * (loinfo.height / 2)
+            : static_cast<size_t>(loinfo.stride) * loinfo.height);
+
+    if (thumb_want && !thumb_lores_ok && !thumb_lores_warned_)
+    {
+        console->warn("thumbnail requested (mode {}) but the lores buffer does not match "
+                      "the expected YUV420 shape (format {}, {}x{} stride {}, losize {}); "
+                      "skipping the thumbnail for this take", thumb_mode_,
+                      loinfo.pixel_format.toString(), loinfo.width, loinfo.height,
+                      loinfo.stride, losize);
+        thumb_lores_warned_ = true;
+    }
+
+    if (thumb_lores_ok)
     {
         const bool colour = (thumb_mode_ == 2);
         const int shift = thumb_shift_;
