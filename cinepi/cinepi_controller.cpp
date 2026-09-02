@@ -253,7 +253,28 @@ void CinePIController::sync(){
 
     auto thumbnail_size = pipe_replies.get<OptionalString>(9);
     if(thumbnail_size){
-        thumbnail_size_ = stoi(*thumbnail_size);
+        int candidate = stoi(*thumbnail_size);
+        int clamped = std::clamp(candidate, 0, 12);
+        /* A resident value this large collapses the thumbnail to a
+         * handful of pixels or fewer: PI-008 found thumbnail_size=50
+         * resident from before this key had any consumer, which clamps
+         * to 12 and, against CineMate's 1272-wide lores plane, produces
+         * a 1x1 thumbnail (1272 >> 12 == 0, floored to 1) -- silently,
+         * since dng_save() never rejects a shift, only floors it. Refuse
+         * and re-seed rather than accept a value that quietly launches
+         * the +7-22% write-cost feature and delivers nothing. Skipped
+         * when lores_width is 0 (no lores stream configured at all --
+         * standalone cinepi-raw with no --lores-width -- where the
+         * thumbnail is unreachable anyway; see dng_save()'s lomem guard). */
+        if (options_->lores_width && (options_->lores_width >> clamped) < 16) {
+            console->warn("thumbnail_size={} (clamped {}) would collapse the {}px-wide "
+                          "lores thumbnail below 16px; resetting to the default {}",
+                          candidate, clamped, options_->lores_width, CP_DEF_THUMBNAIL_SIZE);
+            thumbnail_size_ = CP_DEF_THUMBNAIL_SIZE;
+            redis_->set(CONTROL_KEY_THUMBNAIL_SIZE, to_string(thumbnail_size_));
+        } else {
+            thumbnail_size_ = candidate;
+        }
     }else{
         thumbnail_size_ = CP_DEF_THUMBNAIL_SIZE;
         redis_->set(CONTROL_KEY_THUMBNAIL_SIZE, to_string(thumbnail_size_));
