@@ -826,21 +826,24 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.thumbBitsPerSample   = 8;
     dng_info.thumbPhotometric     = PHOTOMETRIC_MINISBLACK;   /* = 1 */
 
-    /* Worst-case (colour) thumbnail bytes, reserved in dng_info.buffer_size
-     * below regardless of the current `thumbnail` mode: CONTROL_KEY_THUMBNAIL
-     * has a live pub/sub handler with no restart, so the mode can flip 0->2
-     * between here and the next setup_encoder() call, and sizing against
-     * today's mode would let that live toggle overflow the buffer.
-     * CONTROL_KEY_THUMBNAIL_SIZE's handler does set cameraInit_ (restart),
-     * so it IS safe to size against thumbnailSize's value right now. */
-    /* Clamped, not just floored: thumbnailSize reaches here via a bare
-     * stoi() on the live redis handler with no range check, and an
-     * unclamped shift is undefined behaviour on a 32-bit width/height once
-     * it reaches the type's bit width. 12 already collapses 1272 to 0. */
-    const int thumb_shift = options_ ? std::clamp(options_->thumbnailSize, 0, 12) : 0;
+    /* Snapshot the mode and shift for THIS take -- see the members' own
+     * comment in dng_encoder.hpp for why dng_save() must read these and
+     * not options_ live. Clamped, not just floored: thumbnailSize reaches
+     * here via a bare stoi() on the live redis handler with no range
+     * check, and an unclamped shift is undefined behaviour on a 32-bit
+     * width/height once it reaches the type's bit width. 12 already
+     * collapses 1272 to 0. */
+    thumb_mode_  = options_ ? options_->thumbnail : 0;
+    thumb_shift_ = options_ ? std::clamp(options_->thumbnailSize, 0, 12) : 0;
+
+    /* Bytes this take's thumbnail actually needs -- 0 when off, so a take
+     * recorded with the toggle off gets none of this reserved, not the
+     * worst case every take used to pay regardless of mode. */
     const uint32_t thumb_reserved_bytes =
-        std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift) *
-        std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift) * 3u;   /* 3 B/px: colour */
+        (thumb_mode_ == 0) ? 0u :
+        std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift_) *
+        std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift_) *
+        static_cast<uint32_t>(thumb_mode_ == 2 ? 3 : 1);
 
     /* ──  Buffer sizing  ──────────────────────────────────────── */
     /* 64 KB covers the IFD and its out-of-line payloads; log adds an 8 KB
@@ -1338,15 +1341,22 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
      * IFD0-with-raw-in-a-SubIFD. IFD0 above is untouched by this block --
      * same bytes, same offset, same next-IFD field left at 0 -- whenever
      * `thumbnail` is 0 or the lores stream is absent, which is what makes
-     * the off position a genuine no-op. `thumbnail`'s live pub/sub handler
-     * has no restart, so it is read fresh every frame here rather than
-     * cached from setup_encoder(). */
-    const int thumb_mode = options_ ? options_->thumbnail : 0;
-    if ((thumb_mode == 1 || thumb_mode == 2) &&
+     * the off position a genuine no-op.
+     *
+     * thumb_mode_/thumb_shift_, NOT options_->thumbnail/thumbnailSize:
+     * these are the snapshot setup_encoder() took at the start of THIS
+     * take (see their comment in dng_encoder.hpp). A live `set thumbnail`
+     * changes options_ immediately but only reaches a file at the next
+     * take -- otherwise two encode workers racing options_ mid-take could
+     * write one take with a non-monotonic mix of thumbnail/no-thumbnail
+     * frames, and the buffer_size reservation in setup_encoder() (sized
+     * against this same snapshot) could be overflowed by a mode that
+     * changed after it was computed. */
+    if ((thumb_mode_ == 1 || thumb_mode_ == 2) &&
         lomem && losize && loinfo.width && loinfo.height && loinfo.stride)
     {
-        const bool colour = (thumb_mode == 2);
-        const int shift = std::clamp(options_->thumbnailSize, 0, 12);   /* see setup_encoder() */
+        const bool colour = (thumb_mode_ == 2);
+        const int shift = thumb_shift_;
         const uint32_t tw = std::max<uint32_t>(1, loinfo.width  >> shift);
         const uint32_t th = std::max<uint32_t>(1, loinfo.height >> shift);
         const uint16_t spp = colour ? 3 : 1;
