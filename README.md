@@ -340,9 +340,28 @@ Requirements:
 | Piece | Needed | Why |
 |---|---|---|
 | Kernel | ≥ 6.12.93+rpt | older `rp1-cfe` kernel drivers corrupt 16-bit CSI-2 capture (fixed mid-2025: "Avoid unpack operation for 16-bit formats") |
-| Sensor driver | Tiramisioux `imx585-v4l2-driver`, branch `6.12.y` | exposes `wide_dynamic_range` and the 16-bit modes (3856×2180, 1928×1090) |
+| Sensor driver | Tiramisioux `imx585-v4l2-driver`, branch `cinemate-7modes` | exposes `wide_dynamic_range` and the 16-bit modes (3840×2200 4K, 1920×1100 2x2-binned — binned is colour-sensor only) |
 | libcamera | Tiramisioux `libcamera`, branch `cinemate` | 16-bit endian swap, gated off compressed formats |
 | Exposure | manual in 16-bit modes | ISP statistics are invalid at 16-bit — AGC/AWB cannot run there. The 12-bit ClearHDR mode below keeps them working. |
+
+### Launch refusal on failed HDR handshake
+
+Launching with `--hdr sensor` or `--hdr auto` now hard-fails at startup if the
+sensor doesn't confirm the ClearHDR write. cinepi-raw writes
+`wide_dynamic_range=1` to the sensor subdevice, reads it back, and retries up
+to 4 times at 50ms apart; if the readback never comes back true, it throws
+instead of launching:
+
+> `imx585/imx708 ClearHDR: sensor did not accept wide_dynamic_range=1 after retrying -- refusing to launch with --hdr sensor while the sensor's combiner is still off (this is the invalid-combo BLC-fill defect, not a software problem; retry the launch)`
+
+(`sensor` in the message is whichever `--hdr` value was passed.)
+
+This is not a new regression — it converts a previously silent failure into a
+hard one. Before this check, a failed write left the sensor's WDR combiner
+off while cinepi-raw still launched in a ClearHDR mode, so the DNGs recorded
+a flat BLC pedestal fill instead of real data, with every ClearHDR knob
+(thresholds, blend, gain adder) inert against it. If you hit this error,
+retry the launch.
 
 ### 16-bit ClearHDR
 
