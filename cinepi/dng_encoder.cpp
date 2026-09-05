@@ -833,7 +833,20 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      * check, and an unclamped shift is undefined behaviour on a 32-bit
      * width/height once it reaches the type's bit width. 12 already
      * collapses 1272 to 0. */
-    thumb_mode_  = options_ ? options_->thumbnail : 0;
+    /* Always a colour thumbnail. This used to read options_->thumbnail, which
+     * is assigned only in CinePIController::sync() -- and sync() runs after
+     * the encoder is configured, so this read 0 whatever redis held. The
+     * camera reported "embedded lores thumbnail disabled" on every take while
+     * thumbnail=2 sat in redis and the lores stream was configured correctly.
+     * That ordering was never going to be visible from the redis side, which
+     * is why the key looked right the whole time.
+     *
+     * Rather than move the assignment earlier and leave a mode that has to
+     * win a race on every start, the choice is gone: every take gets a colour
+     * thumbnail. Playback wants one on every take, raw decode is far more
+     * expensive on the Pi than serving an embedded thumbnail, and a mode that
+     * is always 2 in practice is not worth the ordering hazard. */
+    thumb_mode_  = 2;
     thumb_shift_ = options_ ? std::clamp(options_->thumbnailSize, 0, 12) : 0;
     thumb_lores_warned_ = false;   /* one warning per take, re-armed here */
 
