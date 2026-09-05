@@ -221,6 +221,31 @@ private:
      * beside log_lut_ and only meaningful while it is non-null. */
     unsigned log_src_shift_ = 0;
 
+    /* ──  DNG thumbnail (IFD1)  ─────────────────────────────
+     * Snapshotted once per configure in setup_encoder() from
+     * options_->thumbnail/thumbnailSize, exactly like log_lut_ above --
+     * NOT read live from options_ in dng_save(). Two reasons, both from
+     * the same fact: setup_encoder() re-runs at the start of every take
+     * (reset_encoder() is called on the rec trigger and on every
+     * resolution reconfigure; DngEncoder::initialized() then false-gates
+     * the next EncodeBuffer() into a fresh setup_encoder() call), while
+     * CONTROL_KEY_THUMBNAIL's own pub/sub handler applies live with no
+     * restart of any kind.
+     *   1. Per-take semantics with no camera restart: a `set thumbnail`
+     *      mid-take changes options_->thumbnail immediately, but the
+     *      snapshot -- and so the file on disk -- only picks it up at
+     *      the NEXT take, never mid-take. Without this, two encode
+     *      workers racing the live value could produce one take with a
+     *      non-monotonic mix of thumbnail/no-thumbnail frames.
+     *   2. dng_info.buffer_size can reserve exactly what this take needs
+     *      (0 when off) instead of worst-case colour bytes on every take
+     *      regardless of mode, which is what reading options_ live would
+     *      have required (the mode could otherwise change after the
+     *      buffer was sized but before the take that uses it starts). */
+    int thumb_mode_  = 0;   /* 0 off / 1 mono / 2 colour, this take     */
+    int thumb_shift_ = 0;   /* clamp(thumbnailSize, 0, 12), this take   */
+    bool thumb_lores_warned_ = false;  /* one warning per take, not per frame */
+
     /* ──  Reusable encoded-buffer pool  ───────────────────── */
     std::vector<uint8_t *> buffer_pool_;
     std::mutex              buffer_pool_mutex_;

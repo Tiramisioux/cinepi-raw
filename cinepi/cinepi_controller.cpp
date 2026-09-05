@@ -22,8 +22,20 @@ using namespace std::chrono;
 #define CP_DEF_SHUTTER 50
 #define CP_DEF_AWB 1
 #define CP_DEF_COMPRESS 0
-#define CP_DEF_THUMBNAIL 1
-#define CP_DEF_THUMBNAIL_SIZE 3
+// 2 (colour). G10/G11 verified on hardware and the operator has made the
+// embedded thumbnail the standard playback path -- raw decode is far more
+// demanding on the Pi and is no longer the pane's fallback (see playback.py
+// on the cinemate side). A standalone cinepi-raw run (no CineMate seeding
+// image_capture.thumbnail into redis before launch), a flushed redis, or a
+// start before that seed runs now gets the same default CineMate ships.
+#define CP_DEF_THUMBNAIL 2
+// thumbnail_size is a right-shift applied to the lores plane inside
+// dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 0 is
+// the default: it is what every size/cost figure in the C9 plan and
+// GATES.md assumes (the 1272x720 lores frame, unscaled). The redis value
+// found resident pre-feature (PI-008: thumbnail_size=50) predates any
+// consumer of this key and is not a default worth preserving.
+#define CP_DEF_THUMBNAIL_SIZE 0
 
 /* ── imx585 ClearHDR live knobs ─────────────────────────────────────────────
  * The knobs are custom V4L2 controls on the sensor subdev; their IDs mirror
@@ -247,10 +259,31 @@ void CinePIController::sync(){
 
     auto thumbnail_size = pipe_replies.get<OptionalString>(9);
     if(thumbnail_size){
-        thumbnail_size_ = stoi(*thumbnail_size);
+        int candidate = stoi(*thumbnail_size);
+        int clamped = std::clamp(candidate, 0, 12);
+        /* A resident value this large collapses the thumbnail to a
+         * handful of pixels or fewer: PI-008 found thumbnail_size=50
+         * resident from before this key had any consumer, which clamps
+         * to 12 and, against CineMate's 1272-wide lores plane, produces
+         * a 1x1 thumbnail (1272 >> 12 == 0, floored to 1) -- silently,
+         * since dng_save() never rejects a shift, only floors it. Refuse
+         * and re-seed rather than accept a value that quietly launches
+         * the +7-22% write-cost feature and delivers nothing. Skipped
+         * when lores_width is 0 (no lores stream configured at all --
+         * standalone cinepi-raw with no --lores-width -- where the
+         * thumbnail is unreachable anyway; see dng_save()'s lomem guard). */
+        if (options_->lores_width && (options_->lores_width >> clamped) < 16) {
+            console->warn("thumbnail_size={} (clamped {}) would collapse the {}px-wide "
+                          "lores thumbnail below 16px; resetting to the default {}",
+                          candidate, clamped, options_->lores_width, CP_DEF_THUMBNAIL_SIZE);
+            thumbnail_size_ = CP_DEF_THUMBNAIL_SIZE;
+            redis_->set(CONTROL_KEY_THUMBNAIL_SIZE, to_string(thumbnail_size_));
+        } else {
+            thumbnail_size_ = candidate;
+        }
     }else{
         thumbnail_size_ = CP_DEF_THUMBNAIL_SIZE;
-        redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_size_));
+        redis_->set(CONTROL_KEY_THUMBNAIL_SIZE, to_string(thumbnail_size_));
     }
 
     console->critical(10);
@@ -832,14 +865,28 @@ void CinePIController::mainThread(){
             buffer_size_sent_ = false;
         }},
         { CONTROL_KEY_THUMBNAIL, [this](const std::optional<std::string>& r) {
-            if(r) {
-                options_->thumbnail = stoi(*r);
+            /* Bare stoi() on a live redis value with no guard: an empty
+             * string or anything non-numeric (a stray manual `redis-cli
+             * set thumbnail xyz`, or a boot-seed that skipped validation)
+             * throws std::invalid_argument uncaught, from inside a pub/sub
+             * callback -- matching the try/catch + !empty() shape every
+             * other live numeric knob here already uses (CONTROL_KEY_HDR_
+             * BLEND etc.). dng_save() clamps to 0..2 regardless, but a
+             * value that never reaches options_->thumbnail at all is
+             * safer than trusting the write path to clamp what should
+             * never have parsed. */
+            if(r && !r->empty()) {
+                try {
+                    options_->thumbnail = std::clamp(stoi(*r), 0, 2);
+                } catch (...) {}
             }
         }},
         { CONTROL_KEY_THUMBNAIL_SIZE, [this](const std::optional<std::string>& r) {
-            if(r) {
-                options_->thumbnailSize = stoi(*r);
-                cameraInit_ = true;
+            if(r && !r->empty()) {
+                try {
+                    options_->thumbnailSize = std::clamp(stoi(*r), 0, 12);
+                    cameraInit_ = true;
+                } catch (...) {}
             }
         }},
         { "log_level", [this](const std::optional<std::string>& r) {

@@ -11,6 +11,7 @@
  #include <iostream>                // debugging, std::cerr
  #include <libcamera/control_ids.h> // metadata.get(controls::...)
  #include <libcamera/formats.h>     // libcamera::formats::
+ #include <libcamera/color_space.h> // loinfo.colour_space->ycbcrEncoding
  #include <cmath>
 #include <cstring>
 #include <cerrno>
@@ -825,6 +826,26 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.thumbBitsPerSample   = 8;
     dng_info.thumbPhotometric     = PHOTOMETRIC_MINISBLACK;   /* = 1 */
 
+    /* Snapshot the mode and shift for THIS take -- see the members' own
+     * comment in dng_encoder.hpp for why dng_save() must read these and
+     * not options_ live. Clamped, not just floored: thumbnailSize reaches
+     * here via a bare stoi() on the live redis handler with no range
+     * check, and an unclamped shift is undefined behaviour on a 32-bit
+     * width/height once it reaches the type's bit width. 12 already
+     * collapses 1272 to 0. */
+    thumb_mode_  = options_ ? options_->thumbnail : 0;
+    thumb_shift_ = options_ ? std::clamp(options_->thumbnailSize, 0, 12) : 0;
+    thumb_lores_warned_ = false;   /* one warning per take, re-armed here */
+
+    /* Bytes this take's thumbnail actually needs -- 0 when off, so a take
+     * recorded with the toggle off gets none of this reserved, not the
+     * worst case every take used to pay regardless of mode. */
+    const uint32_t thumb_reserved_bytes =
+        (thumb_mode_ == 0) ? 0u :
+        std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift_) *
+        std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift_) *
+        static_cast<uint32_t>(thumb_mode_ == 2 ? 3 : 1);
+
     /* ──  Buffer sizing  ──────────────────────────────────────── */
     /* 64 KB covers the IFD and its out-of-line payloads; log adds an 8 KB
      * LinearizationTable on top of that. Worth stating explicitly: an overflow
@@ -832,7 +853,8 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      * a pixel of evidence. */
     const uint32_t frame = ((cfg.size.width * dng_info.bits + 7) / 8) * cfg.size.height;
     const uint32_t tail_slack =
-        64 * 1024 + (log_lut_ ? static_cast<uint32_t>(log_lut_->inverse_size() * sizeof(uint16_t)) : 0u);
+        64 * 1024 + (log_lut_ ? static_cast<uint32_t>(log_lut_->inverse_size() * sizeof(uint16_t)) : 0u)
+        + thumb_reserved_bytes;
     dng_info.buffer_size = align_up(frame + tail_slack, ONE_MB);
 
     /* ──  Static strings & misc  ──────────────────────────────── */
@@ -886,7 +908,14 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     console->info("Encoder configured – {}×{} {}-bit, buffer {} MB",
                   cfg.size.width, cfg.size.height,
                   dng_info.bits, dng_info.buffer_size / ONE_MB);
-    console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
+    if (thumb_mode_ == 0)
+        console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
+    else
+        console->info("DNG writer: embedded lores thumbnail {} at {}x{} (shift {})",
+                      thumb_mode_ == 2 ? "colour" : "mono",
+                      std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift_),
+                      std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift_),
+                      thumb_shift_);
     if (log_lut_)
         console->info("{}  LinearizationTable {} entries", log_lut_->params().describe(),
                       log_lut_->inverse_size());
@@ -1314,6 +1343,179 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
     /* patch TIFF header with IFD-0 offset */
     *reinterpret_cast<uint32_t*>(buf.buffer + 4) = ifd.baseOffset;
+
+    /* ──  6.  Thumbnail (IFD1, chained after IFD0)  ────────────────
+     * Open decision 7, settled 2026-09-01: chained as IFD1 rather than
+     * IFD0-with-raw-in-a-SubIFD. IFD0 above is untouched by this block --
+     * same bytes, same offset, same next-IFD field left at 0 -- whenever
+     * `thumbnail` is 0 or the lores stream is absent, which is what makes
+     * the off position a genuine no-op.
+     *
+     * thumb_mode_/thumb_shift_, NOT options_->thumbnail/thumbnailSize:
+     * these are the snapshot setup_encoder() took at the start of THIS
+     * take (see their comment in dng_encoder.hpp). A live `set thumbnail`
+     * changes options_ immediately but only reaches a file at the next
+     * take -- otherwise two encode workers racing options_ mid-take could
+     * write one take with a non-monotonic mix of thumbnail/no-thumbnail
+     * frames, and the buffer_size reservation in setup_encoder() (sized
+     * against this same snapshot) could be overflowed by a mode that
+     * changed after it was computed. */
+    /* losize was previously only checked non-zero, then U/V addresses
+     * were derived from stride and height regardless -- a short or
+     * differently-shaped buffer (a mis-set lores format, a mid-stream
+     * reconfigure this take's snapshot predates) would read past it.
+     * Require the exact byte count the layout below assumes, and the
+     * pixel format that layout assumes too. */
+    const bool thumb_want = (thumb_mode_ == 1 || thumb_mode_ == 2);
+    const bool thumb_lores_ok = thumb_want &&
+        lomem && loinfo.width && loinfo.height && loinfo.stride &&
+        loinfo.pixel_format == libcamera::formats::YUV420 &&
+        losize >= (thumb_mode_ == 2
+            ? static_cast<size_t>(loinfo.stride) * loinfo.height
+              + 2 * static_cast<size_t>(loinfo.stride / 2) * (loinfo.height / 2)
+            : static_cast<size_t>(loinfo.stride) * loinfo.height);
+
+    if (thumb_want && !thumb_lores_ok && !thumb_lores_warned_)
+    {
+        console->warn("thumbnail requested (mode {}) but the lores buffer does not match "
+                      "the expected YUV420 shape (format {}, {}x{} stride {}, losize {}); "
+                      "skipping the thumbnail for this take", thumb_mode_,
+                      loinfo.pixel_format.toString(), loinfo.width, loinfo.height,
+                      loinfo.stride, losize);
+        thumb_lores_warned_ = true;
+    }
+
+    if (thumb_lores_ok)
+    {
+        const bool colour = (thumb_mode_ == 2);
+        const int shift = thumb_shift_;
+        const uint32_t tw = std::max<uint32_t>(1, loinfo.width  >> shift);
+        const uint32_t th = std::max<uint32_t>(1, loinfo.height >> shift);
+        const uint16_t spp = colour ? 3 : 1;
+
+        /* lomem is planar YUV420 (I420): Y at lomem, stride loinfo.stride;
+         * U at lomem + stride*height, chroma stride stride/2; V right after
+         * U's plane. Same layout ccmp_preview.hpp writes into this same
+         * buffer.
+         *
+         * The lores stream is STUDIO-RANGE (Y 16-235, chroma 16-240):
+         * rpicam_app.cpp's ConfigureVideo picks colorSpace Rec709 for any
+         * stream >=1280 wide or >=720 tall, which is every CineMate launch
+         * (lores height is capped at 720 by sensor_detect._calc_lores()),
+         * and this codebase's own preview path already treats that stream
+         * as limited range -- ccmp_preview.hpp's setYuvCoeffs() bakes in
+         * the same 219/224 scaling with a Y=16/UV=128 black point. Copying
+         * codes verbatim (mono) or decoding with full-range coefficients
+         * (colour, as this used to) puts black at code 16 (~6% grey) with
+         * white at 235, plus a 601-vs-709 hue error in colour. Fixed here
+         * by expanding range (mono) and by decoding with the matrix that
+         * actually matches the stream's own encoding (colour) -- read off
+         * loinfo.colour_space the same way ccmpPreviewStage.cpp reads it
+         * for the *display* path, rather than assumed. */
+        const bool rec709 = loinfo.colour_space &&
+                            loinfo.colour_space->ycbcrEncoding == libcamera::ColorSpace::YcbcrEncoding::Rec709;
+        /* Fixed-point (Q16), ITU-R BT.601-7 / BT.709-6 limited-range
+         * constants -- e.g. R = 1.164*(Y-16) + 1.596*Cr (601) or
+         * 1.164*(Y-16) + 1.793*Cr (709), Cr/Cb already centred on 128. */
+        constexpr int32_t kY   = 76285;                        /* 1.164, both spaces  */
+        const     int32_t kVR  = rec709 ? 117506 : 104598;      /* Cr -> R             */
+        const     int32_t kUG  = rec709 ?  -13960 :  -25690;    /* Cb -> G             */
+        const     int32_t kVG  = rec709 ?  -34941 :  -53295;    /* Cr -> G             */
+        const     int32_t kUB  = rec709 ?  138412 :  132202;    /* Cb -> B             */
+
+        const uint32_t ys = loinfo.stride;
+        const uint32_t cs = ys / 2;
+        const uint8_t *uplane = colour ? (lomem + static_cast<size_t>(ys) * loinfo.height) : nullptr;
+        const uint8_t *vplane = colour ? (uplane + static_cast<size_t>(cs) * (loinfo.height / 2)) : nullptr;
+
+        const uint32_t thumbOff = buf.offset;
+        thread_local std::vector<uint8_t> thumbRow;
+        thumbRow.resize(static_cast<size_t>(tw) * spp);
+
+        for (uint32_t y = 0; y < th; ++y)
+        {
+            const uint32_t srcY = std::min(y << shift, loinfo.height - 1);
+            const uint8_t *yrow = lomem + static_cast<size_t>(srcY) * ys;
+
+            if (!colour)
+            {
+                if (shift == 0)
+                {
+                    /* Full-resolution mono: one row is a contiguous read,
+                     * only the range expansion per sample. */
+                    for (uint32_t x = 0; x < tw; ++x)
+                        thumbRow[x] = static_cast<uint8_t>(
+                            std::clamp((static_cast<int>(yrow[x]) - 16) * 255 / 219, 0, 255));
+                }
+                else
+                {
+                    for (uint32_t x = 0; x < tw; ++x)
+                        thumbRow[x] = static_cast<uint8_t>(std::clamp(
+                            (static_cast<int>(yrow[std::min(x << shift, loinfo.width - 1)]) - 16) * 255 / 219,
+                            0, 255));
+                }
+            }
+            else
+            {
+                const uint8_t *urow = uplane + static_cast<size_t>(srcY / 2) * cs;
+                const uint8_t *vrow = vplane + static_cast<size_t>(srcY / 2) * cs;
+                for (uint32_t x = 0; x < tw; ++x)
+                {
+                    const uint32_t srcX = std::min(x << shift, loinfo.width - 1);
+                    const int32_t Yn = static_cast<int32_t>(yrow[srcX]) - 16;
+                    const int32_t U  = static_cast<int32_t>(urow[srcX / 2]) - 128;
+                    const int32_t V  = static_cast<int32_t>(vrow[srcX / 2]) - 128;
+                    const int32_t y0 = kY * Yn;
+                    const int r = (y0 + kVR * V) >> 16;
+                    const int g = (y0 + kUG * U + kVG * V) >> 16;
+                    const int b = (y0 + kUB * U) >> 16;
+                    thumbRow[3 * x + 0] = static_cast<uint8_t>(std::clamp(r, 0, 255));
+                    thumbRow[3 * x + 1] = static_cast<uint8_t>(std::clamp(g, 0, 255));
+                    thumbRow[3 * x + 2] = static_cast<uint8_t>(std::clamp(b, 0, 255));
+                }
+            }
+            write_pod(buf, thumbRow.data(), thumbRow.size());
+        }
+        const uint32_t thumbSize = buf.offset - thumbOff;
+
+        /* TIFF 6.0 requires every IFD to start on a word (2-byte, here
+         * kept to the stricter 4-byte) boundary. The strip is tw*th*spp
+         * bytes with no padding of its own, so an odd byte count -- mono
+         * at an odd width, or any width*3 that lands odd -- would
+         * otherwise leave IFD1 on an odd offset. */
+        if (buf.offset & 3)
+        {
+            static const uint8_t zeros[4] = {0, 0, 0, 0};
+            write_pod(buf, zeros, 4 - (buf.offset & 3));
+        }
+
+        IFDBuilder ifd1(tw, th);
+        ifd1.baseOffset = buf.usedSize;
+
+        uint32_t subfileType = 1;                 /* thumbnail/reduced-res image */
+        uint16_t bitsArr[3]  = {8, 8, 8};          /* one per sample, TIFF-spec count */
+        uint16_t compression1 = COMPRESSION_NONE;
+        uint16_t phot1 = colour ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK;
+        uint16_t planar1 = 1;
+
+        ifd1.addEntry(254, TIFF_LONG , 1  , &subfileType);
+        ifd1.addEntry(256, TIFF_LONG , 1  , &tw);
+        ifd1.addEntry(257, TIFF_LONG , 1  , &th);
+        ifd1.addEntry(258, TIFF_SHORT, spp, bitsArr);
+        ifd1.addEntry(259, TIFF_SHORT, 1  , &compression1);
+        ifd1.addEntry(262, TIFF_SHORT, 1  , &phot1);
+        ifd1.addEntry(273, TIFF_LONG , 1  , &thumbOff);
+        ifd1.addEntry(277, TIFF_SHORT, 1  , &spp);
+        ifd1.addEntry(278, TIFF_LONG , 1  , &th);
+        ifd1.addEntry(279, TIFF_LONG , 1  , &thumbSize);
+        ifd1.addEntry(284, TIFF_SHORT, 1  , &planar1);
+
+        ifd1.sortEntries(); ifd1.build(buf);
+
+        /* chain IFD0 -> IFD1 */
+        *reinterpret_cast<uint32_t*>(buf.buffer + ifd.nextIfdFieldOffset) = ifd1.baseOffset;
+    }
+
     return buf.usedSize;
 }
 

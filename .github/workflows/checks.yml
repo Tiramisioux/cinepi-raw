@@ -49,7 +49,7 @@ jobs:
       # and ../resources/ccmp_log_luts from that directory -- the same
       # resources/ccmp_luts and resources/ccmp_log_luts used here from the
       # repo root.
-      - name: Build and run the eight cinepi unit tests
+      - name: Build and run the nine cinepi unit tests
         run: |
           set -euo pipefail
           fail=0
@@ -72,6 +72,7 @@ jobs:
 
           build_and_run phase_lock_core
           build_and_run dng_pack
+          build_and_run ifd_builder
           build_and_run log_lut
           build_and_run log_encode_arg
           build_and_run ccmp_lut \

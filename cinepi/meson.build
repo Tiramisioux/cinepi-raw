@@ -77,6 +77,15 @@ dng_pack_test = executable('dng_pack_test',
            install : false)
 test('dng_pack', dng_pack_test)
 
+# Unit tests for IFDBuilder's multi-IFD chaining contract (C9 Phase 0's
+# embedded DNG thumbnail). No libcamera deps — it includes only
+# cinepi/ifd_builder.hpp. Run with `meson test`.
+ifd_builder_test = executable('ifd_builder_test',
+           '../tests/ifd_builder_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('ifd_builder', ifd_builder_test)
+
 # Unit tests for the CineMate Log curve engine. No libcamera / jsoncpp deps — it
 # includes only cinepi/log_lut.hpp (the spec loader in log_lut.cpp is what needs
 # jsoncpp, and it is not part of the tested core). Run with `meson test`.

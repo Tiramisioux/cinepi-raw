@@ -138,6 +138,12 @@ public:
            until we have computed every value/offset                   */
         write_uint16(memBuf, n);
         memBuf.offset += n * sizeof(IFDEntry);   /* 12 bytes each      */
+        /* Remember where the next-IFD field landed so a caller chaining
+           a second IFD after this one can patch it once that IFD's own
+           baseOffset is known -- same after-the-fact pattern already used
+           to patch the TIFF header's IFD-0 offset. Left at 0 (no next
+           IFD) unless a caller does that patch. */
+        nextIfdFieldOffset = memBuf.offset;
         write_uint32(memBuf, 0);                 /* next-IFD = 0       */
 
         /* where does the extra area begin?                            */
@@ -214,6 +220,7 @@ public:
     }
 
     uint32_t baseOffset{0};  /* for callers who still want to patch it */
+    uint32_t nextIfdFieldOffset{0};  /* set by build(); see above */
 
 private:
     uint32_t w{}, h{};
