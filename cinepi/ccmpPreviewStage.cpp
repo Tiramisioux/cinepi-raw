@@ -134,6 +134,11 @@ public:
 		colour_.gamma = params.get<double>("gamma", colour_.gamma);
 		/* 0 puts the clipped-channel magenta back, which is the A/B. */
 		colour_.highlight_rolloff = params.get<double>("highlightRolloff", colour_.highlight_rolloff);
+		/* The raw code the rolloff is a fraction OF -- see
+		 * CcmpPreviewColour::sensor_clip_code. Exposed so a rig whose ClearHDR
+		 * clamp lands somewhere else can be corrected without a rebuild; the
+		 * "max code seen" line below is how that value gets checked. */
+		colour_.sensor_clip_code = params.get<unsigned>("sensorClipCode", colour_.sensor_clip_code);
 	}
 
 	void Configure() override;
@@ -159,6 +164,9 @@ private:
 	size_t lores_bytes_ = 0;
 	CcmpPreviewRenderer renderer_;
 	CcmpPreviewColour colour_;
+
+	static constexpr unsigned kMaxCodeReportFrames = 120;
+	unsigned frames_since_report_ = 0;
 };
 
 void ccmpPreviewStage::Configure()
@@ -267,11 +275,21 @@ void ccmpPreviewStage::Configure()
 	lores_bytes_ = static_cast<size_t>(lores_info.stride) * lores_info.height * 3 / 2;
 	enabled_ = true;
 
+	/* setColour() so highlightReference() below reports the level this take will
+	 * actually use, rather than the previous configure's. Process() sets it
+	 * again per frame for the live AWB gains. */
+	renderer_.setColour(colour_);
+	renderer_.resetMaxCode();
+	frames_since_report_ = 0;
+
 	console->info("ccmpPreview: {} -> {}x{} preview, b={}, exposure {:.2f} gamma {:.2f} "
-				  "highlightRolloff {:.3f} {}",
+				  "highlightRolloff {:.3f} sensorClipCode {} (desaturation from {:.4f} of "
+				  "full scale) {}",
 				  lut->params().describe(), geom.out_width, geom.out_height,
 				  static_cast<long long>(binning), colour_.exposure, colour_.gamma,
-				  colour_.highlight_rolloff, colour_.rec709 ? "Rec709" : "Rec601");
+				  colour_.highlight_rolloff, colour_.sensor_clip_code,
+				  renderer_.highlightReference() * (1.0 - colour_.highlight_rolloff),
+				  colour_.rec709 ? "Rec709" : "Rec601");
 }
 
 bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
@@ -319,6 +337,20 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 	}
 
 	renderer_.render(raw.data(), lores.data());
+
+	/* The one number that says whether sensor_clip_code matches this sensor:
+	 * point the camera at a blown highlight and the peak should settle at (not
+	 * above) the configured clip code. Every ~120 frames so it is a few seconds
+	 * apart at any frame rate, and the window is reset each time so a stale
+	 * maximum from an earlier shot cannot linger. */
+	if (++frames_since_report_ >= kMaxCodeReportFrames)
+	{
+		console->info("ccmpPreview: peak raw code {} over the last {} frames "
+					  "(sensorClipCode {})",
+					  renderer_.maxCodeSeen(), frames_since_report_, colour_.sensor_clip_code);
+		renderer_.resetMaxCode();
+		frames_since_report_ = 0;
+	}
 	return false;
 }
 

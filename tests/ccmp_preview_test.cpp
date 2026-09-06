@@ -104,6 +104,25 @@ std::vector<uint8_t> make_frame(const CcmpPreviewGeometry &g, const Patch &patch
     return buf;
 }
 
+/* A frame where EVERY photosite sits on one code, which is what the imx585's
+ * ClearHDR HG/LG merge delivers when it clamps: the clamp is digital and
+ * downstream of the CFA, so no channel pins first and all four quad samples
+ * read identically. make_frame() cannot express this — it takes per-channel
+ * levels and runs them through the forward curve, which is the right model
+ * everywhere except at the clamp. */
+std::vector<uint8_t> make_clamped_frame(const CcmpPreviewGeometry &g, unsigned code)
+{
+    std::vector<uint8_t> buf(g.raw_stride * g.raw_height, 0);
+    const uint16_t v = static_cast<uint16_t>(code << g.raw_shift);
+    for (unsigned y = 0; y < g.raw_height; ++y)
+    {
+        uint16_t *row = reinterpret_cast<uint16_t *>(buf.data() + static_cast<size_t>(y) * g.raw_stride);
+        for (unsigned x = 0; x < g.raw_width; ++x)
+            row[x] = v;
+    }
+    return buf;
+}
+
 CcmpPreviewGeometry geometry_for(unsigned raw_w, unsigned raw_h, unsigned out_w, unsigned out_h)
 {
     CcmpPreviewGeometry g;
@@ -277,6 +296,77 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
         check(std::abs(bad.v - 128) > 3 * kChromaTol, "and is magenta without the correction",
               "U=" + std::to_string(bad.u) + " V=" + std::to_string(bad.v));
         r.setColour(colour);
+    }
+
+    /* ── the clamp is not at the top of the code space ───────────────────────
+     *
+     * The block above drives the subject to 4x the table's white level, so the
+     * codes saturate at 4095 and the correction fires. Real footage never gets
+     * there. The imx585's ClearHDR merge clamps DIGITALLY at roughly code 3060
+     * (measured on take CINEPI_26-09-06_210738, where R, G and B all plateau on
+     * one value and hold it across all 39 frames), so referencing the rolloff
+     * to the table's top code put the trigger ~950 codes above anything the
+     * sensor can produce and every blown highlight stayed magenta — mid-tones
+     * correct, highlights magenta, the reported defect.
+     *
+     * That is why the block above passed while the hardware was broken: it
+     * asserts the correction at a level the sensor cannot reach. This one holds
+     * the sensor's actual clamp, which is the level that matters. */
+    {
+        /* Just above the shipping reference, i.e. a pixel genuinely AT the
+         * clamp for any clamp in the measured interval. */
+        const unsigned clamp_code = colour.sensor_clip_code + 8;
+        const std::vector<uint8_t> raw = make_clamped_frame(geom, clamp_code);
+
+        bool f = false;
+        const Yuv on = render_flat(r, raw, f);
+        check(f, "a clamped frame renders flat");
+        check(std::abs(on.u - 128) <= kChromaTol && std::abs(on.v - 128) <= kChromaTol,
+              "a highlight clamped BELOW the table's top code still reads neutral",
+              "U=" + std::to_string(on.u) + " V=" + std::to_string(on.v) + " Y=" + std::to_string(on.y));
+        check(on.y >= 235, "and reads as white", "Y=" + std::to_string(on.y));
+
+        /* The pre-fix behaviour, reproduced exactly: sensor_clip_code 0 means
+         * "reference the table's top code". If this ever stops being magenta
+         * the test has lost its grip on the defect it was written for. */
+        CcmpPreviewColour top = colour;
+        top.sensor_clip_code = 0;
+        r.setColour(top);
+        const Yuv bad = render_flat(r, raw, f);
+        check(std::abs(bad.v - 128) > 3 * kChromaTol && std::abs(bad.u - 128) > 3 * kChromaTol,
+              "and referencing the table's top code instead puts the magenta back",
+              "U=" + std::to_string(bad.u) + " V=" + std::to_string(bad.v));
+
+        /* The renderer has to report what it saw, or sensor_clip_code can only
+         * ever be trusted, never checked. */
+        r.resetMaxCode();
+        render_flat(r, raw, f);
+        check(r.maxCodeSeen() == clamp_code, "and reports the peak code it rendered",
+              "saw " + std::to_string(r.maxCodeSeen()) + " expected " + std::to_string(clamp_code));
+        r.setColour(colour);
+    }
+
+    /* The other direction, and the one desaturateHighlight()'s own comment
+     * warns about: a subject WELL below the clamp must not be whitened just
+     * because the reference came down.
+     *
+     * An equal-code quad is a strongly blue raw, not a neutral one, so this
+     * renders far off 128/128 either way — that is the subject, not a fault.
+     * The assertion is only that turning the correction off changes NOTHING,
+     * i.e. that it stayed inert down here. */
+    {
+        const std::vector<uint8_t> raw = make_clamped_frame(geom, colour.sensor_clip_code / 2);
+        bool f = false;
+        const Yuv px = render_flat(r, raw, f);
+        CcmpPreviewColour off = colour;
+        off.highlight_rolloff = 0.0;
+        r.setColour(off);
+        const Yuv ref = render_flat(r, raw, f);
+        r.setColour(colour);
+        check(px.u == ref.u && px.v == ref.v,
+              "a subject below the clamp is untouched by the highlight correction",
+              "with U=" + std::to_string(px.u) + " V=" + std::to_string(px.v) +
+              " without U=" + std::to_string(ref.u) + " V=" + std::to_string(ref.v));
     }
 
     /* Black in, black out. The table's output carries the +200 pedestal and the

@@ -141,6 +141,47 @@ struct CcmpPreviewColour
      * clipped-channel magenta back. */
     double highlight_rolloff = 0.02;
 
+    /* WHERE THE SENSOR ACTUALLY SATURATES, as a raw code — the reference
+     * `highlight_rolloff` is a fraction OF. This is not the decompand table's
+     * top code, and assuming it was is what kept the correction below from ever
+     * firing on real footage.
+     *
+     * The table spans the compander's whole 0..4095 output domain because that
+     * is what the curve is defined over. The imx585 in 12-bit ClearHDR does not
+     * fill it: the HG/LG merge clamps DIGITALLY, well below the top code, and
+     * every channel pins at the SAME code when it does. Measured on take
+     * CINEPI_26-09-06_210738 (b=1, 4K all-pixel): R, G and B all plateau on one
+     * value and hold it identically across all 39 frames. Referencing the
+     * rolloff to code 4095 put the trigger at code 4017 on a signal that stops
+     * around 3060, so blown highlights kept the full magenta cast
+     * desaturateHighlight() exists to remove — mid-tones correct, highlights
+     * magenta, which is exactly the reported defect.
+     *
+     * WHY 3040, AND WHY UNDER THE MEASUREMENT. The take localises the clamp to
+     * roughly [3040, 3081]; the width is the 10-bit CineMate Log round trip the
+     * measurement had to come through, not a moving clamp. The two directions
+     * are NOT symmetric, so the default deliberately sits at the bottom of that
+     * interval:
+     *
+     *   - Reference ABOVE the true clamp and a clipped pixel never reaches the
+     *     end of the ramp, so it desaturates only PARTLY and stays magenta.
+     *     Referencing 3072 against this take leaves G at 17/255 in the blown
+     *     area — better than the 0/255 it shipped with, still visibly wrong.
+     *   - Reference BELOW it and the ramp merely starts a little early. Codes
+     *     3021..3040 span 0.03 stops, so the content it reaches is already at
+     *     the clip for any purpose a monitoring image serves.
+     *
+     * At 3040 the blown area of that take renders neutral to within 2/128 of
+     * chroma, against 91/128 as shipped, and no pixel below the clip moves.
+     *
+     * Overridable from the post-process file (`sensorClipCode`) so a rig whose
+     * ClearHDR knobs land the clamp elsewhere can be corrected without a
+     * rebuild; 0 means "the decompand table's top code", i.e. the pre-fix
+     * behaviour. CcmpPreviewRenderer tracks the highest code it actually sees
+     * and ccmpPreviewStage logs it, so this value can be checked against the
+     * hardware rather than trusted. */
+    unsigned sensor_clip_code = 3040;
+
     /* Which YUV matrix the display expects. The caller reads it off the lores
      * stream's ColorSpace rather than assuming; getting it wrong is a small but
      * real hue shift, and a preview that exists to judge colour should not have
@@ -257,10 +298,23 @@ public:
         /* 0 disables the correction: it makes the blend factor identically 0,
          * so the inner loop needs no special case and the A/B against the
          * uncorrected render is one number in the post-process file. */
+        /* The clip reference, in the same normalised domain `peak` is measured
+         * in. lin_ is built by configure(), which always runs first, so the
+         * table lookup here is safe. Out of range (or 0) falls back to the
+         * table's top, which is the pre-fix behaviour. */
+        double hl_ref = 1.0;
+        if (colour.sensor_clip_code > 0 && colour.sensor_clip_code < lin_.size())
+            hl_ref = lin_[colour.sensor_clip_code];
+        if (!(hl_ref > 0.0))
+            hl_ref = 1.0;
+        hl_ref_ = static_cast<float>(hl_ref);
+
         if (colour.highlight_rolloff > 1e-6)
         {
-            hl_lo_ = static_cast<float>(1.0 - colour.highlight_rolloff);
-            hl_scale_ = static_cast<float>(1.0 / colour.highlight_rolloff);
+            /* Ramp from (1 - rolloff) * clip up to the clip itself, so a pixel
+             * AT the clip is fully desaturated whatever the reference is. */
+            hl_lo_ = static_cast<float>(hl_ref * (1.0 - colour.highlight_rolloff));
+            hl_scale_ = static_cast<float>(1.0 / (hl_ref * colour.highlight_rolloff));
         }
         else
         {
@@ -276,6 +330,13 @@ public:
 
     bool ready() const { return ready_; }
     const CcmpPreviewGeometry &geometry() const { return geom_; }
+
+    /* The normalised level the highlight correction is referenced to, and the
+     * highest raw code seen since the last resetMaxCode(). The second is what
+     * says whether the first matches the sensor. */
+    float highlightReference() const { return hl_ref_; }
+    unsigned maxCodeSeen() const { return max_code_; }
+    void resetMaxCode() const { max_code_ = 0; }
 
     /*
      * raw: the Bayer plane, `raw_stride` bytes per row, 16-bit samples.
@@ -357,12 +418,20 @@ private:
         const uint16_t *r0 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy) * geom_.raw_stride);
         const uint16_t *r1 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy + 1) * geom_.raw_stride);
 
-        const float s[4] = {
-            lin_[r0[sx] >> geom_.raw_shift],
-            lin_[r0[sx + 1] >> geom_.raw_shift],
-            lin_[r1[sx] >> geom_.raw_shift],
-            lin_[r1[sx + 1] >> geom_.raw_shift],
-        };
+        const unsigned c0 = r0[sx] >> geom_.raw_shift;
+        const unsigned c1 = r0[sx + 1] >> geom_.raw_shift;
+        const unsigned c2 = r1[sx] >> geom_.raw_shift;
+        const unsigned c3 = r1[sx + 1] >> geom_.raw_shift;
+
+        /* The highest code this render actually saw. Cheap (four compares
+         * against a register on a path that already touched these samples) and
+         * it is the only way to check sensor_clip_code against the hardware
+         * instead of trusting it — see that field's comment. */
+        const unsigned hi = std::max(std::max(c0, c1), std::max(c2, c3));
+        if (hi > max_code_)
+            max_code_ = hi;
+
+        const float s[4] = { lin_[c0], lin_[c1], lin_[c2], lin_[c3] };
 
         float cam[3];
         if (geom_.mono)
@@ -410,16 +479,22 @@ private:
 
     /* ── the clipped-channel cast ─────────────────────────────────────────────
      *
-     * The decompand fixes the transfer, but it cannot un-clip. For a NEUTRAL
-     * highlight the three channels reach code 4095 at different scene levels,
-     * because green carries the most light: green pins first, red and blue keep
-     * rising, and the gains then multiply an R and a B that are still moving
-     * against a G that is not. R and B overshoot G and the blown area goes
-     * magenta — the same hue as the original defect, from a different cause, and
-     * it survives the decompand untouched.
+     * The decompand fixes the transfer, but it cannot un-clip. A NEUTRAL
+     * highlight that reaches the sensor's ceiling arrives here with all three
+     * channels pinned on the SAME code — the imx585's ClearHDR HG/LG merge
+     * clamps digitally, so unlike a photodiode saturation there is no channel
+     * that pins first. The gains then scale that equal-code plateau by r_gain
+     * and b_gain, R and B overshoot a G that cannot move, and the blown area
+     * goes magenta — the same hue as the original defect, from a different
+     * cause, and it survives the decompand untouched.
      *
-     * The zone runs from where G clips to where R clips, about 1.3 stops at the
-     * shipping gains.
+     * ** THE REFERENCE IS THE SENSOR'S CLIP, NOT THE TABLE'S TOP CODE. ** This
+     * used to compare `peak` against 1.0, i.e. the top of the compander's
+     * output domain. The sensor never gets there (see
+     * CcmpPreviewColour::sensor_clip_code), so the correction was unreachable
+     * on real footage and every blown highlight stayed magenta. `hl_lo_` is now
+     * derived from sensor_clip_code, and the ramp still ends exactly AT the
+     * clip, so a pixel that reaches it is fully desaturated.
      *
      * ** THE TRIGGER IS RAW SATURATION, AND IT CANNOT BE ANYTHING ELSE. ** The
      * tempting test is "did any channel come out of the matrix above 1", since
@@ -501,8 +576,14 @@ private:
     float m_[9] = { 1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f };
     float gamma_[kGammaSize] = {};
     double gamma_built_ = 0.0;   /* 0 = never built, and no valid gamma is 0 */
+    float hl_ref_ = 1.f;         /* normalised level of sensor_clip_code      */
     float hl_lo_ = 0.98f;        /* raw level where desaturation starts       */
     float hl_scale_ = 50.f;      /* 1/highlight_rolloff; 0 = correction off   */
+    /* Observability only, never read by the render itself. mutable so render()
+     * stays const: it describes the data that went through, not the renderer's
+     * configuration. The stage serialises render() under its own mutex, so the
+     * unsynchronised update is safe there. */
+    mutable unsigned max_code_ = 0;
     float y_[3] = {};
     float cb_[3] = {};
     float cr_[3] = {};
