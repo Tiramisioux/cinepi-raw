@@ -345,9 +345,10 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 	 * maximum from an earlier shot cannot linger. */
 	if (++frames_since_report_ >= kMaxCodeReportFrames)
 	{
-		console->info("ccmpPreview: peak raw code {} over the last {} frames "
-					  "(sensorClipCode {})",
-					  renderer_.maxCodeSeen(), frames_since_report_, colour_.sensor_clip_code);
+		console->info("ccmpPreview: peak raw code {}, {} quads fully desaturated, over the "
+					  "last {} frames (sensorClipCode {})",
+					  renderer_.maxCodeSeen(), renderer_.fullyDesaturated(),
+					  frames_since_report_, colour_.sensor_clip_code);
 		renderer_.resetMaxCode();
 		frames_since_report_ = 0;
 	}

@@ -141,46 +141,51 @@ struct CcmpPreviewColour
      * clipped-channel magenta back. */
     double highlight_rolloff = 0.02;
 
-    /* WHERE THE SENSOR ACTUALLY SATURATES, as a raw code — the reference
-     * `highlight_rolloff` is a fraction OF. This is not the decompand table's
-     * top code, and assuming it was is what kept the correction below from ever
-     * firing on real footage.
+    /* THE FLOOR OF THE CLAMP ZONE, as a raw code — the reference
+     * `highlight_rolloff` is a fraction OF, and the level at and above which a
+     * pixel is treated as clipped. Not the decompand table's top code, and —
+     * the part that cost a round on hardware — NOT the highest code the sensor
+     * emits either.
      *
      * The table spans the compander's whole 0..4095 output domain because that
      * is what the curve is defined over. The imx585 in 12-bit ClearHDR does not
-     * fill it: the HG/LG merge clamps DIGITALLY, well below the top code, and
-     * every channel pins at the SAME code when it does. Measured on take
-     * CINEPI_26-09-06_210738 (b=1, 4K all-pixel): R, G and B all plateau on one
-     * value and hold it identically across all 39 frames. Referencing the
-     * rolloff to code 4095 put the trigger at code 4017 on a signal that stops
-     * around 3060, so blown highlights kept the full magenta cast
-     * desaturateHighlight() exists to remove — mid-tones correct, highlights
-     * magenta, which is exactly the reported defect.
+     * fill it: the HG/LG merge clamps digitally and the channels converge as it
+     * does, so a blown area arrives with R, G and B on very nearly the SAME
+     * code. That matters because an equal-code quad is exactly what this
+     * renderer cannot pass through cleanly — with the shipping gains and CCM,
+     * green solves NEGATIVE for an equal-code quad at any level, clamps to 0,
+     * and the pixel goes magenta. So the whole convergence zone renders
+     * magenta, not just its top.
      *
-     * WHY 3040, AND WHY UNDER THE MEASUREMENT. The take localises the clamp to
-     * roughly [3040, 3081]; the width is the 10-bit CineMate Log round trip the
-     * measurement had to come through, not a moving clamp. The two directions
-     * are NOT symmetric, so the default deliberately sits at the bottom of that
-     * interval:
+     * THE ZONE IS SOFT AND SITS BELOW THE PEAK CODE. Measured on two takes:
      *
-     *   - Reference ABOVE the true clamp and a clipped pixel never reaches the
-     *     end of the ramp, so it desaturates only PARTLY and stays magenta.
-     *     Referencing 3072 against this take leaves G at 17/255 in the blown
-     *     area — better than the 0/255 it shipped with, still visibly wrong.
-     *   - Reference BELOW it and the ramp merely starts a little early. Codes
-     *     3021..3040 span 0.03 stops, so the content it reaches is already at
-     *     the clip for any purpose a monitoring image serves.
+     *   CINEPI_26-09-06_210738  magenta codes p1 2974, p50 3000, peak 3054
+     *   CINEPI_26-09-06_214831  magenta codes p1 2948, p50 2974, peak 3027
      *
-     * At 3040 the blown area of that take renders neutral to within 2/128 of
-     * chroma, against 91/128 as shipped, and no pixel below the clip moves.
+     * with the stage's own "peak raw code" line reporting 3050..3061 live. A
+     * first attempt anchored this at 3040 — just under the peak — on the
+     * assumption that the clamp was one hard code. It desaturated the blown
+     * area by a median of 0.000 and changed nothing on hardware, because the
+     * BODY of the zone is 60-80 codes below the peak. Anchor on the floor of
+     * the zone, not its top: the ramp ends AT this code, so anything above it
+     * is fully desaturated and anything the clamp has flattened is caught.
+     *
+     * WHY 2900. It is below the p1 of both takes (2948 and 2974) with margin
+     * for the zone moving with the ClearHDR blend and gain-adder knobs, which
+     * the operator can change. The margin is nearly free: codes 2900..3054 span
+     * 0.078 stops of scene, so the band this claims is one that only clamp
+     * transition lives in, and dropping the anchor from 2974 to 2900 widens the
+     * pixels touched from 0.143% to 0.146% of the frame. Both takes end up
+     * 99.8%+ of the blown area fully desaturated.
      *
      * Overridable from the post-process file (`sensorClipCode`) so a rig whose
      * ClearHDR knobs land the clamp elsewhere can be corrected without a
      * rebuild; 0 means "the decompand table's top code", i.e. the pre-fix
-     * behaviour. CcmpPreviewRenderer tracks the highest code it actually sees
-     * and ccmpPreviewStage logs it, so this value can be checked against the
-     * hardware rather than trusted. */
-    unsigned sensor_clip_code = 3040;
+     * behaviour. ccmpPreviewStage logs the peak code AND how much of the frame
+     * actually reached full desaturation — the second is the number that says
+     * whether this anchor is low enough, and the first alone is what made the
+     * 3040 attempt look right. */
+    unsigned sensor_clip_code = 2900;
 
     /* Which YUV matrix the display expects. The caller reads it off the lores
      * stream's ColorSpace rather than assuming; getting it wrong is a small but
@@ -336,7 +341,11 @@ public:
      * says whether the first matches the sensor. */
     float highlightReference() const { return hl_ref_; }
     unsigned maxCodeSeen() const { return max_code_; }
-    void resetMaxCode() const { max_code_ = 0; }
+    /* Quads the highlight correction ran to completion on since the last
+     * reset. Zero while blown highlights are in frame means sensor_clip_code
+     * is anchored too high. */
+    unsigned long fullyDesaturated() const { return full_desat_; }
+    void resetMaxCode() const { max_code_ = 0; full_desat_ = 0; }
 
     /*
      * raw: the Bayer plane, `raw_stride` bytes per row, 16-bit samples.
@@ -522,6 +531,13 @@ private:
             return;
 
         const float s = std::min(1.f, (peak - hl_lo_) * hl_scale_);
+        /* Observability: how much of the frame the correction actually
+         * COMPLETED on. The peak code alone cannot say — a frame can peak well
+         * above the anchor while the body of the blown area sits below it and
+         * desaturates by nothing, which is exactly how the first anchor looked
+         * correct and did nothing. */
+        if (s >= 0.99f)
+            ++full_desat_;
         const float mx = std::max(lin[0], std::max(lin[1], lin[2]));
         for (int i = 0; i < 3; ++i)
             lin[i] += s * (mx - lin[i]);
@@ -584,6 +600,7 @@ private:
      * configuration. The stage serialises render() under its own mutex, so the
      * unsynchronised update is safe there. */
     mutable unsigned max_code_ = 0;
+    mutable unsigned long full_desat_ = 0;
     float y_[3] = {};
     float cb_[3] = {};
     float cr_[3] = {};

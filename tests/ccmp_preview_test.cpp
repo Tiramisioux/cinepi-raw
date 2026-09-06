@@ -337,12 +337,53 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
               "and referencing the table's top code instead puts the magenta back",
               "U=" + std::to_string(bad.u) + " V=" + std::to_string(bad.v));
 
+        /* Back to the shipping colour BEFORE the reportage render — the block
+         * above left the table-top anchor in place, under which nothing
+         * desaturates and the completion counter is legitimately zero. */
+        r.setColour(colour);
+
         /* The renderer has to report what it saw, or sensor_clip_code can only
          * ever be trusted, never checked. */
         r.resetMaxCode();
         render_flat(r, raw, f);
         check(r.maxCodeSeen() == clamp_code, "and reports the peak code it rendered",
               "saw " + std::to_string(r.maxCodeSeen()) + " expected " + std::to_string(clamp_code));
+        check(r.fullyDesaturated() > 0, "and reports that the correction completed",
+              "fully desaturated " + std::to_string(r.fullyDesaturated()) + " quads");
+        r.setColour(colour);
+    }
+
+    /* ── the anchor has to sit under the BODY of the clamp zone ──────────────
+     *
+     * The regression that cost a round on hardware. The clamp is soft: a blown
+     * area arrives spread over ~100 codes, and the first fix anchored on the
+     * PEAK code the sensor emits rather than the floor of that spread. Every
+     * check above still passed — they hold a frame at or above the anchor —
+     * while the body of the real blown area sat 60-80 codes BELOW it and
+     * desaturated by a median of 0.000.
+     *
+     * So: hold a frame at the level the hardware's blown area actually sits at
+     * relative to its peak, and require the shipping anchor to catch it. */
+    {
+        /* The measured geometry: peak ~3054, body ~2974, i.e. the body is ~80
+         * codes under the peak. Anything the clamp flattened must desaturate. */
+        const unsigned body_code = 2974;
+        const std::vector<uint8_t> raw = make_clamped_frame(geom, body_code);
+        bool f = false;
+        const Yuv on = render_flat(r, raw, f);
+        check(std::abs(on.u - 128) <= kChromaTol && std::abs(on.v - 128) <= kChromaTol,
+              "the BODY of the clamp zone desaturates, not just its peak",
+              "U=" + std::to_string(on.u) + " V=" + std::to_string(on.v));
+
+        /* And the exact anchor that failed on hardware has to fail here too,
+         * or this test cannot tell the two apart. */
+        CcmpPreviewColour high = colour;
+        high.sensor_clip_code = 3040;
+        r.setColour(high);
+        const Yuv bad = render_flat(r, raw, f);
+        check(std::abs(bad.v - 128) > 3 * kChromaTol,
+              "and anchoring above that body is still magenta (the 3040 regression)",
+              "U=" + std::to_string(bad.u) + " V=" + std::to_string(bad.v));
         r.setColour(colour);
     }
 
