@@ -141,15 +141,21 @@ inline constexpr CcmpAnchor kT1Effective[] = {
      * both p1 values for margin. Confirmed on hardware: full res renders blown
      * highlights neutral at this anchor.
      *
-     * clip_code b=4: PROVISIONAL, and the weakest number in this file. Derived,
-     * not measured: the stage's own peak-code line read 2723 at b=4 on the same
-     * light that read 3054 at b=1, and this applies the peak-to-floor ratio
-     * measured at b=1 (1.0378) plus the same 48-code margin. It puts the
-     * anchor-to-peak band at 0.082 stops against 0.078 at b=1, which is the
-     * consistency check available without a binned take. Replace it with a
-     * direct measurement the moment one exists — the procedure is the one used
-     * for b=1: record a binned 12-bit ClearHDR take with a blown highlight and
-     * read the codes under the magenta area of its embedded thumbnail. */
+     * clip_code b=4: DERIVED, then CONFIRMED IN PLACE — not measured from a
+     * binned take, so it is still the softer of the two numbers. It applies the
+     * peak-to-floor ratio measured at b=1 (1.0378) to the one binned peak the
+     * log had (2723), plus the same 48-code margin, which puts the anchor-to-
+     * peak band at 0.082 stops against 0.078 at b=1.
+     *
+     * Confirmed on hardware 2026-09-07: binned ClearHDR renders blown
+     * highlights neutral, and the stage reports `highest uncorrected 2581`
+     * against this anchor of 2582 — i.e. everything at or above it is fully
+     * corrected and the uncorrected ceiling sits exactly one code below, which
+     * is the signature of an anchor placed correctly rather than one that
+     * merely happens to be low enough. A direct measurement (record a binned
+     * 12-bit ClearHDR take with a blown highlight, read the codes under the
+     * magenta area of its embedded thumbnail, as was done for b=1) would still
+     * be worth taking if this mode is ever re-tuned. */
     { 1.0, 500.3389, 2900 },   /* full res 3856x2180 */
     { 4.0, 500.9431, 2582 },   /* 2x2 binned 1928x1090 */
 };
