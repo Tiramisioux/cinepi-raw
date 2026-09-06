@@ -141,51 +141,31 @@ struct CcmpPreviewColour
      * clipped-channel magenta back. */
     double highlight_rolloff = 0.02;
 
-    /* THE FLOOR OF THE CLAMP ZONE, as a raw code — the reference
-     * `highlight_rolloff` is a fraction OF, and the level at and above which a
-     * pixel is treated as clipped. Not the decompand table's top code, and —
-     * the part that cost a round on hardware — NOT the highest code the sensor
-     * emits either.
+    /* OVERRIDE for the floor of the clamp zone. 0 — the default — means "use
+     * the per-binning anchor the decompand table carries" (CcmpAnchor::
+     * clip_code), which is where the measured values live. Set it non-zero
+     * only to override that from the post-process file.
      *
-     * The table spans the compander's whole 0..4095 output domain because that
-     * is what the curve is defined over. The imx585 in 12-bit ClearHDR does not
-     * fill it: the HG/LG merge clamps digitally and the channels converge as it
-     * does, so a blown area arrives with R, G and B on very nearly the SAME
-     * code. That matters because an equal-code quad is exactly what this
-     * renderer cannot pass through cleanly — with the shipping gains and CCM,
-     * green solves NEGATIVE for an equal-code quad at any level, clamps to 0,
-     * and the pixel goes magenta. So the whole convergence zone renders
+     * WHAT THE ZONE IS. The imx585 in 12-bit ClearHDR clamps well below the
+     * compander's top code, and the channels CONVERGE as the HG/LG merge
+     * flattens them, so a blown area arrives with R, G and B on very nearly
+     * the same code. That matters because an equal-code quad is exactly what
+     * this renderer cannot pass through cleanly: with the shipping gains and
+     * CCM, green solves NEGATIVE for an equal-code quad at any level, clamps
+     * to 0, and the pixel goes magenta. The whole convergence zone renders
      * magenta, not just its top.
      *
-     * THE ZONE IS SOFT AND SITS BELOW THE PEAK CODE. Measured on two takes:
+     * ANCHOR ON THE ZONE'S FLOOR, NOT ITS PEAK. The ramp ends AT this code, so
+     * everything above it is fully desaturated. Anchoring near the peak code
+     * the sensor emits leaves the BODY of the zone — 60-80 codes lower at b=1
+     * — desaturated by nothing, which is the shape of the first two failed
+     * attempts at this fix.
      *
-     *   CINEPI_26-09-06_210738  magenta codes p1 2974, p50 3000, peak 3054
-     *   CINEPI_26-09-06_214831  magenta codes p1 2948, p50 2974, peak 3027
-     *
-     * with the stage's own "peak raw code" line reporting 3050..3061 live. A
-     * first attempt anchored this at 3040 — just under the peak — on the
-     * assumption that the clamp was one hard code. It desaturated the blown
-     * area by a median of 0.000 and changed nothing on hardware, because the
-     * BODY of the zone is 60-80 codes below the peak. Anchor on the floor of
-     * the zone, not its top: the ramp ends AT this code, so anything above it
-     * is fully desaturated and anything the clamp has flattened is caught.
-     *
-     * WHY 2900. It is below the p1 of both takes (2948 and 2974) with margin
-     * for the zone moving with the ClearHDR blend and gain-adder knobs, which
-     * the operator can change. The margin is nearly free: codes 2900..3054 span
-     * 0.078 stops of scene, so the band this claims is one that only clamp
-     * transition lives in, and dropping the anchor from 2974 to 2900 widens the
-     * pixels touched from 0.143% to 0.146% of the frame. Both takes end up
-     * 99.8%+ of the blown area fully desaturated.
-     *
-     * Overridable from the post-process file (`sensorClipCode`) so a rig whose
-     * ClearHDR knobs land the clamp elsewhere can be corrected without a
-     * rebuild; 0 means "the decompand table's top code", i.e. the pre-fix
-     * behaviour. ccmpPreviewStage logs the peak code AND how much of the frame
-     * actually reached full desaturation — the second is the number that says
-     * whether this anchor is low enough, and the first alone is what made the
-     * 3040 attempt look right. */
-    unsigned sensor_clip_code = 2900;
+     * AND IT IS PER BINNING, which is why this is only the override and the
+     * real values sit in the table: the same physical clamp lands on ~2900 at
+     * b=1 and ~2582 at b=4, so one shared number fixes full res and leaves HD
+     * magenta. */
+    unsigned sensor_clip_code = 0;
 
     /* Which YUV matrix the display expects. The caller reads it off the lores
      * stream's ColorSpace rather than assuming; getting it wrong is a small but
@@ -254,6 +234,7 @@ public:
         for (size_t c = 0; c < lut.size(); ++c)
             lin_[c] = static_cast<float>((static_cast<double>(lut.table()[c]) - black) / span);
 
+        lut_clip_code_ = lut.clip_code();
         geom_ = geom;
         ready_ = true;
         return true;
@@ -307,12 +288,14 @@ public:
          * in. lin_ is built by configure(), which always runs first, so the
          * table lookup here is safe. Out of range (or 0) falls back to the
          * table's top, which is the pre-fix behaviour. */
+        const unsigned clip = colour.sensor_clip_code ? colour.sensor_clip_code : lut_clip_code_;
         double hl_ref = 1.0;
-        if (colour.sensor_clip_code > 0 && colour.sensor_clip_code < lin_.size())
-            hl_ref = lin_[colour.sensor_clip_code];
+        if (clip > 0 && clip < lin_.size())
+            hl_ref = lin_[clip];
         if (!(hl_ref > 0.0))
             hl_ref = 1.0;
         hl_ref_ = static_cast<float>(hl_ref);
+        resolved_clip_ = clip;
 
         if (colour.highlight_rolloff > 1e-6)
         {
@@ -345,7 +328,11 @@ public:
      * reset. Zero while blown highlights are in frame means sensor_clip_code
      * is anchored too high. */
     unsigned long fullyDesaturated() const { return full_desat_; }
-    void resetMaxCode() const { max_code_ = 0; full_desat_ = 0; }
+    unsigned maxUndesaturatedCode() const { return max_undesat_; }
+    /* The code actually in force: the override when set, else the table's
+     * per-binning anchor. */
+    unsigned resolvedClipCode() const { return resolved_clip_; }
+    void resetMaxCode() const { max_code_ = 0; full_desat_ = 0; max_undesat_ = 0; }
 
     /*
      * raw: the Bayer plane, `raw_stride` bytes per row, 16-bit samples.
@@ -480,7 +467,11 @@ private:
         for (int row = 0; row < 3; ++row)
             lin[row] = m_[row * 3 + 0] * cam[0] + m_[row * 3 + 1] * cam[1] + m_[row * 3 + 2] * cam[2];
 
-        desaturateHighlight(lin, peak);
+        const float applied = desaturateHighlight(lin, peak);
+        if (applied >= 0.99f)
+            ++full_desat_;
+        else if (hi > max_undesat_)
+            max_undesat_ = hi;
 
         for (int row = 0; row < 3; ++row)
             out[row] = gammaEncode(lin[row]);
@@ -525,22 +516,21 @@ private:
      * This is a PREVIEW-only correction. It has no counterpart in the DNG and
      * must not acquire one: the file's job is to carry what was recorded,
      * clipped channels included, so a grade can reconstruct them. */
-    void desaturateHighlight(float lin[3], float peak) const
+    /* Returns the blend actually applied, so the caller can record whether the
+     * correction COMPLETED. The peak code alone cannot say — a frame can peak
+     * well above the anchor while the body of the blown area sits below it and
+     * desaturates by nothing, which is how both earlier anchors looked correct
+     * in the log and did nothing on the picture. */
+    float desaturateHighlight(float lin[3], float peak) const
     {
         if (peak <= hl_lo_)
-            return;
+            return 0.f;
 
         const float s = std::min(1.f, (peak - hl_lo_) * hl_scale_);
-        /* Observability: how much of the frame the correction actually
-         * COMPLETED on. The peak code alone cannot say — a frame can peak well
-         * above the anchor while the body of the blown area sits below it and
-         * desaturates by nothing, which is exactly how the first anchor looked
-         * correct and did nothing. */
-        if (s >= 0.99f)
-            ++full_desat_;
         const float mx = std::max(lin[0], std::max(lin[1], lin[2]));
         for (int i = 0; i < 3; ++i)
             lin[i] += s * (mx - lin[i]);
+        return s;
     }
 
     float gammaEncode(float lin) const
@@ -599,8 +589,15 @@ private:
      * stays const: it describes the data that went through, not the renderer's
      * configuration. The stage serialises render() under its own mutex, so the
      * unsynchronised update is safe there. */
+    unsigned lut_clip_code_ = 0;
+    unsigned resolved_clip_ = 0;
     mutable unsigned max_code_ = 0;
     mutable unsigned long full_desat_ = 0;
+    /* The highest code that did NOT fully desaturate. When the anchor is right
+     * this sits just under it; when the anchor is too high it tracks the frame
+     * peak instead, which is the single number that would have caught both
+     * earlier attempts from the log alone. */
+    mutable unsigned max_undesat_ = 0;
     float y_[3] = {};
     float cb_[3] = {};
     float cr_[3] = {};

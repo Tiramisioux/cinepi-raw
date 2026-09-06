@@ -315,7 +315,7 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
     {
         /* Just above the shipping reference, i.e. a pixel genuinely AT the
          * clamp for any clamp in the measured interval. */
-        const unsigned clamp_code = colour.sensor_clip_code + 8;
+        const unsigned clamp_code = r.resolvedClipCode() + 8;
         const std::vector<uint8_t> raw = make_clamped_frame(geom, clamp_code);
 
         bool f = false;
@@ -326,11 +326,13 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
               "U=" + std::to_string(on.u) + " V=" + std::to_string(on.v) + " Y=" + std::to_string(on.y));
         check(on.y >= 235, "and reads as white", "Y=" + std::to_string(on.y));
 
-        /* The pre-fix behaviour, reproduced exactly: sensor_clip_code 0 means
-         * "reference the table's top code". If this ever stops being magenta
-         * the test has lost its grip on the defect it was written for. */
+        /* The pre-fix behaviour, reproduced exactly: anchor on the table's top
+         * code. (0 no longer means this — it means "use the per-binning
+         * anchor" — so the old reference is now spelled out explicitly.) If
+         * this ever stops being magenta the test has lost its grip on the
+         * defect it was written for. */
         CcmpPreviewColour top = colour;
-        top.sensor_clip_code = 0;
+        top.sensor_clip_code = 4095;
         r.setColour(top);
         const Yuv bad = render_flat(r, raw, f);
         check(std::abs(bad.v - 128) > 3 * kChromaTol && std::abs(bad.u - 128) > 3 * kChromaTol,
@@ -365,9 +367,11 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
      * So: hold a frame at the level the hardware's blown area actually sits at
      * relative to its peak, and require the shipping anchor to catch it. */
     {
-        /* The measured geometry: peak ~3054, body ~2974, i.e. the body is ~80
-         * codes under the peak. Anything the clamp flattened must desaturate. */
-        const unsigned body_code = 2974;
+        /* The measured geometry at b=1: peak ~3054, body ~2974, floor ~2948,
+         * anchor 2900 — i.e. the body sits ~80 codes under the peak and ~74
+         * ABOVE the anchor. Expressed relative to the anchor so this holds for
+         * the binned mode too, whose whole code space is lower. */
+        const unsigned body_code = r.resolvedClipCode() + 74;
         const std::vector<uint8_t> raw = make_clamped_frame(geom, body_code);
         bool f = false;
         const Yuv on = render_flat(r, raw, f);
@@ -375,10 +379,11 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
               "the BODY of the clamp zone desaturates, not just its peak",
               "U=" + std::to_string(on.u) + " V=" + std::to_string(on.v));
 
-        /* And the exact anchor that failed on hardware has to fail here too,
-         * or this test cannot tell the two apart. */
+        /* The shape of the anchor that failed on hardware — set above the body
+         * rather than under it — has to fail here too, or this test cannot
+         * tell the two apart. */
         CcmpPreviewColour high = colour;
-        high.sensor_clip_code = 3040;
+        high.sensor_clip_code = body_code + 66;
         r.setColour(high);
         const Yuv bad = render_flat(r, raw, f);
         check(std::abs(bad.v - 128) > 3 * kChromaTol,
@@ -396,7 +401,7 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
      * The assertion is only that turning the correction off changes NOTHING,
      * i.e. that it stayed inert down here. */
     {
-        const std::vector<uint8_t> raw = make_clamped_frame(geom, colour.sensor_clip_code / 2);
+        const std::vector<uint8_t> raw = make_clamped_frame(geom, r.resolvedClipCode() / 2);
         bool f = false;
         const Yuv px = render_flat(r, raw, f);
         CcmpPreviewColour off = colour;
@@ -579,6 +584,24 @@ void run_mono()
 
 } // namespace
 
+/* The anchor has to differ per binning, or fixing full res leaves HD magenta —
+ * which is exactly what happened. Guards the table, not the renderer. */
+void run_anchor_table()
+{
+    std::cout << "\nper-binning clip anchor\n";
+    CcmpParams p1, p4;
+    const bool ok1 = ccmp_params_for_binning(1.0, p1);
+    const bool ok4 = ccmp_params_for_binning(4.0, p4);
+    check(ok1 && ok4, "both validated binnings carry an anchor");
+    check(p1.clip_code > 0 && p4.clip_code > 0, "and neither is zero",
+          "b=1 " + std::to_string(p1.clip_code) + " b=4 " + std::to_string(p4.clip_code));
+    check(p1.clip_code != p4.clip_code, "and they are not the same code",
+          "b=1 " + std::to_string(p1.clip_code) + " b=4 " + std::to_string(p4.clip_code));
+    /* Both must sit inside their own code space, below the top code — an
+     * anchor at or above it is the original bug. */
+    check(p1.clip_code < 4095 && p4.clip_code < 4095, "and both sit below the table's top code");
+}
+
 int main()
 {
     std::cout << "ccmp_preview_test\n";
@@ -587,6 +610,7 @@ int main()
     run_mode(1.0, "full res 3856x2180", 3856, 2180);
     run_common();
     run_mono();
+    run_anchor_table();
 
     std::cout << "\n" << (g_failures ? "FAILED " : "PASSED ") << g_failures << " failure(s)\n";
     return g_failures ? 1 : 0;

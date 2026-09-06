@@ -283,11 +283,11 @@ void ccmpPreviewStage::Configure()
 	frames_since_report_ = 0;
 
 	console->info("ccmpPreview: {} -> {}x{} preview, b={}, exposure {:.2f} gamma {:.2f} "
-				  "highlightRolloff {:.3f} sensorClipCode {} (desaturation from {:.4f} of "
+				  "highlightRolloff {:.3f} clip anchor {} (desaturation from {:.4f} of "
 				  "full scale) {}",
 				  lut->params().describe(), geom.out_width, geom.out_height,
 				  static_cast<long long>(binning), colour_.exposure, colour_.gamma,
-				  colour_.highlight_rolloff, colour_.sensor_clip_code,
+				  colour_.highlight_rolloff, renderer_.resolvedClipCode(),
 				  renderer_.highlightReference() * (1.0 - colour_.highlight_rolloff),
 				  colour_.rec709 ? "Rec709" : "Rec601");
 }
@@ -345,10 +345,14 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 	 * maximum from an earlier shot cannot linger. */
 	if (++frames_since_report_ >= kMaxCodeReportFrames)
 	{
-		console->info("ccmpPreview: peak raw code {}, {} quads fully desaturated, over the "
-					  "last {} frames (sensorClipCode {})",
-					  renderer_.maxCodeSeen(), renderer_.fullyDesaturated(),
-					  frames_since_report_, colour_.sensor_clip_code);
+		/* highestUncorrected is the number to read: with the anchor in the right
+		 * place it sits just under it, and when it tracks the peak instead the
+		 * anchor is too high and the blown area is still magenta. */
+		console->info("ccmpPreview: peak raw code {}, highest uncorrected {}, {} quads fully "
+					  "desaturated, over the last {} frames (clip anchor {})",
+					  renderer_.maxCodeSeen(), renderer_.maxUndesaturatedCode(),
+					  renderer_.fullyDesaturated(), frames_since_report_,
+					  renderer_.resolvedClipCode());
 		renderer_.resetMaxCode();
 		frames_since_report_ = 0;
 	}

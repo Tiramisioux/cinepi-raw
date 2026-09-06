@@ -122,11 +122,36 @@ struct CcmpAnchor
 {
     double binning;   /* b — pixels summed per output sample: 1 or 4 */
     double t1_eff;    /* the effective T1 that delivers the measured a1 */
+
+    /* THE FLOOR OF THE CLEARHDR CLAMP ZONE, in this binning's own codes.
+     * Preview-only: nothing in the DNG path reads it. See
+     * CcmpPreviewColour::sensor_clip_code for what the zone is and why the
+     * FLOOR is the anchor rather than the peak code.
+     *
+     * It has to be per binning because the code a given scene level lands on
+     * is per binning — the compander is applied to b*L and divided back by b,
+     * so the same clamp sits at 2900-ish at b=1 and 2582-ish at b=4. Anchoring
+     * both on one number is why HD stayed magenta after full res was fixed. */
+    unsigned clip_code;
 };
 
 inline constexpr CcmpAnchor kT1Effective[] = {
-    { 1.0, 500.3389 },   /* full res 3856x2180 */
-    { 4.0, 500.9431 },   /* 2x2 binned 1928x1090 */
+    /* clip_code b=1: MEASURED on takes CINEPI_26-09-06_210738 and _214831 —
+     * magenta-area codes p1 2974 / 2948, peak 3054 / 3027 — then dropped below
+     * both p1 values for margin. Confirmed on hardware: full res renders blown
+     * highlights neutral at this anchor.
+     *
+     * clip_code b=4: PROVISIONAL, and the weakest number in this file. Derived,
+     * not measured: the stage's own peak-code line read 2723 at b=4 on the same
+     * light that read 3054 at b=1, and this applies the peak-to-floor ratio
+     * measured at b=1 (1.0378) plus the same 48-code margin. It puts the
+     * anchor-to-peak band at 0.082 stops against 0.078 at b=1, which is the
+     * consistency check available without a binned take. Replace it with a
+     * direct measurement the moment one exists — the procedure is the one used
+     * for b=1: record a binned 12-bit ClearHDR take with a blown highlight and
+     * read the codes under the magenta area of its embedded thumbnail. */
+    { 1.0, 500.3389, 2900 },   /* full res 3856x2180 */
+    { 4.0, 500.9431, 2582 },   /* 2x2 binned 1928x1090 */
 };
 
 /* Curve parameters for one mode. `binning` is the only input that varies. */
@@ -154,6 +179,10 @@ struct CcmpParams
      * edit meaning "write a different BlackLevel" would move the curve instead. */
     double pedestal = kCcmpPedestal;       /* P — part of the transfer         */
     double out_pedestal = kCcmpPedestal;   /* the output domain — a choice     */
+
+    /* Preview-only, carried here so it travels with the rest of the per-binning
+     * anchor. See CcmpAnchor::clip_code. */
+    unsigned clip_code = 0;
 
     int s1_index = kCcmpAcmp1Index;
     int s2_index = kCcmpAcmp2Index;
@@ -208,6 +237,7 @@ inline bool ccmp_params_for_binning(double binning, CcmpParams &params)
             CcmpParams p;
             p.binning = a.binning;
             p.T1 = a.t1_eff;
+            p.clip_code = a.clip_code;
             params = p;
             return p.valid();
         }
@@ -321,6 +351,8 @@ public:
      * the decoded top code lands. */
     int black_level() const { return static_cast<int>(std::floor(params_.out_pedestal + 0.5)); }
     int white_level() const { return table_.empty() ? 0 : static_cast<int>(table_.back()); }
+    /* The preview's highlight anchor for this binning — see CcmpAnchor. */
+    unsigned clip_code() const { return params_.clip_code; }
 
     /* The last code the curve is the identity on. Below this the sensor stored
      * L unchanged, so the table must too — a one-line check that catches a
