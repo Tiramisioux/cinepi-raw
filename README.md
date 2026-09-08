@@ -169,63 +169,14 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--audio-timecode-offset-frames <int>` | `0` | Frame offset added to the 24-bit USB-capture WAV metadata timecode. PCM is not shifted. |
 | `--unique-camera-model <string>` | `"cinepi"` | Override the `UniqueCameraModel` DNG tag embedded in recorded frames. Changing to `Blackmagic Pocket Cinema Camera 4K` enables ISO settings to clips in DaVinci Resolve. |
 
-### WAV timecode offset (`--audio-timecode-offset-frames`)
-
-A USB capture path can land a fixed number of frames early or late relative to video even after clock correction (analog/buffering latency that is constant across takes). `--audio-timecode-offset-frames` nudges the **WAV metadata timecode** by a whole number of frames to compensate. Only the embedded BWF/iXML timecode is shifted — the PCM samples are never moved.
-
-- This flag covers the **24-bit USB capture (helper) path**. The 16-bit plain-`arecord` path has its own `--plain-arecord-timecode-offset-frames`.
-- **Sign convention:** a **positive** offset moves the timecode later, so audio lands later on the NLE timeline — use a positive value when the sound is *early*. A negative value moves it earlier.
-- Independent of the built-in ADC clock correction; both can be active at once.
-- CineMate sets this automatically from `audio_capture.24bit.timecode_offset_frames` (and the 16-bit flag from `audio_capture.16bit.timecode_offset_frames`) in `settings.jsonc`; pass it manually only when running `cinepi-raw` directly.
-
-When non-zero, `cinepi-raw` logs after each take:
-
-```
-Applied 24-bit USB capture WAV metadata timecode offset: +2 frames; PCM timing unchanged
-```
-
 ## Frame-rate phase lock
 
-Off by default (`fps_phase_lock` Redis key). A closed-loop servo that holds the
-recorded frame cadence on the operator's nominal fps, so audio and video stay in
-sync across long takes.
-
-**How it differs from stock cinepi-raw:** stock cinepi-raw sets one
-`FrameDurationLimits` per fps change and lets the sensor free-run, so a small
-fixed quantisation/crystal offset between the requested rate and what the sensor
-actually delivers accumulates over a take. The phase lock measures and corrects
-every frame instead.
-
-**How it works:** each frame in `process()` it compares the accumulated frame
-phase (from the monotonic `SensorTimestamp`) against the ideal `n / fps` and trims
-`FrameDurationLimits` with a PI servo. The integer-VBLANK quantisation downstream
-is dithered (first-order sigma-delta) so the *average* rate is exact. It is
-VBLANK-only (never touches line length) and pre-converges during preview, so a
-clip is locked from the first frame.
-
-**What it means for sync:** the video cadence tracks the Pi clock — the same clock
-the audio is captured against — so A/V no longer drift apart over long takes; the
-residual is a bounded sub-frame offset, not an accumulating drift.
-
-Gains are tunable live via `pll_kp` / `pll_ki` / `pll_deadband_us`. On a
-multi-camera `--sync` genlock rig it is safe to leave enabled: cinepi-raw infers
-its role from `--sync` and runs the absolute Pi-clock discipline only on the
-master (`--sync` off or `server`). The `--sync` client self-suppresses the lock
-so libcamera's rpi.sync owns that sensor's VBLANK and holds the relative A→B
-genlock — the lock never shares a sensor's VBLANK with rpi.sync, which is the
-conflict the client gate prevents. If you would rather keep the master strictly
-constant-rate, disable the lock and discipline the sync server's rate instead.
+Syncs frame capture to the onboard clock of the Raspberry Pi intead of using the sensors clock. Makes it easier to record in sync with audio recordings (since both frame and audio capure are using the same clock). Off by default. 
 
 ## Manual DNG encoder
 
 - Manual writing of DNG tags.
-
 - Frames are written uncompressed, for simple I/O.
-
-- Packs 16-bit SDR streams (12-bit sensor data, MSB-aligned, so the pack is lossless) to 12 bit. True 16-bit sensor modes (imx585 ClearHDR) always keep full 16-bit depth.
-
-  The `--keep16` flag, which disabled that packing, was removed. The 4 bits it preserved are padding, so it only ever produced a ~33% larger file carrying the same information.
-
 - Supports both IMX 585 color and mono variants.
 
 ### Worker pool tuning examples
@@ -248,7 +199,6 @@ constant-rate, disable the lock and discipline the sync server's rate instead.
 ## Audio recording
 
 - Places WAV output alongside the DNG take (`/media/RAW/<folder>.wav`).
-
 - Compatible with USB 16 bit mono and RODE VideoMic 24 bit stereo microphones using `dsnoop`.
 
 ### /etc/asound.conf setup
@@ -344,25 +294,6 @@ Requirements:
 | libcamera | Tiramisioux `libcamera`, branch `cinemate` | 16-bit endian swap, gated off compressed formats |
 | Exposure | manual in 16-bit modes | ISP statistics are invalid at 16-bit — AGC/AWB cannot run there. The 12-bit ClearHDR mode below keeps them working. |
 
-### Launch refusal on failed HDR handshake
-
-Launching with `--hdr sensor` or `--hdr auto` now hard-fails at startup if the
-sensor doesn't confirm the ClearHDR write. cinepi-raw writes
-`wide_dynamic_range=1` to the sensor subdevice, reads it back, and retries up
-to 4 times at 50ms apart; if the readback never comes back true, it throws
-instead of launching:
-
-> `imx585/imx708 ClearHDR: sensor did not accept wide_dynamic_range=1 after retrying -- refusing to launch with --hdr sensor while the sensor's combiner is still off (this is the invalid-combo BLC-fill defect, not a software problem; retry the launch)`
-
-(`sensor` in the message is whichever `--hdr` value was passed.)
-
-This is not a new regression — it converts a previously silent failure into a
-hard one. Before this check, a failed write left the sensor's WDR combiner
-off while cinepi-raw still launched in a ClearHDR mode, so the DNGs recorded
-a flat BLC pedestal fill instead of real data, with every ClearHDR knob
-(thresholds, blend, gain adder) inert against it. If you hit this error,
-retry the launch.
-
 ### 16-bit ClearHDR
 
 The sensor outputs one 16-bit linear Bayer frame; cinepi-raw records it as true
@@ -409,25 +340,6 @@ setting it:
 | `hdr_blend` | HDR Data Blending Mode | 0–8 | how the two readouts are mixed across the transition zone (0 = HG 1/2 + LG 1/2, per the driver menu) |
 | `hdr_gain_adder` | HDR Gain Adder | 0–5 | digital gain applied to the low-gain path in the merge (menu index; driver default 2 = +12 dB) — shifts where the blend knee lands in the output range |
 
-`hdr_threshold_low`/`hdr_threshold_high` are two Redis keys, but the sensor
-control (`IMX585_CID_HDR_DATASEL_TH`) is a single hardware `u16[2]` pair —
-cinepi-raw reads both keys and writes them together whichever one changes.
-
-```bash
-redis-cli set hdr_blend 2 && redis-cli publish cp_controls hdr_blend
-redis-cli set hdr_threshold_low 500 && redis-cli publish cp_controls hdr_threshold_low
-redis-cli set hdr_threshold_high 3000 && redis-cli publish cp_controls hdr_threshold_high
-```
-
-Toggling ClearHDR itself (`wide_dynamic_range`) changes the sensor's mode
-list, so it stays a launch flag — restart cinepi-raw to switch between SDR
-and HDR. CineMate builds HDR profiles and CLI commands on top of these keys
-(see the CineMate docs, *ClearHDR* page).
-
-Known behaviour: highlights near the merge hand-off can render magenta in
-flat greys — that zone is where the readouts converge, and white balance
-pushes red/blue above green there. Tune `hdr_threshold_low`/`hdr_threshold_high`/`hdr_blend`
-for the scene, or grade it out; it is not a capture defect.
 
 ### Setting the knobs with v4l2-ctl (no Redis)
 
@@ -447,33 +359,3 @@ v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_gain_adder_db=1
 v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl wide_dynamic_range=1   # ClearHDR on — restart cinepi-raw afterwards
 v4l2-ctl -d /dev/v4l-subdev2 --list-ctrls-menus                # inspect ranges and menu entries
 ```
-
-`wide_dynamic_range` changes the sensor's mode list, so flip it before
-launching (or relaunch after). The three knob controls apply live.
-
-`hdr_data_selection_threshold` takes `EXP_TH_H,EXP_TH_L` — high first. The
-first value must be >= the second: `EXP_TH_H < EXP_TH_L` is a prohibited
-sensor state that outputs only the black-level pedestal, and this raw-v4l2
-path bypasses the guard cinepi-raw applies to the Redis keys. A value set
-this way also outlives cinepi-raw restarts: the driver replays cached
-control values at every stream start, so only a module reload or an
-explicit rewrite clears it.
-
-## Tests and CI
-
-`cinepi/meson.build` defines seven pure-C++ unit tests (no libcamera, no Redis, no
-rpicam-apps dependency) — the project's own, most thorough entry point:
-
-```bash
-meson test -C build --print-errorlogs
-```
-
-`.github/workflows/checks.yml` runs on every pull request: since `meson setup` requires
-libcamera unconditionally even to configure, and there's no `subprojects/*.wrap` to fetch it,
-CI instead compiles and runs each of the seven test targets directly with `g++`, bypassing
-meson setup entirely — no Raspberry Pi or libcamera build needed to keep this green. A
-shellcheck job runs alongside it.
-
-## License
-
-The source code is made available under the simplified [BSD 2-Clause license](https://spdx.org/licenses/BSD-2-Clause.html).
