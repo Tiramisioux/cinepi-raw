@@ -1,0 +1,31 @@
+{
+ "source_spec": "../log_luts/cinemate_log_16to10.json",
+ "log_params": {
+  "mu": 10000,
+  "black_level": 3200,
+  "white_level": 65535,
+  "source_bits": 16,
+  "target_bits": 10,
+  "code_max": 1023,
+  "footroom_codes": 32,
+  "footroom_lsb": 487
+ },
+ "mode3_fullres": {
+  "mode": 3,
+  "b": 1.0,
+  "entries": 4096,
+  "files": [
+   "ccmp12_to_log10_mode3_fullres.bin",
+   "ccmp12_to_log10_mode3_fullres.txt"
+  ]
+ },
+ "mode2_binned": {
+  "mode": 2,
+  "b": 4.0,
+  "entries": 4096,
+  "files": [
+   "ccmp12_to_log10_mode2_binned.bin",
+   "ccmp12_to_log10_mode2_binned.txt"
+  ]
+ }
+}

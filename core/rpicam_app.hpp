@@ -133,6 +133,14 @@ public:
 	void OpenCamera();
 	void CloseCamera();
 
+	// Insert a post-processing stage at the front of the chain if the
+	// post-process file did not name it. Call after OpenCamera(), which is
+	// where that file is read.
+	void EnsureFirstPostProcessingStage(std::string const &name)
+	{
+		post_processor_.EnsureFirstStage(name);
+	}
+
 	void ConfigureViewfinder();
 	void ConfigureStill(unsigned int flags = FLAG_STILL_NONE);
 	void ConfigureVideo(unsigned int flags = FLAG_VIDEO_NONE, uint8_t thumbnailFactor = 0);
@@ -185,6 +193,12 @@ public:
 
 protected:
 	std::unique_ptr<Options> options_;
+
+	// The camera this app has open, for subclasses that need to read sensor
+	// properties off it. camera_ itself stays private so that opening, closing
+	// and acquiring it remain RPiCamApp's business alone. Null before
+	// OpenCamera() and after CloseCamera().
+	std::shared_ptr<Camera> const &GetCamera() const { return camera_; }
 
 private:
 	template <typename T>

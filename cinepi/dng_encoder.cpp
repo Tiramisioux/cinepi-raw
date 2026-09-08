@@ -11,6 +11,7 @@
  #include <iostream>                // debugging, std::cerr
  #include <libcamera/control_ids.h> // metadata.get(controls::...)
  #include <libcamera/formats.h>     // libcamera::formats::
+ #include <libcamera/color_space.h> // loinfo.colour_space->ycbcrEncoding
  #include <cmath>
 #include <cstring>
 #include <cerrno>
@@ -26,9 +27,10 @@
 #include <sched.h>
 #include <sys/resource.h>
  
- #include "dng_encoder.hpp"        
- #include "utils.hpp"               
- #include "ifd_builder.hpp"         
+ #include "dng_encoder.hpp"
+ #include "utils.hpp"
+ #include "ifd_builder.hpp"
+ #include "ccmp_gate.hpp"
  
  #include <sys/mman.h>              
  #include <sys/types.h>
@@ -139,19 +141,8 @@ void pack_8bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
     }
 }
 
-void pack_10bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
-    // 5 bytes can hold 4 10-bit pixels
-    // Every iteration of the loop processes 4 pixels (40 bits)
-    for (size_t i = 0; i < num_pixels; i += 4) {
-        dst[0] = src[i] >> 2;                               // Highest 8 bits of pixel 1
-        dst[1] = (src[i] << 6) | (src[i + 1] >> 4);         // Lowest 2 bits of pixel 1 + highest 6 bits of pixel 2
-        dst[2] = (src[i + 1] << 4) | (src[i + 2] >> 6);     // Lowest 4 bits of pixel 2 + highest 4 bits of pixel 3
-        dst[3] = (src[i + 2] << 2) | (src[i + 3] >> 8);     // Lowest 6 bits of pixel 3 + highest 2 bits of pixel 4
-        dst[4] = src[i + 3];                                // Lowest 8 bits of pixel 4
-
-        dst += 5; // Move to the next 5 bytes
-    }
-}
+/* The live 10-bit packer moved to cinepi/dng_pack.hpp as pack_row_10bit() so it
+ * can be unit-tested (tests/dng_pack_test.cpp). */
 
 void pack_12bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
     // 3 bytes can hold 2 12-bit pixels
@@ -185,236 +176,10 @@ void pack_14bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
 
 #include <vector>   // one new header
 
-/* ────────────────────────────────────────────────────────────── */
-/*  Helper: pack a single 16-bit row → 12-bit packed               */
-/*  width must be even (IMX585 gives even pixel counts).          */
-/* ────────────────────────────────────────────────────────────── */
-static inline void pack_row_12bit(const uint16_t *src,
-                                  uint8_t       *dst,
-                                  uint32_t       width)
-{
-    for (uint32_t x = 0; x < width; x += 2)
-    {
-        uint16_t p0 = src[x];
-        uint16_t p1 = src[x + 1];
-        dst[0] =  p0 >> 4;                     /* upper 8 bits of pixel 0      */
-        dst[1] = (p0 << 4) | (p1 >> 8);        /* lower 4 + upper 4            */
-        dst[2] =  p1;                          /* lower 8 bits of pixel 1       */
-        dst += 3;
-    }
-}
-
-/* Pack a 16-bit source row to packed 12-bit output while dropping 4 LSBs. */
-static inline void pack_row_16_to_12bit(const uint16_t *src,
-                                        uint8_t       *dst,
-                                        uint32_t       width)
-{
-    for (uint32_t x = 0; x < width; x += 2)
-    {
-        const uint16_t p0 = src[x] >> 4;
-        const uint16_t p1 = src[x + 1] >> 4;
-        dst[0] = p0 >> 4;
-        dst[1] = (p0 << 4) | (p1 >> 8);
-        dst[2] = p1;
-        dst += 3;
-    }
-}
-
-/* Unpack MIPI CSI-2 RAW12 (2 px in 3 bytes) to right-justified 16-bit (0..4095).
- * VC4/Unicam delivers SBGGR12_CSI2P in this layout — verified against real Pi 4
- * IMX477 captures (decoding as contiguous-12 instead gives a checkerboard/
- * "wrong bit order" raw). Byte 2 holds the two low nibbles: the even pixel takes
- * the low nibble, the odd pixel the high nibble. The output is right-justified so
- * it feeds pack_row_12bit() (NOT pack_row_16_to_12bit, which drops 4 LSBs). */
-static inline void unpack_csi2_raw12(const uint8_t *src, uint16_t *dst, uint32_t width)
-{
-    for (uint32_t x = 0; x + 1 < width; x += 2)
-    {
-        const uint8_t b0 = src[0], b1 = src[1], b2 = src[2];
-        dst[x]     = (static_cast<uint16_t>(b0) << 4) |  (b2 & 0x0F);
-        dst[x + 1] = (static_cast<uint16_t>(b1) << 4) | ((b2 >> 4) & 0x0F);
-        src += 3;
-    }
-}
-
-/* Unpack MIPI CSI-2 RAW10 (4 px in 5 bytes) to right-justified 16-bit (0..1023).
- * Byte 4 holds the four pixels' low 2 bits, first pixel in the lowest pair. Same
- * MIPI convention as RAW12 above; feeds pack_10bit_data(). */
-static inline void unpack_csi2_raw10(const uint8_t *src, uint16_t *dst, uint32_t width)
-{
-    for (uint32_t x = 0; x + 3 < width; x += 4)
-    {
-        const uint8_t b0 = src[0], b1 = src[1], b2 = src[2], b3 = src[3], b4 = src[4];
-        dst[x]     = (static_cast<uint16_t>(b0) << 2) |  (b4 & 0x03);
-        dst[x + 1] = (static_cast<uint16_t>(b1) << 2) | ((b4 >> 2) & 0x03);
-        dst[x + 2] = (static_cast<uint16_t>(b2) << 2) | ((b4 >> 4) & 0x03);
-        dst[x + 3] = (static_cast<uint16_t>(b3) << 2) | ((b4 >> 6) & 0x03);
-        src += 5;
-    }
-}
-
-/*
- * PiSP COMP1 compressed Bayer decode.
- *
- * Pi 5's PiSP frontend may turn requested CSI2 packed raw into PISP_COMP1.
- * The compressed stream stores one 8-pixel block in 8 bytes. Decode back to
- * PiSP's 16-bit working domain, then the regular DNG row packer can emit the
- * same 12-bit DNG payload used for unpacked 16-bit raw. The constants match
- * the Raspberry Pi PiSP pipeline configuration used by Will Whang's IMX585
- * libcamera fork. Decoder logic adapted from Apertar-Core's MIT-licensed
- * CdngEncoder (Copyright (c) 2026 Apertar Studio).
- */
-constexpr uint16_t PISP_COMP1_OFFSET = 2048;
-constexpr size_t PISP_DEQUANT_LUT_SIZE = 1024;
-
-static inline uint32_t read_le32(const uint8_t *src)
-{
-    return static_cast<uint32_t>(src[0]) |
-           (static_cast<uint32_t>(src[1]) << 8) |
-           (static_cast<uint32_t>(src[2]) << 16) |
-           (static_cast<uint32_t>(src[3]) << 24);
-}
-
-static uint16_t pisp_dequantize_scalar(uint16_t q, int qmode)
-{
-    switch (qmode)
-    {
-    case 0:
-        return static_cast<uint16_t>((q < 320) ? (16 * q) : (32 * (q - 160)));
-    case 1:
-        return static_cast<uint16_t>(std::min<uint32_t>(65535u, 64u * q));
-    case 2:
-        return static_cast<uint16_t>(std::min<uint32_t>(65535u, 128u * q));
-    default:
-        return static_cast<uint16_t>((q < 94) ? (256 * q) : std::min<uint32_t>(65535u, 512u * (q - 47)));
-    }
-}
-
-static std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> build_pisp_dequant_lut(int qmode)
-{
-    std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> lut {};
-    for (size_t i = 0; i < lut.size(); ++i)
-        lut[i] = pisp_dequantize_scalar(static_cast<uint16_t>(i), qmode);
-    return lut;
-}
-
-static const std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> PISP_DEQUANT_MODE0 = build_pisp_dequant_lut(0);
-static const std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> PISP_DEQUANT_MODE1 = build_pisp_dequant_lut(1);
-static const std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> PISP_DEQUANT_MODE2 = build_pisp_dequant_lut(2);
-static const std::array<uint16_t, PISP_DEQUANT_LUT_SIZE> PISP_DEQUANT_MODE3 = build_pisp_dequant_lut(3);
-
-static inline uint16_t pisp_dequantize_fast(int q, int qmode)
-{
-    const size_t idx = static_cast<size_t>(std::clamp(q, 0, static_cast<int>(PISP_DEQUANT_LUT_SIZE - 1)));
-    switch (qmode)
-    {
-    case 0:
-        return PISP_DEQUANT_MODE0[idx];
-    case 1:
-        return PISP_DEQUANT_MODE1[idx];
-    case 2:
-        return PISP_DEQUANT_MODE2[idx];
-    default:
-        return PISP_DEQUANT_MODE3[idx];
-    }
-}
-
-static inline uint16_t add_pisp_comp1_offset(uint16_t value)
-{
-    return static_cast<uint16_t>(std::min<uint32_t>(65535u, static_cast<uint32_t>(value) + PISP_COMP1_OFFSET));
-}
-
-static void pisp_comp1_subblock(uint16_t *dst, uint32_t word)
-{
-    int q[4] {};
-    const int qmode = word & 3;
-    if (qmode < 3)
-    {
-        const int field0 = (word >> 2) & 511;
-        const int field1 = (word >> 11) & 127;
-        const int field2 = (word >> 18) & 127;
-        const int field3 = (word >> 25) & 127;
-        if (qmode == 2 && field0 >= 384)
-        {
-            q[1] = field0;
-            q[2] = field1 + 384;
-        }
-        else
-        {
-            q[1] = (field1 >= 64) ? field0 : field0 + 64 - field1;
-            q[2] = (field1 >= 64) ? field0 + field1 - 64 : field0;
-        }
-        int p1 = std::max(0, q[1] - 64);
-        if (qmode == 2)
-            p1 = std::min(384, p1);
-        int p2 = std::max(0, q[2] - 64);
-        if (qmode == 2)
-            p2 = std::min(384, p2);
-        q[0] = p1 + field2;
-        q[3] = p2 + field3;
-    }
-    else
-    {
-        const int pack0 = (word >> 2) & 32767;
-        const int pack1 = (word >> 17) & 32767;
-        q[0] = (pack0 & 15) + 16 * ((pack0 >> 8) / 11);
-        q[1] = (pack0 >> 4) % 176;
-        q[2] = (pack1 & 15) + 16 * ((pack1 >> 8) / 11);
-        q[3] = (pack1 >> 4) % 176;
-    }
-
-    dst[0] = pisp_dequantize_fast(q[0], qmode);
-    dst[2] = pisp_dequantize_fast(q[1], qmode);
-    dst[4] = pisp_dequantize_fast(q[2], qmode);
-    dst[6] = pisp_dequantize_fast(q[3], qmode);
-}
-
-static void decode_pisp_comp1_block(const uint8_t *src, uint16_t *dst)
-{
-    pisp_comp1_subblock(dst, read_le32(src));
-    pisp_comp1_subblock(dst + 1, read_le32(src + 4));
-    for (int i = 0; i < 8; ++i)
-        dst[i] = add_pisp_comp1_offset(dst[i]);
-}
-
-static void unpack_pisp_comp1_row_to_16(const uint8_t *src, uint16_t *dst, uint32_t width)
-{
-    const uint32_t full_blocks = width / 8u;
-    uint32_t x = 0;
-    for (uint32_t block = 0; block < full_blocks; ++block, x += 8u, src += 8u)
-        decode_pisp_comp1_block(src, dst + x);
-
-    const uint32_t remaining = width - x;
-    if (remaining > 0)
-    {
-        uint16_t working[8] {};
-        decode_pisp_comp1_block(src, working);
-        std::copy(working, working + remaining, dst + x);
-    }
-}
-
-static void unpack_pisp_comp1_row_to_packed12(const uint8_t *src, uint8_t *dst, uint32_t width)
-{
-    const uint32_t full_blocks = width / 8u;
-    uint32_t x = 0;
-    for (uint32_t block = 0; block < full_blocks; ++block, x += 8u, src += 8u)
-    {
-        uint16_t working[8];
-        decode_pisp_comp1_block(src, working);
-        pack_row_16_to_12bit(working, dst + (static_cast<size_t>(x) / 2u) * 3u, 8u);
-    }
-
-    const uint32_t remaining = width - x;
-    if (remaining > 0)
-    {
-        uint16_t working[8] {};
-        uint8_t packed[12] {};
-        decode_pisp_comp1_block(src, working);
-        const uint32_t tail = std::min(remaining, 8u);
-        pack_row_16_to_12bit(working, packed, tail);
-        std::memcpy(dst + (static_cast<size_t>(x) / 2u) * 3u, packed, (tail * 12u + 7u) / 8u);
-    }
-}
+/* Pure DNG pixel pack/unpack helpers (pack_row_12bit, pack_row_16_to_12bit,
+ * pack_row_10bit, unpack_csi2_raw12/raw10, PiSP COMP1 decode) live in a header so
+ * they can be unit-tested without libcamera. See tests/dng_pack_test.cpp. */
+#include "cinepi/dng_pack.hpp"
 
 
 struct Matrix
@@ -722,33 +487,310 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.black_level_repeat_dim[0] = 2;
     dng_info.black_level_repeat_dim[1] = 2;
 
-    /* By default we pack 16-bit streams to 12-bit unless user said --keep16 */
-    write12bit_ = (bf.bits == 16) && !options_->keep16;
+    /* On PiSP every raw stream arrives as a 16-bit container. SDR sensor modes
+     * (<=12 significant bits, MSB-aligned) always pack down to 12-bit DNGs;
+     * dropping the 4 padding LSBs is lossless there. A true 16-bit sensor mode
+     * (imx585 ClearHDR SRGGB16, sensor mode bit depth 16) carries real data in
+     * all 16 bits, so it keeps full depth. The bit depth comes from the snapshot
+     * taken at reconfigure time, not options_->mode (which the redis thread
+     * mutates). BlackLevel is computed per-frame in dng_save() from
+     * SensorBlackLevels, scaled to the output white level.
+     *
+     * (--keep16 used to force full depth for the SDR case too; it was removed
+     * because the 4 bits it preserved are padding, so it only ever bought a
+     * ~33% larger file carrying the same information. --log-encode is the one
+     * output-depth control now.)
+     *
+     * !sensor_mode_trusted_ forces this false, i.e. keeps the full 16-bit
+     * container, regardless of what sensor_mode_bit_depth_ claims. The two
+     * ways this decision can be wrong are not symmetric: believing a stale
+     * "12" and packing down throws away real 16-bit data (bf.bits == 16, so
+     * the container genuinely carries it) with no way to get it back;
+     * believing a stale "16" and keeping the container when the mode was
+     * really a 12-in-16 SDR stream just stores four already-known-zero
+     * padding bits, which is what the untrusted branch below already accepts
+     * doing on every ordinary reconfigure. Fail toward the non-destructive
+     * side, same reasoning as the CCMP gate just below. */
+    write12bit_ = sensor_mode_trusted_ && (bf.bits == 16) && sensor_mode_bit_depth_ != 16;
 
     if (write12bit_) {
         dng_info.bits  = 12;
         dng_info.white = (1u << 12) - 1u;
-
-        /* rescale black levels already in the array */
-        for (float &bl : dng_info.black_levels)
-            bl = bl * dng_info.white / 65535.f;
-    }
-    else {
-        dng_info.white = (1u << dng_info.bits) - 1u;   // 65 535 for true 16-bit
     }
 
+    /* ──  CCMP12 decompand  ───────────────────────────────────────
+     * In 12-bit ClearHDR the imx585 companands on-sensor: the 16-bit ClearHDR
+     * signal goes through a three-segment piecewise-linear curve and 12-bit
+     * codes come out. Written to a DNG as if they were linear those codes
+     * render with the mid-tones crushed magenta — the highlights white-balance
+     * and nothing below them does, because the defect is the transfer curve and
+     * not the gains. A LinearizationTable undoes it inside the file, so a
+     * converter sees linear data and no post step is needed.
+     *
+     * Scope is exactly the two measured modes: ClearHDR ON **and** a 12-bit
+     * sensor mode. 16-bit ClearHDR (modes 4/5) is delivered linear with no
+     * compander in the path, and a 12-bit SDR mode never companded either —
+     * gating on bit depth alone would decompand data that was never companded,
+     * which is the same defect with the sign flipped.
+     *
+     * dng_info.white becomes the table's OUTPUT white level: under a
+     * LinearizationTable a reader applies the curve BEFORE reading the level
+     * tags, so both describe the table's output domain and not the stored
+     * codes. BlackLevel is handled in dng_save(), where the curve is the
+     * authority and the usual metadata rescale must not run.
+     *
+     * FIRST, because decompanding is what makes the data linear and the log
+     * curve below assumes linear input. Today they are mutually exclusive (the
+     * log scope chain refuses a companded source); when P3 precomposes them it
+     * is this order the composition has to follow.
+     *
+     * Anything unmeasured falls through to the ordinary linear path rather than
+     * emitting a mislabelled file.
+     *
+     * sensor_mode_trusted_ is the round-2 addition (ccmp_gate.hpp): a request
+     * whose dimensions didn't match the validated raw stream cannot be
+     * believed to be 12-bit just because sensor_mode_bit_depth_ says so — see
+     * that header for the full reasoning and the observed hardware failure it
+     * closes. */
+    ccmp_lut_ = nullptr;
+    if (options_ && ccmp_gate_should_consider(options_->hdr, sensor_mode_bit_depth_, sensor_mode_trusted_))
+    {
+        std::string err;
+        const CcmpLut *lut = get_ccmp_lut(sensor_binning_, err);
+        if (lut)
+        {
+            ccmp_lut_ = lut;
+            dng_info.bits  = 12;
+            dng_info.white = static_cast<uint32_t>(lut->white_level());
+            console->info("{}  LinearizationTable {} entries, BlackLevel {} WhiteLevel {}",
+                          lut->params().describe(), lut->size(),
+                          lut->black_level(), lut->white_level());
+        }
+        else
+        {
+            /* Loud, because the alternative is a silently magenta take. */
+            console->warn("12-bit ClearHDR without a CCMP decompand table: {}. "
+                          "Writing linear 12-bit codes — the mid-tones will render "
+                          "magenta and no post step recovers them cleanly.", err);
+        }
+    }
+    else if (options_ && (options_->hdr == "sensor" || options_->hdr == "auto") &&
+             sensor_mode_bit_depth_ == 12 && !sensor_mode_trusted_)
+    {
+        /* Reachable only because sensor_mode_trusted_ is false -- hdr scope
+         * and bit depth alone would have considered this. Same loud warning
+         * as the "no measured table" case above, naming the actual reason:
+         * the requested mode did not match what the camera configured, so
+         * the frozen "12" cannot be trusted. */
+        console->warn("12-bit ClearHDR requested but the requested mode did not match the "
+                      "configured raw stream; skipping the CCMP decompand table rather than "
+                      "risk mislabelling. Writing linear 12-bit codes — the mid-tones will "
+                      "render magenta and no post step recovers them cleanly.");
+    }
 
-    for (float &bl : dng_info.black_levels)          // already filled earlier
-    bl = bl * dng_info.white / 65535.f;          // 16-bit → 12-bit scale
+    /* ──  CineMate Log  ───────────────────────────────────────
+     * Resolve the curve here, the one place that knows both depths, and let
+     * everything downstream key off log_lut_. dng_info.bits/white feed four
+     * things at once — the dng_save() branch chain, tag 258, tag 0xC61D and
+     * the black-level rescale — so they are the only two values the log path
+     * has to override:
+     *
+     *   bits  = the STORED code depth (12), so tag 258 and the buffer sizing
+     *           below describe the packed log codes that are really written.
+     *   white = the LINEAR (table-output) white level, because under a
+     *           LinearizationTable the level tags live in the table's OUTPUT
+     *           domain, not the code domain. That is also exactly what turns
+     *           the `* dng_info.white / 65535.f` black rescale at the bottom of
+     *           dng_save() into the identity, which is the required bypass:
+     *           SensorBlackLevels is already in that same 16-bit linear domain.
+     *
+     * Scope: 16-bit ClearHDR and 12-bit SDR sensor modes, to 12- or 10-bit
+     * codes. Anything else falls through to the normal linear path rather than
+     * emitting an untested file. */
+    log_lut_       = nullptr;
+    log_src_shift_ = 0;
+    if (options_ && options_->log_encode)
+    {
+        std::string err;
+        const LogLut *lut  = nullptr;
+        const int target   = options_->log_encode;
+        const int src_bits = static_cast<int>(sensor_mode_bit_depth_);
+        unsigned shift     = 0;
 
+        /* The source must be LINEAR, and 12-bit ClearHDR is not — it is
+         * CCMP-companded on-sensor (see log_source_is_companded()). It is
+         * still a valid log source, but only via composition: decompand to
+         * 16-bit linear FIRST, then apply the 16-to-`target` curve, never a
+         * spec keyed on the companded 12-bit domain (there is no such thing
+         * as a linear 12to10 reading of CCMP data). Resolved below, once the
+         * row shape confirms this is a normalisable source at all. */
+        const bool companded = log_source_is_companded(src_bits, options_->hdr);
 
-    /* ──  Black-level defaults (16-bit = 256 DN)  ─────────────── */
-    std::fill(std::begin(dng_info.black_levels),
-              std::end(dng_info.black_levels),
-              256.f);
+        /* Which curve is keyed on the SENSOR mode depth, not bf.bits. On PiSP
+         * every raw stream arrives in a 16-bit container, so a 12-bit mode is
+         * SRGGB16 carrying its 12 significant bits MSB-aligned — measured on
+         * device: stride is 2 B/px and the recorded BlackLevel 200 lands at code
+         * 200, not at 12. bf describes the row LAYOUT, sensor_mode_bit_depth_
+         * the DOMAIN the curve was fitted to, and those two disagree exactly
+         * there. Getting it wrong is silent: a 16-bit sample indexed into a
+         * 4096-entry forward table clamps, pinning the frame at white. */
+        if (src_bits != 16 && src_bits != 12)
+            err = "needs a 16- or 12-bit sensor mode (this one is " +
+                  std::to_string(src_bits) + "-bit)";
+        /* Which row shapes: only the ones the loop in dng_save() can normalise
+         * to right-justified src_bits, and nothing else. Companding doesn't
+         * change the wire format, only the code VALUES, so this classification
+         * is identical whether or not `companded` is true — 12-bit ClearHDR
+         * rows are shaped exactly like plain 12-bit SDR rows. */
+        else if (bf.compressed && src_bits != 16)
+            err = "COMP1 rows decode to a 16-bit domain, not " + std::to_string(src_bits);
+        else if (bf.packed && (bf.bits != 12 || src_bits != 12))
+            err = "no CSI2 unpacker for packed " + std::to_string(bf.bits) +
+                  "-bit rows in a " + std::to_string(src_bits) + "-bit domain";
+        else if (!bf.compressed && !bf.packed && bf.bits != src_bits)
+        {
+            /* The one legal mismatch is the PiSP SDR container above. */
+            if (bf.bits == 16 && src_bits == 12)
+                shift = 4;
+            else
+                err = std::to_string(bf.bits) + "-bit rows cannot carry a " +
+                      std::to_string(src_bits) + "-bit domain";
+        }
 
-    if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
-        std::copy(bl->begin(), bl->end(), dng_info.black_levels);
+        /* Composed is keyed on the CCMP decompand for this binning, not on
+         * src_bits/target directly — see get_ccmp_composed_log_lut(). Only
+         * target 10 has a composed spec today (there is no 16to12 composition
+         * wired up); anything else refuses exactly as before P3. */
+        bool composed = false;
+        if (err.empty() && companded)
+        {
+            if (target != 10)
+                err = "12-bit ClearHDR is CCMP-companded on-sensor; only "
+                      "--log-encode 10 composes with the decompand today "
+                      "(target " + std::to_string(target) + " has no composed spec)";
+            else
+            {
+                lut      = get_ccmp_composed_log_lut(target, sensor_binning_, err);
+                composed = (lut != nullptr);
+                if (!lut)
+                    err = "12-bit ClearHDR log-encode needs the CCMP decompand: " + err;
+            }
+        }
+        else if (err.empty())
+            lut = get_log_lut(src_bits, target, err);
+
+        /* The loaded spec, not the flag, decides the real depths. load_log_lut()
+         * picks the file by NAME and verifies its table round-trips, but never
+         * cross-checks the depths the file declares against the pair it was
+         * asked for — and the row path below only has packers for 12 and 10. So
+         * refuse a spec that disagrees, instead of encoding against one domain
+         * and labelling the file with another. A composed lut's params() are
+         * the curve AFTER decompand (source_bits 16), not src_bits (12) — that
+         * mismatch is the whole point of composing, not an error to catch. */
+        if (lut)
+        {
+            const LogLutParams &lp = lut->params();
+            const int expected_source_bits = composed ? 16 : src_bits;
+            if (lp.target_bits != target)
+                err = "spec targets " + std::to_string(lp.target_bits) +
+                      " bit, expected " + std::to_string(target);
+            else if (lp.source_bits != expected_source_bits)
+                err = "spec sources " + std::to_string(lp.source_bits) +
+                      " bit, expected " + std::to_string(expected_source_bits);
+            else if (lp.target_bits != 12 && lp.target_bits != 10)
+                err = "no packer for " + std::to_string(lp.target_bits) + "-bit codes";
+
+            if (!err.empty())
+                lut = nullptr;
+        }
+
+        /* A spec is keyed on the DEPTH PAIR alone — log_lut_spec_filename() builds
+         * the name from <src>to<tgt> and nothing else — but its black level is
+         * per-sensor. cinemate_log_12to10 assumes 200 (imx585/imx283 3200 in the
+         * 16-bit domain); every sensor has a 12-bit mode and imx477's black is
+         * 256, imx296's 240. Handing it that spec would build the toe around 200
+         * while SensorBlackLevels writes 256 into the file's own BlackLevel tag —
+         * curve and tag disagreeing by 56 LSB, exactly where the footroom codes
+         * live. Refuse instead, like every other scope guard here.
+         *
+         * Tolerance is one footroom code (foot/F): below that the toe is
+         * misplaced by less than the quantisation it controls, which is also
+         * enough slack for per-channel jitter in the reported levels. Making spec
+         * selection genuinely sensor-aware is a separate pass — it breaks the
+         * "rebuilt table must equal the spec's shipped table" invariant. */
+        if (lut)
+        {
+            const LogLutParams &lp = lut->params();
+            auto bl = metadata.get(controls::SensorBlackLevels);
+            if (!bl || bl->size() < 4)
+            {
+                /* Without the reported levels this check cannot run at all, and
+                 * the entire reason it exists is that a wrong black is SILENT —
+                 * the toe lands in the wrong place and nothing downstream says
+                 * so. Refuse, like every other guard here, rather than encode
+                 * against a curve nothing has confirmed belongs to this sensor.
+                 * Every Pi sensor reports these; a mode that somehow does not
+                 * records linear instead of recording something subtly wrong. */
+                err = "no SensorBlackLevels reported, cannot verify the curve's black level";
+                lut = nullptr;
+            }
+            else
+            {
+                int worst_seen = lp.black_level;
+                float worst_off = 0.f;
+                for (size_t i = 0; i < 4; ++i)
+                {
+                    const int scaled = log_lut_scale_black(lp, (*bl)[i]);
+                    const float off  = std::fabs(static_cast<float>(scaled - lp.black_level));
+                    if (off > worst_off) { worst_off = off; worst_seen = scaled; }
+                }
+                if (worst_off > log_lut_black_tolerance(lp))
+                {
+                    err = "spec assumes black " + std::to_string(lp.black_level) +
+                          " but this sensor reports " + std::to_string(worst_seen) +
+                          " at " + std::to_string(lp.source_bits) + " bit";
+                    lut = nullptr;
+                }
+            }
+        }
+
+        if (lut)
+        {
+            log_lut_       = lut;
+            log_src_shift_ = shift;
+            write12bit_    = false;       /* the log path owns the row conversion */
+            dng_info.bits  = lut->params().target_bits;
+            dng_info.white = lut->params().white_level;
+            /* Named explicitly so a hardware session can grep for composition the
+             * same way it already greps for the CCMP decompand's own line — the
+             * generic "LinearizationTable N entries" log further down (present
+             * either way) does not by itself say whether CCMP composed into it. */
+            if (composed)
+                console->info("CineMate Log: 12-bit ClearHDR (CCMP) composed with "
+                              "{}", lut->params().describe());
+        }
+        else
+            console->warn("CineMate Log off for this mode: {}", err);
+    }
+
+    /* ──  ONE TAG, ONE TABLE  ─────────────────────────────────────
+     * Both paths write tag 0xC618 and a DNG has exactly one of it, so at most
+     * one may be live. ccmp_lut_ and a non-composed log_lut_ ARE mutually
+     * exclusive by construction: log_source_is_companded() is true under
+     * exactly the same condition (12-bit sensor mode + --hdr sensor/auto) that
+     * resolves ccmp_lut_ above, so whenever both would be non-null the log
+     * block above has already taken the composed branch, never the plain
+     * get_log_lut() one. The one legitimate way to see both non-null at once
+     * is a successfully composed log_lut_ — which already carries the right
+     * dng_info.bits/white/write12bit_ from the assignment above, and the
+     * black-level and tag-emission chains later in this file are ordered LOG
+     * first for exactly this reason. Nothing to resolve here; the check below
+     * is a tripwire in case that invariant is ever broken by a future edit. */
+    if (ccmp_lut_ && log_lut_ && write12bit_)
+        console->error("both a CCMP decompand and a non-composed CineMate Log "
+                       "table resolved for one file with write12bit_ still set — "
+                       "the composed path always clears it. This should be "
+                       "unreachable; investigate before trusting this recording.");
 
     /* ──  White-balance gains & CCM  ──────────────────────────── */
     std::fill(std::begin(dng_info.NEUTRAL), std::end(dng_info.NEUTRAL), 1.f);
@@ -784,9 +826,49 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     dng_info.thumbBitsPerSample   = 8;
     dng_info.thumbPhotometric     = PHOTOMETRIC_MINISBLACK;   /* = 1 */
 
+    /* Snapshot the mode and shift for THIS take -- see the members' own
+     * comment in dng_encoder.hpp for why dng_save() must read these and
+     * not options_ live. Clamped, not just floored: thumbnailSize reaches
+     * here via a bare stoi() on the live redis handler with no range
+     * check, and an unclamped shift is undefined behaviour on a 32-bit
+     * width/height once it reaches the type's bit width. 12 already
+     * collapses 1272 to 0. */
+    /* Always a colour thumbnail. This used to read options_->thumbnail, which
+     * is assigned only in CinePIController::sync() -- and sync() runs after
+     * the encoder is configured, so this read 0 whatever redis held. The
+     * camera reported "embedded lores thumbnail disabled" on every take while
+     * thumbnail=2 sat in redis and the lores stream was configured correctly.
+     * That ordering was never going to be visible from the redis side, which
+     * is why the key looked right the whole time.
+     *
+     * Rather than move the assignment earlier and leave a mode that has to
+     * win a race on every start, the choice is gone: every take gets a colour
+     * thumbnail. Playback wants one on every take, raw decode is far more
+     * expensive on the Pi than serving an embedded thumbnail, and a mode that
+     * is always 2 in practice is not worth the ordering hazard. */
+    thumb_mode_  = 2;
+    thumb_shift_ = options_ ? std::clamp(options_->thumbnailSize, 0, 12) : 0;
+    thumb_lores_warned_ = false;   /* one warning per take, re-armed here */
+
+    /* Bytes this take's thumbnail actually needs -- 0 when off, so a take
+     * recorded with the toggle off gets none of this reserved, not the
+     * worst case every take used to pay regardless of mode. */
+    const uint32_t thumb_reserved_bytes =
+        (thumb_mode_ == 0) ? 0u :
+        std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift_) *
+        std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift_) *
+        static_cast<uint32_t>(thumb_mode_ == 2 ? 3 : 1);
+
     /* ──  Buffer sizing  ──────────────────────────────────────── */
+    /* 64 KB covers the IFD and its out-of-line payloads; log adds an 8 KB
+     * LinearizationTable on top of that. Worth stating explicitly: an overflow
+     * here does not crash, write_pod() throws and the frame is dropped without
+     * a pixel of evidence. */
     const uint32_t frame = ((cfg.size.width * dng_info.bits + 7) / 8) * cfg.size.height;
-    dng_info.buffer_size = align_up(frame + 64 * 1024, ONE_MB);
+    const uint32_t tail_slack =
+        64 * 1024 + (log_lut_ ? static_cast<uint32_t>(log_lut_->inverse_size() * sizeof(uint16_t)) : 0u)
+        + thumb_reserved_bytes;
+    dng_info.buffer_size = align_up(frame + tail_slack, ONE_MB);
 
     /* ──  Static strings & misc  ──────────────────────────────── */
     dng_info.make       = "Raspberry Pi";
@@ -839,7 +921,17 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     console->info("Encoder configured – {}×{} {}-bit, buffer {} MB",
                   cfg.size.width, cfg.size.height,
                   dng_info.bits, dng_info.buffer_size / ONE_MB);
-    console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
+    if (thumb_mode_ == 0)
+        console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
+    else
+        console->info("DNG writer: embedded lores thumbnail {} at {}x{} (shift {})",
+                      thumb_mode_ == 2 ? "colour" : "mono",
+                      std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift_),
+                      std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift_),
+                      thumb_shift_);
+    if (log_lut_)
+        console->info("{}  LinearizationTable {} entries", log_lut_->params().describe(),
+                      log_lut_->inverse_size());
     if (raw_compressed_in_)
         console->info("PiSP COMP1 raw input detected; decoding to {}-bit DNG rows", dng_info.bits);
 }
@@ -875,7 +967,60 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     /* ── 1. Raw image copy (packing if 12-bit) ─────────────────── */
     const uint32_t rawOff = buf.offset;
 
-    if (bayer_format.compressed)
+    if (log_lut_)
+    {
+        /* CineMate Log: linear sensor codes -> log codes, packed at the target
+         * depth. The forward LUT already emits right-justified target-depth
+         * codes, so the ordinary packer consumes its output with no extra
+         * conversion.
+         *
+         * Every source shape funnels through one uint16 row, right-justified in
+         * the curve's own source domain: COMP1 is decompressed, CSI2-packed
+         * RAW12 is unpacked, the PiSP SDR container is shifted down off its MSB
+         * alignment, and an already-right-justified row is read in place.
+         * setup_encoder() refused anything this chain cannot normalise, so the
+         * cases below are exhaustive. Encoding row16Buf into itself is
+         * deliberate — the map is per-sample and the write to x follows the read
+         * of x — and it keeps every converting case to a single scratch row. */
+        const int target         = log_lut_->params().target_bits;
+        const uint32_t rowPacked = (info.width * target + 7) / 8;
+        rowBuf.resize(rowPacked);
+        row16Buf.resize(info.width);
+
+        for (uint32_t y = 0; y < info.height; ++y)
+        {
+            const uint8_t  *srow = raw + y * info.stride;
+            const uint16_t *lin;
+            if (bayer_format.compressed)
+            {
+                unpack_pisp_comp1_row_to_16(srow, row16Buf.data(), info.width);
+                lin = row16Buf.data();
+            }
+            else if (bayer_format.packed)
+            {
+                unpack_csi2_raw12(srow, row16Buf.data(), info.width);
+                lin = row16Buf.data();
+            }
+            else if (log_src_shift_)
+            {
+                right_justify_row(reinterpret_cast<const uint16_t *>(srow),
+                                  row16Buf.data(), info.width, log_src_shift_);
+                lin = row16Buf.data();
+            }
+            else
+            {
+                lin = reinterpret_cast<const uint16_t *>(srow);
+            }
+
+            log_lut_->encode_row(lin, row16Buf.data(), info.width);
+            if (target == 12)
+                pack_row_12bit(row16Buf.data(), rowBuf.data(), info.width);
+            else
+                pack_row_10bit(row16Buf.data(), rowBuf.data(), info.width);
+            write_pod(buf, rowBuf.data(), rowPacked);
+        }
+    }
+    else if (bayer_format.compressed)
     {
         if (write12bit_)
         {
@@ -944,12 +1089,13 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     }
     else if (dng_info.bits == 10)
     {
+        /* pack_row_10bit() writes exactly this many bytes: Pass 2 gave it a
+         * zero-padded final group that emits only the (n*10+7)/8 bytes those n
+         * pixels occupy, replacing the old flat 5 B/group (which also over-READ
+         * the source row). So the scratch row needs no rounding-up — same sizing
+         * as the log path above. */
         const uint32_t rowPacked = (info.width * 10 + 7) / 8;   /* 1.25 B / px */
-        /* pack_10bit_data() writes 5 bytes per 4-pixel group; size the scratch
-         * row to the rounded-up group count so a width that is not a multiple of
-         * 4 cannot overflow it. For the standard 10-bit modes (mult-of-4 width)
-         * this equals rowPacked exactly. */
-        rowBuf.resize(((info.width + 3u) / 4u) * 5u);
+        rowBuf.resize(rowPacked);
         if (bayer_format.packed)
             row16Buf.resize(info.width);
 
@@ -971,7 +1117,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                  * justified in the low 10 bits. */
                 src = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
             }
-            pack_10bit_data(src, rowBuf.data(), info.width);
+            pack_row_10bit(src, rowBuf.data(), info.width);
             write_pod(buf, rowBuf.data(), rowPacked);
         }
     }
@@ -991,7 +1137,55 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     /* ──  3.  Per-channel black-level  ────────────────────────── */
     uint16_t black[4] {};
     auto ord = bayer_format.order;
-    if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
+    /* WHICHEVER TABLE IS LIVE OWNS THIS TAG. Under a LinearizationTable a reader
+     * applies the curve BEFORE reading BlackLevel, so the tag describes the
+     * table's OUTPUT and the curve — not the metadata — is the authority. Both
+     * branches below also cover the 4096-pedestal fallback further down, which
+     * is a LINEAR-path assumption and wrong under either table.
+     *
+     * Ordered LOG first. The two are not independent alternatives: when 12-bit
+     * ClearHDR is log-encoded, log_lut_ is the CCMP decompand COMPOSED with the
+     * log curve (setup_encoder(), get_ccmp_composed_log_lut()) and ccmp_lut_ is
+     * also non-null alongside it — but tag 0xC618 carries the composed curve's
+     * own (unmodified) 16-to-target inverse table, so the tags describing it
+     * must be the LOG curve's, not CCMP's. Log off is the only case ccmp_lut_
+     * is checked at all. */
+    if (log_lut_)
+    {
+        /* The log curve's output has exactly one black point:
+         * inverse[F] == lp.black_level, by construction (log_decode_level(F) is
+         * BL + 0; asserted for all three shipped curves in
+         * tests/log_lut_test.cpp). Composed or not — a composed log_lut_'s
+         * params() are the target curve's own (e.g. 16to10's BL 3200), which is
+         * exactly the domain its embedded table actually decodes to.
+         *
+         * The reported per-channel levels do not survive the encode — all four
+         * CFA channels pass through the same single-channel map — and writing
+         * them would claim a per-channel pedestal the table has already
+         * flattened, up to the one footroom code of slack setup_encoder()
+         * allows. That is exactly the shadow range the footroom exists to
+         * preserve.
+         *
+         * It is also the only right answer if SensorBlackLevels goes missing:
+         * the fallback would write 4096 (16->*) or 256 (12->10) where the curve
+         * says 3200 or 200. setup_encoder() now refuses the log path in that
+         * case, so this is belt-and-braces rather than the only guard. */
+        std::fill(std::begin(black), std::end(black),
+                  static_cast<uint16_t>(log_lut_->params().black_level));
+    }
+    else if (ccmp_lut_)
+    {
+        /* The decompand's output has one black point: the pedestal the curve was
+         * measured against. The rescale below would be actively wrong —
+         * SensorBlackLevels reports 3200 in the 16-bit domain, and
+         * 3200 * 63265/65535 is 3089 where the curve says 200. It would also
+         * claim a per-channel pedestal the table has already flattened: the
+         * decompand is per stored code and knows nothing about which CFA phase
+         * it came from, so all four channels pass through the same map. */
+        const uint16_t bl = static_cast<uint16_t>(ccmp_lut_->black_level());
+        std::fill(std::begin(black), std::end(black), bl);
+    }
+    else if (auto bl = metadata.get(controls::SensorBlackLevels); bl && bl->size() >= 4)
     {
         for (int i = 0; i < 4; ++i)
         {
@@ -1004,7 +1198,15 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         }
     }
     else
-        std::fill(std::begin(black), std::end(black), 256);
+    {
+        /* No SensorBlackLevels metadata: assume the common Pi pedestal of 4096
+         * in the 16-bit domain (upstream rpicam-apps uses 4096 >> (16 - bits))
+         * and scale it to the output white level like the metadata path above:
+         * 256 for 12-bit output, 4096 for 16-bit. */
+        const uint16_t fallback =
+            static_cast<uint16_t>(4096.f * dng_info.white / 65535.f + 0.5f);
+        std::fill(std::begin(black), std::end(black), fallback);
+    }
 
     /* ──  4.  Prepare matrices  ───────────────────────────────── */
     int32_t matrixXY[18]; encode_rational_array(dng_info.CAM_XYZ, 9, matrixXY);
@@ -1044,6 +1246,25 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(0xC61A, TIFF_RATIONAL, 4, blackRat);
     uint16_t white16 = static_cast<uint16_t>(dng_info.white);
     ifd.addEntry(0xC61D, TIFF_SHORT, 1, &white16);
+
+    /* LinearizationTable — the log curve (composed with the CCMP decompand
+     * when the source is 12-bit ClearHDR, see setup_encoder()), or the plain
+     * CCMP decompand alone when log is off, or neither. Either table IS the
+     * tag's SHORT payload, no conversion. It is what puts the two levels
+     * above into the right domain: a reader applies this table first, so
+     * BlackLevel/WhiteLevel describe its OUTPUT (linear), not the stored
+     * codes. Tag order does not matter, sortEntries() below puts the
+     * directory in ascending order.
+     *
+     * A DNG has ONE of this tag, so this chain must stay an if/else and must
+     * stay in the same order as the black-level chain above and the
+     * resolution in setup_encoder() — log first, same reasoning as there. */
+    if (log_lut_)
+        ifd.addEntry(0xC618, TIFF_SHORT,
+                     static_cast<uint32_t>(log_lut_->inverse_size()), log_lut_->inverse());
+    else if (ccmp_lut_)
+        ifd.addEntry(0xC618, TIFF_SHORT,
+                     static_cast<uint32_t>(ccmp_lut_->size()), ccmp_lut_->table());
 
     /* colour matrices */
     ifd.addEntry(0xC621, TIFF_SRATIONAL, 9, matrixXY);   /* ColorMatrix1 */
@@ -1135,6 +1356,179 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
     /* patch TIFF header with IFD-0 offset */
     *reinterpret_cast<uint32_t*>(buf.buffer + 4) = ifd.baseOffset;
+
+    /* ──  6.  Thumbnail (IFD1, chained after IFD0)  ────────────────
+     * Open decision 7, settled 2026-09-01: chained as IFD1 rather than
+     * IFD0-with-raw-in-a-SubIFD. IFD0 above is untouched by this block --
+     * same bytes, same offset, same next-IFD field left at 0 -- whenever
+     * `thumbnail` is 0 or the lores stream is absent, which is what makes
+     * the off position a genuine no-op.
+     *
+     * thumb_mode_/thumb_shift_, NOT options_->thumbnail/thumbnailSize:
+     * these are the snapshot setup_encoder() took at the start of THIS
+     * take (see their comment in dng_encoder.hpp). A live `set thumbnail`
+     * changes options_ immediately but only reaches a file at the next
+     * take -- otherwise two encode workers racing options_ mid-take could
+     * write one take with a non-monotonic mix of thumbnail/no-thumbnail
+     * frames, and the buffer_size reservation in setup_encoder() (sized
+     * against this same snapshot) could be overflowed by a mode that
+     * changed after it was computed. */
+    /* losize was previously only checked non-zero, then U/V addresses
+     * were derived from stride and height regardless -- a short or
+     * differently-shaped buffer (a mis-set lores format, a mid-stream
+     * reconfigure this take's snapshot predates) would read past it.
+     * Require the exact byte count the layout below assumes, and the
+     * pixel format that layout assumes too. */
+    const bool thumb_want = (thumb_mode_ == 1 || thumb_mode_ == 2);
+    const bool thumb_lores_ok = thumb_want &&
+        lomem && loinfo.width && loinfo.height && loinfo.stride &&
+        loinfo.pixel_format == libcamera::formats::YUV420 &&
+        losize >= (thumb_mode_ == 2
+            ? static_cast<size_t>(loinfo.stride) * loinfo.height
+              + 2 * static_cast<size_t>(loinfo.stride / 2) * (loinfo.height / 2)
+            : static_cast<size_t>(loinfo.stride) * loinfo.height);
+
+    if (thumb_want && !thumb_lores_ok && !thumb_lores_warned_)
+    {
+        console->warn("thumbnail requested (mode {}) but the lores buffer does not match "
+                      "the expected YUV420 shape (format {}, {}x{} stride {}, losize {}); "
+                      "skipping the thumbnail for this take", thumb_mode_,
+                      loinfo.pixel_format.toString(), loinfo.width, loinfo.height,
+                      loinfo.stride, losize);
+        thumb_lores_warned_ = true;
+    }
+
+    if (thumb_lores_ok)
+    {
+        const bool colour = (thumb_mode_ == 2);
+        const int shift = thumb_shift_;
+        const uint32_t tw = std::max<uint32_t>(1, loinfo.width  >> shift);
+        const uint32_t th = std::max<uint32_t>(1, loinfo.height >> shift);
+        const uint16_t spp = colour ? 3 : 1;
+
+        /* lomem is planar YUV420 (I420): Y at lomem, stride loinfo.stride;
+         * U at lomem + stride*height, chroma stride stride/2; V right after
+         * U's plane. Same layout ccmp_preview.hpp writes into this same
+         * buffer.
+         *
+         * The lores stream is STUDIO-RANGE (Y 16-235, chroma 16-240):
+         * rpicam_app.cpp's ConfigureVideo picks colorSpace Rec709 for any
+         * stream >=1280 wide or >=720 tall, which is every CineMate launch
+         * (lores height is capped at 720 by sensor_detect._calc_lores()),
+         * and this codebase's own preview path already treats that stream
+         * as limited range -- ccmp_preview.hpp's setYuvCoeffs() bakes in
+         * the same 219/224 scaling with a Y=16/UV=128 black point. Copying
+         * codes verbatim (mono) or decoding with full-range coefficients
+         * (colour, as this used to) puts black at code 16 (~6% grey) with
+         * white at 235, plus a 601-vs-709 hue error in colour. Fixed here
+         * by expanding range (mono) and by decoding with the matrix that
+         * actually matches the stream's own encoding (colour) -- read off
+         * loinfo.colour_space the same way ccmpPreviewStage.cpp reads it
+         * for the *display* path, rather than assumed. */
+        const bool rec709 = loinfo.colour_space &&
+                            loinfo.colour_space->ycbcrEncoding == libcamera::ColorSpace::YcbcrEncoding::Rec709;
+        /* Fixed-point (Q16), ITU-R BT.601-7 / BT.709-6 limited-range
+         * constants -- e.g. R = 1.164*(Y-16) + 1.596*Cr (601) or
+         * 1.164*(Y-16) + 1.793*Cr (709), Cr/Cb already centred on 128. */
+        constexpr int32_t kY   = 76285;                        /* 1.164, both spaces  */
+        const     int32_t kVR  = rec709 ? 117506 : 104598;      /* Cr -> R             */
+        const     int32_t kUG  = rec709 ?  -13960 :  -25690;    /* Cb -> G             */
+        const     int32_t kVG  = rec709 ?  -34941 :  -53295;    /* Cr -> G             */
+        const     int32_t kUB  = rec709 ?  138412 :  132202;    /* Cb -> B             */
+
+        const uint32_t ys = loinfo.stride;
+        const uint32_t cs = ys / 2;
+        const uint8_t *uplane = colour ? (lomem + static_cast<size_t>(ys) * loinfo.height) : nullptr;
+        const uint8_t *vplane = colour ? (uplane + static_cast<size_t>(cs) * (loinfo.height / 2)) : nullptr;
+
+        const uint32_t thumbOff = buf.offset;
+        thread_local std::vector<uint8_t> thumbRow;
+        thumbRow.resize(static_cast<size_t>(tw) * spp);
+
+        for (uint32_t y = 0; y < th; ++y)
+        {
+            const uint32_t srcY = std::min(y << shift, loinfo.height - 1);
+            const uint8_t *yrow = lomem + static_cast<size_t>(srcY) * ys;
+
+            if (!colour)
+            {
+                if (shift == 0)
+                {
+                    /* Full-resolution mono: one row is a contiguous read,
+                     * only the range expansion per sample. */
+                    for (uint32_t x = 0; x < tw; ++x)
+                        thumbRow[x] = static_cast<uint8_t>(
+                            std::clamp((static_cast<int>(yrow[x]) - 16) * 255 / 219, 0, 255));
+                }
+                else
+                {
+                    for (uint32_t x = 0; x < tw; ++x)
+                        thumbRow[x] = static_cast<uint8_t>(std::clamp(
+                            (static_cast<int>(yrow[std::min(x << shift, loinfo.width - 1)]) - 16) * 255 / 219,
+                            0, 255));
+                }
+            }
+            else
+            {
+                const uint8_t *urow = uplane + static_cast<size_t>(srcY / 2) * cs;
+                const uint8_t *vrow = vplane + static_cast<size_t>(srcY / 2) * cs;
+                for (uint32_t x = 0; x < tw; ++x)
+                {
+                    const uint32_t srcX = std::min(x << shift, loinfo.width - 1);
+                    const int32_t Yn = static_cast<int32_t>(yrow[srcX]) - 16;
+                    const int32_t U  = static_cast<int32_t>(urow[srcX / 2]) - 128;
+                    const int32_t V  = static_cast<int32_t>(vrow[srcX / 2]) - 128;
+                    const int32_t y0 = kY * Yn;
+                    const int r = (y0 + kVR * V) >> 16;
+                    const int g = (y0 + kUG * U + kVG * V) >> 16;
+                    const int b = (y0 + kUB * U) >> 16;
+                    thumbRow[3 * x + 0] = static_cast<uint8_t>(std::clamp(r, 0, 255));
+                    thumbRow[3 * x + 1] = static_cast<uint8_t>(std::clamp(g, 0, 255));
+                    thumbRow[3 * x + 2] = static_cast<uint8_t>(std::clamp(b, 0, 255));
+                }
+            }
+            write_pod(buf, thumbRow.data(), thumbRow.size());
+        }
+        const uint32_t thumbSize = buf.offset - thumbOff;
+
+        /* TIFF 6.0 requires every IFD to start on a word (2-byte, here
+         * kept to the stricter 4-byte) boundary. The strip is tw*th*spp
+         * bytes with no padding of its own, so an odd byte count -- mono
+         * at an odd width, or any width*3 that lands odd -- would
+         * otherwise leave IFD1 on an odd offset. */
+        if (buf.offset & 3)
+        {
+            static const uint8_t zeros[4] = {0, 0, 0, 0};
+            write_pod(buf, zeros, 4 - (buf.offset & 3));
+        }
+
+        IFDBuilder ifd1(tw, th);
+        ifd1.baseOffset = buf.usedSize;
+
+        uint32_t subfileType = 1;                 /* thumbnail/reduced-res image */
+        uint16_t bitsArr[3]  = {8, 8, 8};          /* one per sample, TIFF-spec count */
+        uint16_t compression1 = COMPRESSION_NONE;
+        uint16_t phot1 = colour ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK;
+        uint16_t planar1 = 1;
+
+        ifd1.addEntry(254, TIFF_LONG , 1  , &subfileType);
+        ifd1.addEntry(256, TIFF_LONG , 1  , &tw);
+        ifd1.addEntry(257, TIFF_LONG , 1  , &th);
+        ifd1.addEntry(258, TIFF_SHORT, spp, bitsArr);
+        ifd1.addEntry(259, TIFF_SHORT, 1  , &compression1);
+        ifd1.addEntry(262, TIFF_SHORT, 1  , &phot1);
+        ifd1.addEntry(273, TIFF_LONG , 1  , &thumbOff);
+        ifd1.addEntry(277, TIFF_SHORT, 1  , &spp);
+        ifd1.addEntry(278, TIFF_LONG , 1  , &th);
+        ifd1.addEntry(279, TIFF_LONG , 1  , &thumbSize);
+        ifd1.addEntry(284, TIFF_SHORT, 1  , &planar1);
+
+        ifd1.sortEntries(); ifd1.build(buf);
+
+        /* chain IFD0 -> IFD1 */
+        *reinterpret_cast<uint32_t*>(buf.buffer + ifd.nextIfdFieldOffset) = ifd1.baseOffset;
+    }
+
     return buf.usedSize;
 }
 
@@ -1168,14 +1562,34 @@ void DngEncoder::encodeThread(int num)
             if (!tc_origin_set_)
             {
                 /* First frame of clip: capture wall-clock HH:MM:SS origin. */
+                /* SMPTE frame base = round(fps), taken from the CONFIGURED rate.
+                 *
+                 * This deliberately does not derive the base from the measured
+                 * FrameDuration metadata.  At a half-integer rate the nominal
+                 * duration lands exactly on the rounding boundary (24.5 fps ->
+                 * 40816.33 µs), and the sensor quantises frame duration to whole
+                 * line-times, which differ per sensor mode.  Rounding the
+                 * measured value therefore flipped the base between 24 and 25
+                 * purely on which mode was active -- observed on hardware at
+                 * 24.5 fps in two sessions that read the same binary and
+                 * disagreed, which cost a day chasing a phantom regression.
+                 *
+                 * options_->framerate is the same source the 0xC764 FrameRate
+                 * tag already uses (see fpsRat above), so the tag and the frame
+                 * base now agree by construction.  std::lround is
+                 * half-away-from-zero, matching cinepi_sound.cpp's
+                 * nominalTimecodeFramerate() so the WAV and the DNG cannot
+                 * disagree either (F-253).
+                 *
+                 * FrameDuration stays as the fallback for the case where no
+                 * rate was configured.  It is in MICROSECONDS (40000 µs @ 25
+                 * fps), so fps = 1e6 / fd -- using 1e9 here would give 25000
+                 * (1000x too high) and ~999 phantom TC holes per frame. */
                 int fps_int = 24;
-                /* libcamera FrameDuration is in MICROSECONDS (40000 µs @ 25fps),
-                 * so fps = 1e6 / fd.  Using 1e9 here gives 25000 (1000× too high):
-                 * raw_elapsed = round(40000 * 25000 / 1e6) = 1000 → ~999 phantom
-                 * holes per frame.  The pre-fix path derived this same value as
-                 * fpsRat[0]/fpsRat[1] = round(1e9/fd)/1000, i.e. exactly 1e6/fd. */
-                if (auto fd = encode_item.met.get(controls::FrameDuration); fd && *fd > 0)
-                    fps_int = static_cast<int>(1'000'000.0 / static_cast<double>(*fd) + 0.5);
+                if (options_->framerate && *options_->framerate > 0.f)
+                    fps_int = static_cast<int>(std::lround(*options_->framerate));
+                else if (auto fd = encode_item.met.get(controls::FrameDuration); fd && *fd > 0)
+                    fps_int = static_cast<int>(std::lround(1'000'000.0 / static_cast<double>(*fd)));
                 if (fps_int <= 0) fps_int = 24;
 
                 /* Prefer wall-clock for the HH:MM:SS display origin; fall back

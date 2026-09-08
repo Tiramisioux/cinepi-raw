@@ -1,23 +1,38 @@
+# cinepi-raw
+
 ![cp_raw_banner](https://github.com/cinepi/cinepi-raw/assets/25234407/71591abc-f9b2-467e-806f-30557bcd1491)
 
-*fork of rpicam-apps that builds upon the rpicam-raw app, offering cinema dng recording capabillities and integration with REDIS offering an abstract "API" like layer for custom integrations / controls.*
+*Fork of rpicam-apps that builds upon the rpicam-raw app: CinemaDNG recording plus a Redis control layer for custom integrations and controls. Adapted to libcamera 0.5 / rpicam-apps 1.7.*
 
-License
--------
+This fork is the recorder half of [CineMate](https://github.com/Tiramisioux/cinemate). CineMate's one-click installer builds everything on this page automatically — follow this README to build the stack by hand, or to run `cinepi-raw` standalone.
 
-The source code is made available under the simplified [BSD 2-Clause license](https://spdx.org/licenses/BSD-2-Clause.html).
+## How to install
 
-# How to install
-
-## 0 . Prerequisites
+### Prerequisites
 
 If you run Raspberry Pi OS Lite, begin by installing the following packages:
 
 ```bash
-sudo apt install -y python-pip git python3-jinja2 ffmpeg
-````
+sudo apt install -y python3-pip git python3-jinja2 ffmpeg
+```
 
-## Install libcamera
+### Install libcamera
+
+Build dependencies first:
+
+```shell
+sudo apt install -y python3-pip git python3-jinja2 libboost-dev libgnutls28-dev openssl pybind11-dev qtbase5-dev libqt5core5a meson cmake python3-yaml python3-ply libglib2.0-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libavdevice59 libyaml-dev
+```
+
+`libyaml-dev` matters: without the system libyaml, libcamera's meson falls back to building
+the bundled yaml-0.2.5 subproject, which does not compile under Bookworm's GCC 12 with
+`-Werror`.
+
+```shell
+sudo apt-get install --reinstall libtiff5-dev && sudo ln -sf $(find /usr/lib -name "libtiff.so" | head -n 1) /usr/lib/aarch64-linux-gnu/libtiff.so.5 && export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH && sudo ldconfig
+```
+
+Then clone and build the Tiramisioux fork's `cinemate` branch:
 
 ```shell
 git clone https://github.com/Tiramisioux/libcamera && \
@@ -39,25 +54,13 @@ sudo ninja -C build install && \
 cd
 ```
 
-```shell
-cd ~/libcamera/utils && sudo chmod +x *.py *.sh && sudo chmod +x ~/libcamera/src/ipa/ipa-sign.sh && cd ~/libcamera && sudo ninja -C build install
-```
+### Install cpp-mjpeg-streamer
 
 ```shell
-sudo apt-get install --reinstall libtiff5-dev && sudo ln -sf $(find /usr/lib -name "libtiff.so" | head -n 1) /usr/lib/aarch64-linux-gnu/libtiff.so.5 && export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH && sudo ldconfig
+sudo apt install -y libspdlog-dev libjsoncpp-dev && cd /home/pi && git clone https://github.com/nadjieb/cpp-mjpeg-streamer.git && cd cpp-mjpeg-streamer && mkdir build && cd build && cmake .. && make && sudo make install && cd
 ```
 
-```shell
-sudo apt install -y python3-pip git python3-jinja2 libboost-dev libgnutls28-dev openssl pybind11-dev qtbase5-dev libqt5core5a meson cmake python3-yaml python3-ply libglib2.0-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libavdevice59
-```
-
-## Install cpp-mjpeg streamer
-
-```shell
-sudo apt install -y libspdlog-dev libjsoncpp-dev && cd /home/pi && git clone https://github.com/tiramisioux/cpp-mjpeg-streamer.git --branch cinemate && cd cpp-mjpeg-streamer && mkdir build && cd build && cmake .. && make && sudo make install && cd
-```
-
-## Install cinepi-raw dependencies
+### Install cinepi-raw dependencies
 
 `ffmpeg` is required on the Pi for WAV BEXT/iXML timecode metadata writes.
 
@@ -69,12 +72,18 @@ sudo apt install -y cmake libepoxy-dev libavdevice-dev build-essential cmake lib
 sudo ldconfig
 ```
 
-## Install cinepi-raw 
+### Install cinepi-raw
 
 ```shell
-git clone https://github.com/Tiramisioux/cinepi-raw.git && cd cinepi-raw && mkdir build && cd build && sudo meson setup && sudo ninja && cd ../.. && sudo meson install -C cinepi-raw/build && sudo ldconfig
+git clone https://github.com/Tiramisioux/cinepi-raw.git && cd cinepi-raw && meson setup build && ninja -C build && sudo meson install -C build && sudo ldconfig
 ```
-### for pi 4:
+
+The `-Dtest=false` in the `libcamera` step above is that project's own build option — this
+repo's `meson.build` has no `test` option at all. The `cinepi` unit tests
+(`cinepi/meson.build`) are built unconditionally by the `meson setup` + `ninja` above like any
+other target; nothing here disables them.
+
+#### For Pi 4:
 
 ```shell
 sudo echo "/home/pi/cinepi-raw/build
@@ -82,11 +91,11 @@ sudo echo "/home/pi/cinepi-raw/build
 /usr/local/lib/aarch64-linux-gnu" | sudo tee /etc/ld.so.conf.d/cinepi-raw.conf && sudo ldconfig && echo 'export LD_LIBRARY_PATH=/home/pi/cinepi-raw/build:/usr/lib/aarch64-linux-gnu:/usr/local/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH' >> ~/.bashrc && source ~/.bashrc
 ```
 
-## Set redis key
+### Seed Redis with a white balance default
 
 ```shell
 redis-cli <<EOF
-SET cg_rb 2.5,2.2
+SET cg_rb 3.5,1.5
 PUBLISH cp_controls cg_rb
 EOF
 ```
@@ -104,7 +113,7 @@ reboot
 then
 
 ```bash
-cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0 
+cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0
 ```
 
 ### Choosing the `--mode` packing (`U` vs `P`) per Pi model
@@ -116,30 +125,25 @@ cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 -
 | `U`   | **U**npacked — one 16-bit sample per pixel | `SBGGR12` |
 | `P`   | **P**acked — CSI-2 packed (smaller, less DMA/CMA) | `SBGGR12_CSI2P` |
 
-Pick the token by camera receiver, **not** by sensor:
+Both tokens produce correct DNGs at 10- and 12-bit — the encoder handles unpacked, packed and PiSP-compressed streams. Pick the token for your Pi model:
 
-| Pi model | Receiver | Recommended packing | Why |
-|----------|----------|---------------------|-----|
-| Pi 5 / CM5 | PiSP (`rp1-cfe`) | `U` | Plenty of bandwidth/CMA; an unpacked stream is simplest. A `P` request is delivered as PiSP `COMP1` and decoded by the DNG encoder. |
-| Pi 4 / Pi 400 / CM4 | VC4/Unicam (`unicam`) | `P` | Packed CSI-2 uses ~1.33× less DMA/CMA at 12-bit (~1.6× at 10-bit), which the high-fps modes need on the smaller Pi 4 CMA pool. |
-
-The DNG encoder produces a correct DNG for **both** `U` and `P` at 10- and 12-bit, so the choice is about bandwidth/CMA, not correctness. (Earlier builds only handled the unpacked stream and emitted a garbled "wrong bit order" raw when fed a `P` stream on Pi 4 — that is fixed: the encoder now branches on the actual packed/unpacked format.)
-
-Manual examples (IMX477 on `cam0`):
+**Pi 5 / CM5 — use `U`, with the PiSP tuning file:**
 
 ```bash
-# Pi 4 / VC4 — packed; Pi 4 also skips --tuning-file
-cinepi-raw --mode 2028:1080:12:P --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --hdmi-port 1 --cam-port cam0
-
-# Pi 5 / PiSP — unpacked, with the PiSP tuning file
 cinepi-raw --mode 2028:1080:12:U --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --tuning-file ~/libcamera/src/ipa/rpi/pisp/data/imx477.json --hdmi-port 1 --cam-port cam0
 ```
 
-When launched by CineMate this is automatic: the packing token is data-driven from `resources/sensors.json` (`packing_by_platform`) and resolved against the detected Pi model, so you normally never set it by hand.
+The PiSP front end has bandwidth and CMA to spare, so the simple unpacked stream is the right default. (A `P` request also works on Pi 5: PiSP delivers it as `COMP1` and the DNG encoder decodes it.)
 
-# CineMate fork
+**Pi 4 / Pi 400 / CM4 — use `P`, and leave `--tuning-file` out:**
 
-_Adapted to libcamera 0.5 / rpicam-apps 1.0.7._
+```bash
+cinepi-raw --mode 2028:1080:12:P --width 2028 --height 1080 --lores-width 1280 --lores-height 720 --shutter 20000 --awbgains "2.5,2.0" --awb auto --hdmi-port 1 --cam-port cam0
+```
+
+Packed CSI-2 fits ~1.33× more 12-bit frames into the Pi 4's smaller DMA/CMA pool (~1.6× at 10-bit), which the high-fps modes need. Pi 4 uses the VC4/Unicam receiver with its built-in tuning, so the `--tuning-file` flag stays out.
+
+When launched by CineMate all of this is automatic: the packing token comes from `resources/sensors.json` (`packing_by_platform`) resolved against the detected Pi model.
 
 ## Additional flags
 
@@ -150,7 +154,11 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-raw�
 | `--cam-port <string>`     | `""`    | Physical camera port to use (e.g. `cam0` or `cam1`). |
 | `--hdmi-port <int>`       | `-1`    | Choose a specific HDMI connector for the DRM preview:<br>`0` = HDMI-0, `1` = HDMI-1, `-1` = automatic. |
 | `--same-hdmi`             | `false` | Force both CinePi apps (capture & controller) to share the same HDMI output. |
-| `--keep16`                | `false` | Write full 16-bit DNG files; **disable** 12-bit packing of 16-bit streams. |
+| `--hdr <string>`          | `off`   | On-sensor / multiframe HDR: `off`, `auto`, `sensor`, or `single-exp` (PiSP single-exposure multiframe HDR). On imx585, `sensor` (or `auto`) is ClearHDR — see [IMX585 ClearHDR](#imx585-clearhdr). Changing it alters the sensor's mode list, so it needs a process restart. |
+| `--log-encode [<10\|12>]` | off     | Log-encode recorded DNGs with CineMate Log: a µ-law curve companding the linear sensor signal to fewer bits, plus a DNG `LinearizationTable` (tag `0xC618`) so any raw application decodes it straight back to linear. Bare flag = 12 bit. Works from a **16-bit sensor mode** (imx585 ClearHDR), a **12-bit** one (12→10), or **12-bit ClearHDR** (decompand composed with the 16→10 curve, target 10 only): 16→12 saves ~25 % of the file size, 16→10 ~37 %, 12→10 ~17 %. A combination without a shipped curve records linear and logs why. |
+| `--zoom <float>`          | `1.0`   | Digital zoom factor for the preview streams (`1.0` = full frame, `2.0` = 200 % centre-crop). Live-controllable via the `zoom` Redis key. |
+| `--scaler-crops <string>` | *(none)* | Per-stream crop rectangles as fractions: `x,y,w,h[:x,y,w,h ...]` (0–1, up to 3 streams). |
+| `--max-pixel-rate <float>`| `0` (libcamera default) | Pixel-rate ceiling in MPix/s, passed through to the PiSP IPA — CineMate uses it to keep advertised mode ceilings honest against the live RP1 clock. |
 | `--encode-workers <n>`    | `2`     | Number of DNG encode worker threads to spawn (min. `1`). |
 | `--disk-workers <n>`      | `8`     | Number of disk writer threads used for flushing DNGs (min. `1`). |
 | `--encode-affinity <list>`| `auto`  | Pin encode workers to a CPU list (e.g. `4,5` or `2-5`). |
@@ -167,8 +175,8 @@ A USB capture path can land a fixed number of frames early or late relative to v
 
 - This flag covers the **24-bit USB capture (helper) path**. The 16-bit plain-`arecord` path has its own `--plain-arecord-timecode-offset-frames`.
 - **Sign convention:** a **positive** offset moves the timecode later, so audio lands later on the NLE timeline — use a positive value when the sound is *early*. A negative value moves it earlier.
-- Independent of clock correction; both can be active at once.
-- Like the clock-correction flag, Cinemate sets this automatically from `audio.timecode_offset_frames` in `settings.json`; pass it manually only when running `cinepi-raw` directly.
+- Independent of the built-in ADC clock correction; both can be active at once.
+- CineMate sets this automatically from `audio_capture.24bit.timecode_offset_frames` (and the 16-bit flag from `audio_capture.16bit.timecode_offset_frames`) in `settings.jsonc`; pass it manually only when running `cinepi-raw` directly.
 
 When non-zero, `cinepi-raw` logs after each take:
 
@@ -210,11 +218,13 @@ constant-rate, disable the lock and discipline the sync server's rate instead.
 
 ## Manual DNG encoder
 
-- Manual writing of DNG tags. 
+- Manual writing of DNG tags.
 
 - Frames are written uncompressed, for simple I/O.
 
-- Packs the 16 bit files to 12 bit, unless `--keep16` is used.
+- Packs 16-bit SDR streams (12-bit sensor data, MSB-aligned, so the pack is lossless) to 12 bit. True 16-bit sensor modes (imx585 ClearHDR) always keep full 16-bit depth.
+
+  The `--keep16` flag, which disabled that packing, was removed. The 4 bits it preserved are padding, so it only ever produced a ~33% larger file carrying the same information.
 
 - Supports both IMX 585 color and mono variants.
 
@@ -234,29 +244,21 @@ constant-rate, disable the lock and discipline the sync server's rate instead.
   ```
 
   This example pins encode workers to CPUs 4–5 with a higher priority while leaving disk flush threads on the little cores with a lower scheduling priority.
-  
+
 ## Audio recording
 
-- Places WAV output alongside  DNG take (`media/RAW/<folder>.wav`).
+- Places WAV output alongside the DNG take (`/media/RAW/<folder>.wav`).
 
-- Compatible with USB 16 bit mono and RODE Videomic 24bit stereo microphone using `dsnoop`.
+- Compatible with USB 16 bit mono and RODE VideoMic 24 bit stereo microphones using `dsnoop`.
 
-### .asoundrc Setup
+### /etc/asound.conf setup
 
-For `dsnoop` support, create a `~/etc/asound.conf`:
+For `dsnoop` support, create `/etc/asound.conf`:
 
 ```bash
-
-    sudo tee /etc/asound.conf >/dev/null <<'EOF'
-# --- Hardware handle (use stable card name; change "NTG" if your card shows a different name in `arecord -l`)
-pcm.mic_hw {
-  type hw
-  card "NTG"
-  device 0
-}
-
-# --- One shared dsnoop backend pinned to the mic's native mode (RØDE NTG: S24_3LE @ 48k, stereo)
-pcm.mic_dsnoop {
+sudo tee /etc/asound.conf >/dev/null <<'EOF'
+# RODE NTG path (24-bit stereo)
+pcm.mic_dsnoop_24 {
   type dsnoop
   ipc_key 5978
   ipc_perm 0666
@@ -271,25 +273,31 @@ pcm.mic_dsnoop {
   bindings.1 1
 }
 
-# --- Front-ends: let plug adapt whatever the app asks for (stereo 24-bit or mono 16-bit)
-pcm.mic_24bit {
-  type plug
-  slave.pcm "mic_dsnoop"
+# Cheap USB path (16-bit mono)
+pcm.mic_dsnoop_16 {
+  type dsnoop
+  ipc_key 5979
+  ipc_perm 0666
+  ipc_key_add_uid false
+  slave {
+    pcm "hw:CARD=Device,DEV=0"
+    format S16_LE
+    rate 48000
+    channels 1
+  }
+  bindings.0 0
 }
 
-pcm.mic_16bit {
-  type plug
-  slave.pcm "mic_dsnoop"
-}
+pcm.mic_24bit { type plug; slave.pcm "mic_dsnoop_24" }
+pcm.mic_16bit { type plug; slave.pcm "mic_dsnoop_16" }
 EOF
-
 ```
 
-Exit nano editor using ctrl+x.
+Change `"NTG"` / `"Device"` if your card shows a different name in `arecord -l`.
 
 ## Controlling recording via Redis
 
-CinePi-raw listens for recording commands through a **single string key**  `is_recording` and the **`cp_controls` pub-sub channel**.  
+CinePi-raw listens for recording commands through a **single string key**  `is_recording` and the **`cp_controls` pub-sub channel**.
 
 The mechanism in the CineMate fork is edge-driven: only **transitions** 0 → 1 or 1 → 0 start or stop a take; duplicate writes are ignored.
 
@@ -318,4 +326,154 @@ sensor.
 SET zoom 1.5
 PUBLISH cp_controls zoom
 ```
+
 CinemaDNGs always contain the entire sensor.
+
+## IMX585 ClearHDR
+
+ClearHDR is the imx585's on-sensor single-frame HDR: the sensor merges a
+high-gain and a low-gain readout internally. It comes in two flavours here —
+a 16-bit linear mode and a 12-bit CCMP-companded mode.
+
+Requirements:
+
+| Piece | Needed | Why |
+|---|---|---|
+| Kernel | ≥ 6.12.93+rpt | older `rp1-cfe` kernel drivers corrupt 16-bit CSI-2 capture (fixed mid-2025: "Avoid unpack operation for 16-bit formats") |
+| Sensor driver | Tiramisioux `imx585-v4l2-driver`, branch `cinemate-7modes` | exposes `wide_dynamic_range` and the 16-bit modes (3840×2200 4K, 1920×1100 2x2-binned — binned is colour-sensor only) |
+| libcamera | Tiramisioux `libcamera`, branch `cinemate` | 16-bit endian swap, gated off compressed formats |
+| Exposure | manual in 16-bit modes | ISP statistics are invalid at 16-bit — AGC/AWB cannot run there. The 12-bit ClearHDR mode below keeps them working. |
+
+### Launch refusal on failed HDR handshake
+
+Launching with `--hdr sensor` or `--hdr auto` now hard-fails at startup if the
+sensor doesn't confirm the ClearHDR write. cinepi-raw writes
+`wide_dynamic_range=1` to the sensor subdevice, reads it back, and retries up
+to 4 times at 50ms apart; if the readback never comes back true, it throws
+instead of launching:
+
+> `imx585/imx708 ClearHDR: sensor did not accept wide_dynamic_range=1 after retrying -- refusing to launch with --hdr sensor while the sensor's combiner is still off (this is the invalid-combo BLC-fill defect, not a software problem; retry the launch)`
+
+(`sensor` in the message is whichever `--hdr` value was passed.)
+
+This is not a new regression — it converts a previously silent failure into a
+hard one. Before this check, a failed write left the sensor's WDR combiner
+off while cinepi-raw still launched in a ClearHDR mode, so the DNGs recorded
+a flat BLC pedestal fill instead of real data, with every ClearHDR knob
+(thresholds, blend, gain adder) inert against it. If you hit this error,
+retry the launch.
+
+### 16-bit ClearHDR
+
+The sensor outputs one 16-bit linear Bayer frame; cinepi-raw records it as true
+16-bit DNGs (BlackLevel 3200, WhiteLevel 65535, no compression, no linearization
+table needed). This is the quality path — full linear data, manual exposure only.
+
+Start with the `--hdr sensor` flag and a 16-bit unpacked mode:
+
+```bash
+cinepi-raw --camera 0 --mode 3856:2180:16:U --width 1920 --height 1080 \
+  --lores-width 1280 --lores-height 720 --hdr sensor
+```
+
+The log should show `Selected sensor format: 3856x2180-SRGGB16_1X16` and
+`Selected CFE format: 3856x2180-RG16`. Behaviour changes while ClearHDR is on:
+
+- frame rate halves (≈ 21.9 fps max at 3856×2180 on a stock RP1 clock; ≈ 33.4 fps 4K / 37.5 fps 2K with the RP1 overclock — see the CineMate docs, *Overclocking* page)
+- analogue gain caps at code 80 (≈ 15.8×, ISO 1580 in CineMate terms)
+- each 3856×2180 DNG is ≈ 16.9 MB (plan storage bandwidth: 15 fps ≈ 252 MB/s)
+- set exposure and colour gains manually via Redis (`iso`, `shutter_s`/`shutter_a`, `cg_rb`)
+
+### 12-bit ClearHDR (CCMP12)
+
+With `--hdr sensor` and a **12-bit** mode (`--mode 3856:2180:12:U`) the sensor
+still merges HG and LG internally, but outputs a CCMP-companded 12-bit frame
+instead of 16-bit linear:
+
+- **AE and AWB keep working** — the ISP statistics gate only trips at 16-bit, so this is the ClearHDR mode for auto exposure. (Statistics are computed on the companded signal, so treat auto exposure as approximate.)
+- The DNG carries the CCMP decompand curve as its `LinearizationTable`, so raw apps decode it back to linear automatically — same mechanism as CineMate Log.
+- `--log-encode 10` works here too: the encoder composes the CCMP decompand with the 16→10 log curve into one table. Target 12 is refused (no composed spec).
+- Frame rates are the same as 16-bit ClearHDR; files are 12-bit-sized (≈ 12.6 MB per 4K frame vs ≈ 16.9 MB), and ≈ 10.5 MB with `--log-encode 10`. The 16-bit mode remains the quality path.
+- Use the **unpacked** token (`:12:U`). The CCMP preview stage cannot address a CSI2-packed (`:12:P`) raw as 16-bit samples and disables itself, leaving a magenta preview — the recorded DNGs are still correct, but the monitor is not.
+
+### Live ClearHDR knobs (Redis)
+
+The merge behaviour is tunable while streaming. Each key maps to a custom
+V4L2 control on the sensor; publish the key name on `cp_controls` after
+setting it:
+
+| Redis key | Sensor control | Range | What it does |
+|---|---|---|---|
+| `hdr_threshold_low` | HDR Data Selection Threshold, low side | 0–4095 | raw level below which the sensor reads pure high-gain |
+| `hdr_threshold_high` | HDR Data Selection Threshold, high side | 0–4095 | raw level above which the sensor reads pure low-gain |
+| `hdr_blend` | HDR Data Blending Mode | 0–8 | how the two readouts are mixed across the transition zone (0 = HG 1/2 + LG 1/2, per the driver menu) |
+| `hdr_gain_adder` | HDR Gain Adder | 0–5 | digital gain applied to the low-gain path in the merge (menu index; driver default 2 = +12 dB) — shifts where the blend knee lands in the output range |
+
+`hdr_threshold_low`/`hdr_threshold_high` are two Redis keys, but the sensor
+control (`IMX585_CID_HDR_DATASEL_TH`) is a single hardware `u16[2]` pair —
+cinepi-raw reads both keys and writes them together whichever one changes.
+
+```bash
+redis-cli set hdr_blend 2 && redis-cli publish cp_controls hdr_blend
+redis-cli set hdr_threshold_low 500 && redis-cli publish cp_controls hdr_threshold_low
+redis-cli set hdr_threshold_high 3000 && redis-cli publish cp_controls hdr_threshold_high
+```
+
+Toggling ClearHDR itself (`wide_dynamic_range`) changes the sensor's mode
+list, so it stays a launch flag — restart cinepi-raw to switch between SDR
+and HDR. CineMate builds HDR profiles and CLI commands on top of these keys
+(see the CineMate docs, *ClearHDR* page).
+
+Known behaviour: highlights near the merge hand-off can render magenta in
+flat greys — that zone is where the readouts converge, and white balance
+pushes red/blue above green there. Tune `hdr_threshold_low`/`hdr_threshold_high`/`hdr_blend`
+for the scene, or grade it out; it is not a capture defect.
+
+### Setting the knobs with v4l2-ctl (no Redis)
+
+The knobs are ordinary V4L2 controls on the sensor subdevice, so any shell can
+set them while cinepi-raw runs. Find the subdevice once, then set controls by
+name:
+
+```bash
+# find the imx585 subdevice (usually /dev/v4l-subdev2)
+for s in /dev/v4l-subdev*; do
+  v4l2-ctl -d "$s" --list-ctrls 2>/dev/null | grep -q wide_dynamic_range && echo "$s"
+done
+
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_data_selection_threshold=4095,0
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_data_blending_mode=2
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl hdr_gain_adder_db=1
+v4l2-ctl -d /dev/v4l-subdev2 --set-ctrl wide_dynamic_range=1   # ClearHDR on — restart cinepi-raw afterwards
+v4l2-ctl -d /dev/v4l-subdev2 --list-ctrls-menus                # inspect ranges and menu entries
+```
+
+`wide_dynamic_range` changes the sensor's mode list, so flip it before
+launching (or relaunch after). The three knob controls apply live.
+
+`hdr_data_selection_threshold` takes `EXP_TH_H,EXP_TH_L` — high first. The
+first value must be >= the second: `EXP_TH_H < EXP_TH_L` is a prohibited
+sensor state that outputs only the black-level pedestal, and this raw-v4l2
+path bypasses the guard cinepi-raw applies to the Redis keys. A value set
+this way also outlives cinepi-raw restarts: the driver replays cached
+control values at every stream start, so only a module reload or an
+explicit rewrite clears it.
+
+## Tests and CI
+
+`cinepi/meson.build` defines seven pure-C++ unit tests (no libcamera, no Redis, no
+rpicam-apps dependency) — the project's own, most thorough entry point:
+
+```bash
+meson test -C build --print-errorlogs
+```
+
+`.github/workflows/checks.yml` runs on every pull request: since `meson setup` requires
+libcamera unconditionally even to configure, and there's no `subprojects/*.wrap` to fetch it,
+CI instead compiles and runs each of the seven test targets directly with `g++`, bypassing
+meson setup entirely — no Raspberry Pi or libcamera build needed to keep this green. A
+shellcheck job runs alongside it.
+
+## License
+
+The source code is made available under the simplified [BSD 2-Clause license](https://spdx.org/licenses/BSD-2-Clause.html).

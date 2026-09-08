@@ -70,6 +70,14 @@ install_symlink('libcamera_app.so',
 subdir('apps')
 subdir('cinepi')
 
+# CineMate Log curve specs, loaded at startup by cinepi/log_lut.cpp. Installed
+# where find_log_lut_spec() looks first; running uninstalled out of the repo clone
+# still works via its /home/pi and ./resources fallbacks.
+install_data(['resources/log_luts/cinemate_log_16to12.json',
+              'resources/log_luts/cinemate_log_16to10.json',
+              'resources/log_luts/cinemate_log_12to10.json'],
+             install_dir : get_option('datadir') / 'cinepi-raw' / 'log_luts')
+
 summary({
             'libav encoder' : enable_libav,
             'drm preview' : enable_drm,

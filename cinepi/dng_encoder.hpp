@@ -18,7 +18,9 @@
 
 #include "encoder/encoder.hpp"
 #include "raw_options.hpp"
-#include "cinepi_frameinfo.hpp"	
+#include "cinepi_frameinfo.hpp"
+#include "log_lut.hpp"
+#include "ccmp_lut.hpp"
 
 
 class DngEncoder : public Encoder
@@ -29,6 +31,37 @@ public:
 	
 	/* NEW – let the controller push µs-since-epoch for each frame */
     void setWallClockTimestamp(uint64_t us);   // µs since 1970-01-01
+
+	/* Sensor-mode bit depth, snapshotted on the event-loop thread in the same
+	 * statement as the validated raw StreamConfiguration (cinepi_raw.cpp,
+	 * immediately after StartCamera()). setup_encoder keys its 16-bit
+	 * keep-full-depth decision and the CCMP gate off this instead of reading
+	 * options_->mode.bit_depth live, which the redis subscriber thread
+	 * mutates (a stale value could leak into a mid-reconfigure take). */
+	void setSensorModeBitDepth(unsigned int bits) { sensor_mode_bit_depth_ = bits; }
+
+	/* Pixels summed per output sample — 1 at full res, 4 for 2x2 binning.
+	 * Snapshotted alongside the bit depth above and for the same reason.
+	 *
+	 * This SELECTS THE CCMP DECOMPAND TABLE. The compander's input is the
+	 * binned signal, so the two 12-bit ClearHDR modes put their knees 4x apart
+	 * in the delivered-linear domain and one table cannot serve both. Select on
+	 * binning, never on ClearHDR alone and never on resolution-as-a-string:
+	 * getting it backwards is wrong by 2.6x at knee1 and does not look
+	 * obviously wrong in a render. */
+	void setSensorBinning(double binning) { sensor_binning_ = binning; }
+
+	/* Whether the bit-depth/binning snapshots above actually describe the
+	 * stream setup_encoder() is about to configure. False when
+	 * cinepi_raw.cpp found the requested mode's dimensions did not match the
+	 * validated raw StreamConfiguration — the snapshots are still whatever
+	 * was requested, not what the camera configured, so a 12-bit request
+	 * landing on a genuinely 16-bit sensor mode must not be believed. See
+	 * ccmp_gate.hpp for what this gates and why. Defaults to true: absent a
+	 * call to this setter (only cinepi_raw.cpp calls it, once per
+	 * reconfigure), the snapshots are trusted exactly as before this flag
+	 * existed. */
+	void setSensorModeTrusted(bool trusted) { sensor_mode_trusted_ = trusted; }
 
 	// Encode the given buffer.
 	void EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us) override;
@@ -171,6 +204,48 @@ private:
 
     bool write12bit_{false};
 
+    /* ──  CineMate Log  ───────────────────────────────────────
+     * Resolved once per configure in setup_encoder(), where the SOURCE depth
+     * (the Bayer format) and the TARGET depth (--log-encode) are known
+     * together; dng_save() only reads it. Non-null is the single "this clip is
+     * log-encoded" switch, and it is only set when a spec ships for the pair —
+     * a missing curve degrades to a normal linear recording rather than failing
+     * the take. The pointer comes from the process-wide cache in log_lut.cpp
+     * and stays valid for the process lifetime, so encode workers read it
+     * without a lock. params().target_bits is the authoritative code depth. */
+    const LogLut *log_lut_ = nullptr;
+
+    /* How far the DMA row has to be shifted down to reach the curve's source
+     * domain: 4 for a <=12-bit sensor mode on PiSP, which arrives MSB-aligned in
+     * a 16-bit container, and 0 when the row is already right-justified. Set
+     * beside log_lut_ and only meaningful while it is non-null. */
+    unsigned log_src_shift_ = 0;
+
+    /* ──  DNG thumbnail (IFD1)  ─────────────────────────────
+     * Snapshotted once per configure in setup_encoder() from
+     * options_->thumbnail/thumbnailSize, exactly like log_lut_ above --
+     * NOT read live from options_ in dng_save(). Two reasons, both from
+     * the same fact: setup_encoder() re-runs at the start of every take
+     * (reset_encoder() is called on the rec trigger and on every
+     * resolution reconfigure; DngEncoder::initialized() then false-gates
+     * the next EncodeBuffer() into a fresh setup_encoder() call), while
+     * CONTROL_KEY_THUMBNAIL's own pub/sub handler applies live with no
+     * restart of any kind.
+     *   1. Per-take semantics with no camera restart: a `set thumbnail`
+     *      mid-take changes options_->thumbnail immediately, but the
+     *      snapshot -- and so the file on disk -- only picks it up at
+     *      the NEXT take, never mid-take. Without this, two encode
+     *      workers racing the live value could produce one take with a
+     *      non-monotonic mix of thumbnail/no-thumbnail frames.
+     *   2. dng_info.buffer_size can reserve exactly what this take needs
+     *      (0 when off) instead of worst-case colour bytes on every take
+     *      regardless of mode, which is what reading options_ live would
+     *      have required (the mode could otherwise change after the
+     *      buffer was sized but before the take that uses it starts). */
+    int thumb_mode_  = 0;   /* 0 off / 1 mono / 2 colour, this take     */
+    int thumb_shift_ = 0;   /* clamp(thumbnailSize, 0, 12), this take   */
+    bool thumb_lores_warned_ = false;  /* one warning per take, not per frame */
+
     /* ──  Reusable encoded-buffer pool  ───────────────────── */
     std::vector<uint8_t *> buffer_pool_;
     std::mutex              buffer_pool_mutex_;
@@ -197,13 +272,21 @@ private:
                                      const std::optional<int> &nice_value);
 
         bool encoder_initialized_;
+        unsigned int sensor_mode_bit_depth_ = 0;
+        double sensor_binning_ = 0.0;
+        bool sensor_mode_trusted_ = true;
+
+        /* The CCMP decompand table for this configuration, or nullptr when the
+         * mode is not 12-bit ClearHDR. Owned by the process-wide cache in
+         * ccmp_lut.cpp, so this is a borrowed pointer and stays valid. Resolved
+         * once in setup_encoder; everything downstream keys off it. */
+        const CcmpLut *ccmp_lut_ = nullptr;
 	struct DngInfo
 {
 	uint8_t bits;
 
 	uint32_t white;
 	float black;
-	float black_levels[4];
 
 	float NEUTRAL[3];
 	float ANALOGBALANCE[3];

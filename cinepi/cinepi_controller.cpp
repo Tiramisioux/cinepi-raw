@@ -2,9 +2,15 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/videodev2.h>
 
 using namespace std;
 using namespace std::chrono;
@@ -16,8 +22,130 @@ using namespace std::chrono;
 #define CP_DEF_SHUTTER 50
 #define CP_DEF_AWB 1
 #define CP_DEF_COMPRESS 0
-#define CP_DEF_THUMBNAIL 1
-#define CP_DEF_THUMBNAIL_SIZE 3
+// 2 (colour). G10/G11 verified on hardware and the operator has made the
+// embedded thumbnail the standard playback path -- raw decode is far more
+// demanding on the Pi and is no longer the pane's fallback (see playback.py
+// on the cinemate side). A standalone cinepi-raw run (no CineMate seeding
+// image_capture.thumbnail into redis before launch), a flushed redis, or a
+// start before that seed runs now gets the same default CineMate ships.
+#define CP_DEF_THUMBNAIL 2
+// thumbnail_size is a right-shift applied to the lores plane inside
+// dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 0 is
+// the default: it is what every size/cost figure in the C9 plan and
+// GATES.md assumes (the 1272x720 lores frame, unscaled). The redis value
+// found resident pre-feature (PI-008: thumbnail_size=50) predates any
+// consumer of this key and is not a default worth preserving.
+#define CP_DEF_THUMBNAIL_SIZE 0
+
+/* ── imx585 ClearHDR live knobs ─────────────────────────────────────────────
+ * The knobs are custom V4L2 controls on the sensor subdev; their IDs mirror
+ * imx585.c (Tiramisioux imx585-v4l2-driver, 6.12.y). They are plain sensor
+ * register controls, so they apply live while streaming. Only the ClearHDR
+ * enable itself (wide_dynamic_range, set via --hdr sensor at launch) changes
+ * the sensor's mode list and therefore needs a process restart.
+ */
+static constexpr uint32_t IMX585_CID_BASE           = V4L2_CID_USER_BASE + 0x2000;
+static constexpr uint32_t IMX585_CID_HDR_DATASEL_TH = IMX585_CID_BASE + 0; /* u16[2], 0..4095 */
+static constexpr uint32_t IMX585_CID_HDR_DATASEL_BK = IMX585_CID_BASE + 1; /* menu, 0..8 */
+static constexpr uint32_t IMX585_CID_HDR_GAIN_ADDER = IMX585_CID_BASE + 5; /* menu, 0..5 */
+
+/* Probe /dev/v4l-subdevN for the sensor that exposes the ClearHDR controls. */
+static int open_imx585_subdev()
+{
+    for (int i = 0; i < 16; i++) {
+        std::string dev = "/dev/v4l-subdev" + std::to_string(i);
+        int fd = open(dev.c_str(), O_RDWR, 0);
+        if (fd < 0)
+            continue;
+        struct v4l2_query_ext_ctrl q = {};
+        q.id = IMX585_CID_HDR_DATASEL_TH;
+        if (!ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &q))
+            return fd;
+        close(fd);
+    }
+    return -1;
+}
+
+/* Set one ClearHDR control: a u16 pair when `pair` is non-null, else `value`. */
+static bool set_imx585_hdr_ctrl(uint32_t id, int32_t value, const uint16_t *pair)
+{
+    int fd = open_imx585_subdev();
+    if (fd < 0)
+        return false;
+
+    uint16_t buf[2];
+    struct v4l2_ext_control c = {};
+    c.id = id;
+    if (pair) {
+        buf[0] = pair[0];
+        buf[1] = pair[1];
+        c.size = sizeof(buf);
+        c.p_u16 = buf;
+    } else {
+        c.value = value;
+    }
+
+    struct v4l2_ext_controls ctrls = {};
+    ctrls.which = V4L2_CTRL_WHICH_CUR_VAL;
+    ctrls.count = 1;
+    ctrls.controls = &c;
+    bool ok = !ioctl(fd, VIDIOC_S_EXT_CTRLS, &ctrls);
+    close(fd);
+    return ok;
+}
+
+/* Parse one hdr_threshold_low/high Redis value, clamped 0..4095; missing or
+ * invalid -> 0. IMX585_CID_HDR_DATASEL_TH is a hardware u16[2] pair, so both
+ * sides must always be written together even though they are two Redis keys. */
+static uint16_t parse_hdr_threshold(const std::optional<std::string>& v)
+{
+    if (!v || v->empty())
+        return 0;
+    try {
+        return (uint16_t)std::clamp(std::stoi(*v), 0, 4095);
+    } catch (...) {
+        return 0;
+    }
+}
+
+/* Build the IMX585_CID_HDR_DATASEL_TH u16[2] from the two Redis keys, in the
+ * order the driver writes them (imx585.c:1532-1534, write site :1472-1474):
+ *
+ *     th[0] -> EXP_TH_H (0x36D0)   high-gain saturation cutoff
+ *     th[1] -> EXP_TH_L (0x36D4)   high-gain "low" cutoff
+ *
+ * so hdr_threshold_HIGH belongs in th[0] and hdr_threshold_LOW in th[1].
+ * That matches what both keys have always been documented to mean --
+ * hdr_threshold_high is "the raw level above which the sensor reads pure
+ * low-gain", which is precisely the HG saturation cutoff.
+ *
+ * These were passed the other way round until 2026-08-30: every call site
+ * built { low, high }, so hdr_threshold_low landed in EXP_TH_H. Confirmed on
+ * hardware by writing low=3000/high=500 and reading the registers back --
+ * 0x36D0 came back 3000 and 0x36D4 came back 500.
+ *
+ * Returns false, writing nothing, when the pair would violate the sensor's
+ * EXP_TH_H >= EXP_TH_L constraint. The driver is explicit that the spec marks
+ * EXP_TH_H < EXP_TH_L as "Prohibited -- the sensor enters an invalid state and
+ * only outputs the BLC pedestal", and escaping that state needs a large light
+ * transient at the sensor, so refusing the write is much cheaper than making
+ * it. Note this is reachable from the documented usage: setting only one of
+ * the two keys leaves the other parsing as 0.
+ */
+static bool build_hdr_threshold_pair(const std::optional<std::string>& low_v,
+                                     const std::optional<std::string>& high_v,
+                                     uint16_t pair[2])
+{
+    const uint16_t low = parse_hdr_threshold(low_v);
+    const uint16_t high = parse_hdr_threshold(high_v);
+
+    if (high < low)
+        return false;
+
+    pair[0] = high;   /* EXP_TH_H */
+    pair[1] = low;    /* EXP_TH_L */
+    return true;
+}
 
 void CinePIController::sync(){
     // getAllKeysAndValuesFromRedis();
@@ -131,10 +259,31 @@ void CinePIController::sync(){
 
     auto thumbnail_size = pipe_replies.get<OptionalString>(9);
     if(thumbnail_size){
-        thumbnail_size_ = stoi(*thumbnail_size);
+        int candidate = stoi(*thumbnail_size);
+        int clamped = std::clamp(candidate, 0, 12);
+        /* A resident value this large collapses the thumbnail to a
+         * handful of pixels or fewer: PI-008 found thumbnail_size=50
+         * resident from before this key had any consumer, which clamps
+         * to 12 and, against CineMate's 1272-wide lores plane, produces
+         * a 1x1 thumbnail (1272 >> 12 == 0, floored to 1) -- silently,
+         * since dng_save() never rejects a shift, only floors it. Refuse
+         * and re-seed rather than accept a value that quietly launches
+         * the +7-22% write-cost feature and delivers nothing. Skipped
+         * when lores_width is 0 (no lores stream configured at all --
+         * standalone cinepi-raw with no --lores-width -- where the
+         * thumbnail is unreachable anyway; see dng_save()'s lomem guard). */
+        if (options_->lores_width && (options_->lores_width >> clamped) < 16) {
+            console->warn("thumbnail_size={} (clamped {}) would collapse the {}px-wide "
+                          "lores thumbnail below 16px; resetting to the default {}",
+                          candidate, clamped, options_->lores_width, CP_DEF_THUMBNAIL_SIZE);
+            thumbnail_size_ = CP_DEF_THUMBNAIL_SIZE;
+            redis_->set(CONTROL_KEY_THUMBNAIL_SIZE, to_string(thumbnail_size_));
+        } else {
+            thumbnail_size_ = candidate;
+        }
     }else{
         thumbnail_size_ = CP_DEF_THUMBNAIL_SIZE;
-        redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_size_));
+        redis_->set(CONTROL_KEY_THUMBNAIL_SIZE, to_string(thumbnail_size_));
     }
 
     console->critical(10);
@@ -164,6 +313,53 @@ void CinePIController::sync(){
             options_->SetZoom(std::stof(*zoom_str));
     else
             redis_->set(CONTROL_KEY_ZOOM, std::to_string(options_->Zoom()));
+
+    // ── imx585 ClearHDR knobs: apply any persisted values at startup, so a
+    //    profile selected before this process launched (CineMate `set hdr
+    //    profile`) takes effect without an extra pub/sub round-trip.
+    //
+    //    Gate on ClearHDR being ON. These are HDR-only sensor controls, and the
+    //    gain adder writes EXP_GAIN (0x3081). The driver's common_regs reset
+    //    EXP_GAIN to 0 for every mode and only common_clearHDR_mode raises it to
+    //    +12 dB, so re-applying a persisted hdr_gain_adder here in an SDR launch
+    //    would override that reset and boost SDR by up to +29 dB (magenta shadow
+    //    noise). When HDR is off we leave the sensor's normal-mode defaults be.
+    if (options_->hdr == "sensor" || options_->hdr == "auto") {
+        auto low_v = redis_->get(CONTROL_KEY_HDR_THRESHOLD_LOW);
+        auto high_v = redis_->get(CONTROL_KEY_HDR_THRESHOLD_HIGH);
+        if ((low_v && !low_v->empty()) || (high_v && !high_v->empty())) {
+            uint16_t pair[2];
+            if (!build_hdr_threshold_pair(low_v, high_v, pair))
+                console->warn("ClearHDR threshold restore refused: hdr_threshold_high ({}) is "
+                              "below hdr_threshold_low ({}). EXP_TH_H < EXP_TH_L is a prohibited "
+                              "sensor state that outputs only the black-level pedestal. Leaving "
+                              "the driver's own pair in place. Set both keys, or neither.",
+                              parse_hdr_threshold(high_v), parse_hdr_threshold(low_v));
+            else if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
+                console->info("ClearHDR data-selection threshold restored to "
+                              "EXP_TH_H={}, EXP_TH_L={}", pair[0], pair[1]);
+            else
+                console->warn("ClearHDR threshold restore: no imx585 ClearHDR subdev control found");
+        }
+        if (auto v = redis_->get(CONTROL_KEY_HDR_BLEND); v && !v->empty()) {
+            try {
+                int val = std::clamp(std::stoi(*v), 0, 8);
+                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_BK, val, nullptr))
+                    console->info("ClearHDR blending mode restored to {}", val);
+                else
+                    console->warn("ClearHDR blend restore: no imx585 ClearHDR subdev control found");
+            } catch (...) {}
+        }
+        if (auto v = redis_->get(CONTROL_KEY_HDR_GAIN_ADDER); v && !v->empty()) {
+            try {
+                int val = std::clamp(std::stoi(*v), 0, 5);
+                if (set_imx585_hdr_ctrl(IMX585_CID_HDR_GAIN_ADDER, val, nullptr))
+                    console->info("ClearHDR gain adder restored to menu index {}", val);
+                else
+                    console->warn("ClearHDR gain adder restore: no imx585 ClearHDR subdev control found");
+            } catch (...) {}
+        }
+    }
 
     // ── Frame-rate phase-lock config (write defaults if the keys are absent) ──
     if (auto v = redis_->get(CONTROL_KEY_PHASE_LOCK); v && !v->empty()) {
@@ -277,17 +473,13 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     }
 
     /* ────────────────────────────────────────────────────────────── */
-    /*  1. One-off buffer-pool size announcement                     */
+    /*  1. One-off buffer-pool size announcement (queued in step 5)  */
     /* ────────────────────────────────────────────────────────────── */
-    if (!buffer_size_sent_ && app_->GetEncoder()->initialized())
-    {
-        redis_->set("buffer_size",
-                    std::to_string(app_->GetEncoder()->maxRamBuffers()));
-        buffer_size_sent_ = true;
-    }
+    const bool announce_buffer_size =
+        !buffer_size_sent_ && app_->GetEncoder()->initialized();
 
     /* ────────────────────────────────────────────────────────────── */
-    /*  2. Publish live stats                                        */
+    /*  2. Build live stats                                          */
     /* ────────────────────────────────────────────────────────────── */
     Json::Value data;
     data["framerate"]  = completed_request->framerate;
@@ -302,13 +494,11 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     data["framesInFlight"]  = static_cast<Json::Int64>(app_->GetEncoder()->getFramesInFlight());
     data["timestamp"]  = static_cast<Json::Int64>(epoch_ns);   // ← TOD ns
     data["cameraPort"] = options_->CamPort();                  // cam0 / cam1 — disambiguates the shared cp_stats channel
-    redis_->publish(CHANNEL_STATS, data.toStyledString());
 
-    /* cache per-camera timestamp key (TOD ns) */
+    /* per-camera timestamp key (TOD ns) */
     const char *ts_key = (options_->CamPort() == "cam1")
                            ? "timestamp_cam1"
                            : "timestamp_cam0";
-    redis_->set(ts_key, std::to_string(epoch_ns));
 
     /* ────────────────────────────────────────────────────────────── */
     /*  3. Feed encoder with µs-since-epoch (for DNG time-code)      */
@@ -316,7 +506,7 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
     app_->GetEncoder()->setWallClockTimestamp(epoch_ns / 1'000ULL); // µs
 
     /* ────────────────────────────────────────────────────────────── */
-    /*  4. Keep last encoder BCD time-code in Redis                  */
+    /*  4. Last encoder BCD time-code (written to Redis in step 5)   */
     /* ────────────────────────────────────────────────────────────── */
     auto &tc_bcd = app_->GetEncoder()->originationTimeCode;
 
@@ -332,14 +522,67 @@ void CinePIController::process(CompletedRequestPtr &completed_request)
        << std::setw(2) << ff;
 
     const char *tc_key = (options_->CamPort() == "cam1") ? "tc_cam1" : "tc_cam0";
-    redis_->set(tc_key, tc.str());
 
     /* ────────────────────────────────────────────────────────────── */
-    /*  5. Closed-loop frame-rate phase lock. References the Pi wall    */
+    /*  5. One pipelined Redis round trip for the whole frame:        */
+    /*     stats publish + timestamp/tc SETs (+ one-off buffer_size)  */
+    /*     + the fps_user and is_recording GETs that used to be       */
+    /*     separate blocking calls here and in triggerRec().          */
+    /*     This runs on the capture thread, so collapsing 4-6 round   */
+    /*     trips into 1 keeps Redis stalls off the frame path.        */
+    /* ────────────────────────────────────────────────────────────── */
+    OptionalString fps_user;
+    rec_flag_prefetch_valid_ = false;
+    try
+    {
+        auto pipe = redis_->pipeline(false);   // borrow the pooled connection
+        pipe.publish(CHANNEL_STATS, data.toStyledString())
+            .set(ts_key, std::to_string(epoch_ns))
+            .set(tc_key, tc.str());
+        if (announce_buffer_size)
+            pipe.set("buffer_size",
+                     std::to_string(app_->GetEncoder()->maxRamBuffers()));
+        pipe.get("fps_user")
+            .get("is_recording");
+        auto replies = pipe.exec();
+
+        const std::size_t base = announce_buffer_size ? 4 : 3;
+        fps_user           = replies.get<OptionalString>(base);
+        rec_flag_prefetch_ = replies.get<OptionalString>(base + 1);
+        rec_flag_prefetch_valid_ = true;
+        if (announce_buffer_size)
+            buffer_size_sent_ = true;
+        if (frame_pipe_failing_)
+        {
+            console->info("per-frame Redis pipeline recovered");
+            frame_pipe_failing_ = false;
+        }
+    }
+    catch (const Error &err)
+    {
+        /* Redis briefly unavailable: keep capturing — stats/timecode resume
+         * on the next frame, and triggerRec() holds the current record state
+         * (see rec_flag_prefetch_valid_). Warn once per outage so a
+         * PERSISTENT failure (e.g. a WRONGTYPE reply on every GET while the
+         * rest of Redis works) stays visible at the default log level;
+         * repeats stay at debug to avoid frame-rate log spam.              */
+        if (!frame_pipe_failing_)
+        {
+            console->warn("per-frame Redis pipeline failed — live stats and the "
+                          "record safety-net are degraded until it recovers: {}",
+                          err.what());
+            frame_pipe_failing_ = true;
+        }
+        else
+            console->debug("per-frame Redis pipeline still failing: {}", err.what());
+    }
+
+    /* ────────────────────────────────────────────────────────────── */
+    /*  6. Closed-loop frame-rate phase lock. References the Pi wall    */
     /*     clock (FrameWallClock = the audio clock, computed above).    */
     /*     No-op unless enabled; suppressed on the --sync client.       */
     /* ────────────────────────────────────────────────────────────── */
-    updatePhaseLock(static_cast<int64_t>(epoch_ns));
+    updatePhaseLock(static_cast<int64_t>(epoch_ns), fps_user);
 }
 
 
@@ -349,6 +592,28 @@ void CinePIController::mainThread(){
     auto sub = redis_->subscriber();
 
     using MessageHandler = std::function<void(const std::optional<std::string>&)>;
+
+    /* Both threshold keys write the same u16[2] sensor control, so whichever
+     * one changed, the other is read alongside it and the pair goes out
+     * together. Shared so the EXP_TH_H >= EXP_TH_L guard cannot drift between
+     * the two handlers. */
+    auto apply_hdr_thresholds = [this](const std::optional<std::string>& low_v,
+                                       const std::optional<std::string>& high_v) {
+        uint16_t pair[2];
+        if (!build_hdr_threshold_pair(low_v, high_v, pair)) {
+            console->warn("ClearHDR threshold rejected: hdr_threshold_high ({}) is below "
+                          "hdr_threshold_low ({}). EXP_TH_H < EXP_TH_L is a prohibited sensor "
+                          "state that outputs only the black-level pedestal, and clearing it "
+                          "needs a light transient at the sensor. Sensor left unchanged.",
+                          parse_hdr_threshold(high_v), parse_hdr_threshold(low_v));
+            return;
+        }
+        if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_TH, 0, pair))
+            console->info("ClearHDR data-selection threshold set to EXP_TH_H={}, EXP_TH_L={}",
+                          pair[0], pair[1]);
+        else
+            console->warn("ClearHDR threshold: no imx585 ClearHDR subdev control found");
+    };
 
     std::unordered_map<std::string, MessageHandler> handlers = {
         { CONTROL_KEY_RAW_CROP, [this](const std::optional<std::string>& r) {
@@ -565,19 +830,63 @@ void CinePIController::mainThread(){
         { CONTROL_KEY_PLL_DEADBAND, [this](const std::optional<std::string>& r) {
             if(r && !r->empty()) { try { pllParams_.deadbandUs = std::stod(*r); } catch (...) {} }
         }},
+        { CONTROL_KEY_HDR_THRESHOLD_LOW, [apply_hdr_thresholds, this](const std::optional<std::string>& r) {
+            if(r && !r->empty())
+                apply_hdr_thresholds(r, redis_->get(CONTROL_KEY_HDR_THRESHOLD_HIGH));
+        }},
+        { CONTROL_KEY_HDR_THRESHOLD_HIGH, [apply_hdr_thresholds, this](const std::optional<std::string>& r) {
+            if(r && !r->empty())
+                apply_hdr_thresholds(redis_->get(CONTROL_KEY_HDR_THRESHOLD_LOW), r);
+        }},
+        { CONTROL_KEY_HDR_BLEND, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                try {
+                    int v = std::clamp(std::stoi(*r), 0, 8);
+                    if (set_imx585_hdr_ctrl(IMX585_CID_HDR_DATASEL_BK, v, nullptr))
+                        console->info("ClearHDR blending mode set to {}", v);
+                    else
+                        console->warn("ClearHDR blend: no imx585 ClearHDR subdev control found");
+                } catch (...) {}
+            }
+        }},
+        { CONTROL_KEY_HDR_GAIN_ADDER, [this](const std::optional<std::string>& r) {
+            if(r && !r->empty()) {
+                try {
+                    int v = std::clamp(std::stoi(*r), 0, 5);
+                    if (set_imx585_hdr_ctrl(IMX585_CID_HDR_GAIN_ADDER, v, nullptr))
+                        console->info("ClearHDR gain adder set to menu index {}", v);
+                    else
+                        console->warn("ClearHDR gain adder: no imx585 ClearHDR subdev control found");
+                } catch (...) {}
+            }
+        }},
         { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
             cameraInit_ = true;
             buffer_size_sent_ = false;
         }},
         { CONTROL_KEY_THUMBNAIL, [this](const std::optional<std::string>& r) {
-            if(r) {
-                options_->thumbnail = stoi(*r);
+            /* Bare stoi() on a live redis value with no guard: an empty
+             * string or anything non-numeric (a stray manual `redis-cli
+             * set thumbnail xyz`, or a boot-seed that skipped validation)
+             * throws std::invalid_argument uncaught, from inside a pub/sub
+             * callback -- matching the try/catch + !empty() shape every
+             * other live numeric knob here already uses (CONTROL_KEY_HDR_
+             * BLEND etc.). dng_save() clamps to 0..2 regardless, but a
+             * value that never reaches options_->thumbnail at all is
+             * safer than trusting the write path to clamp what should
+             * never have parsed. */
+            if(r && !r->empty()) {
+                try {
+                    options_->thumbnail = std::clamp(stoi(*r), 0, 2);
+                } catch (...) {}
             }
         }},
         { CONTROL_KEY_THUMBNAIL_SIZE, [this](const std::optional<std::string>& r) {
-            if(r) {
-                options_->thumbnailSize = stoi(*r);
-                cameraInit_ = true;
+            if(r && !r->empty()) {
+                try {
+                    options_->thumbnailSize = std::clamp(stoi(*r), 0, 12);
+                    cameraInit_ = true;
+                } catch (...) {}
             }
         }},
         { "log_level", [this](const std::optional<std::string>& r) {
@@ -597,7 +906,10 @@ void CinePIController::mainThread(){
                 return;
 
             /* ─────────── 0. parse & deduplicate ─────────── */
-            static double last_z = 1.0;                         // remember previous
+            /* last_zoom_ is the last zoom APPLIED to the ISP, not the last
+             * value seen — a camera restart resets ScalerCrop, so the main
+             * loop clears this baseline (resetZoomDedup) after StartCamera. */
+            double last_z = last_zoom_.load();
             double z = std::clamp(std::stod(*r), 0.10, 25.0);   // keep sane range
 
             console->debug("ZOOM raw='{}'  parsed={:.3f}  prev={:.3f}",
@@ -607,7 +919,7 @@ void CinePIController::mainThread(){
                 console->debug("… duplicate – ignored");
                 return;
             }
-            last_z = z;
+            last_zoom_.store(z);
             options_->SetZoom(z);                               // store for CLI / save
 
             /* ─────────── 1. active sensor area ──────────── */
@@ -669,8 +981,25 @@ void CinePIController::mainThread(){
         if (it != handlers.end()) {
             it->second(r);
         }
-        
-        redis_->bgsave();
+
+        /* Debounced RDB snapshot. This used to run unconditionally, forking
+         * redis-server and rewriting dump.rdb on the SD card for EVERY control
+         * message — a rotary-encoder burst meant a fork storm while recording.
+         * One save per minute keeps operator-seeded keys (the launch-config
+         * contract) persistent across power cuts with a ≤60 s window; the
+         * distro redis.conf save policy backstops the trailing edge of a
+         * burst. bgsave_done_ guarantees the first message saves — see the
+         * member note: a zero time_point is the boot epoch, not "long ago". */
+        auto now = std::chrono::steady_clock::now();
+        if (!bgsave_done_ || now - last_bgsave_ >= std::chrono::seconds(60)) {
+            try {
+                redis_->bgsave();
+                last_bgsave_ = now;
+                bgsave_done_ = true;
+            } catch (const Error &err) {
+                console->debug("bgsave failed: {}", err.what());
+            }
+        }
     });
 
     sub.subscribe(CHANNEL_CONTROLS);
@@ -706,18 +1035,20 @@ void CinePIController::mainThread(){
 /*  suppressed on the --sync client, where rpi.sync owns the VBLANK to   */
 /*  hold the relative A->B genlock. Inferred from options_->sync.        */
 /* ------------------------------------------------------------------ */
-void CinePIController::updatePhaseLock(int64_t refTsNs)
+void CinePIController::updatePhaseLock(int64_t refTsNs, const OptionalString &fpsUser)
 {
     /* I/O lives here; the control law is the pure phaseLockStep() in
      * phase_lock_core.hpp (unit-tested in tests/phase_lock_core_test.cpp).
      *
      * Target = operator's NOMINAL fps (fps_user), read each frame so an fps change
-     * re-arms the lock. The reference clock is the Pi wall clock (FrameWallClock),
-     * passed in as refTsNs by process(). The --sync client role suppresses the
-     * lock so libcamera rpi.sync owns that sensor's VBLANK on a genlock rig. */
+     * re-arms the lock — fetched by process()'s pipelined batch and passed in, so
+     * the freshness is unchanged but the dedicated per-frame GET is gone. The
+     * reference clock is the Pi wall clock (FrameWallClock), passed in as refTsNs
+     * by process(). The --sync client role suppresses the lock so libcamera
+     * rpi.sync owns that sensor's VBLANK on a genlock rig. */
     double target = pllState_.targetFps;
-    if (auto v = redis_->get("fps_user"); v && !v->empty()) {
-        try { target = std::stod(*v); } catch (...) {}
+    if (fpsUser && !fpsUser->empty()) {
+        try { target = std::stod(*fpsUser); } catch (...) {}
     }
 
     const bool roleClient = (options_->sync == 2);
@@ -735,9 +1066,16 @@ void CinePIController::updatePhaseLock(int64_t refTsNs)
         app_->SetControls(cl);
     }
 
-    /* Telemetry for the test harness (only when the servo actually ran). */
+    /* Telemetry for the test harness (only when the servo actually ran) —
+     * both SETs share one pipelined round trip on the capture thread. */
     if (res.servoRan) {
-        redis_->set("pll_phase_err_us", std::to_string(std::lround(res.phaseErrUs)));
-        redis_->set("pll_req_dur_us", std::to_string(res.durUs));
+        try {
+            auto pipe = redis_->pipeline(false);
+            pipe.set("pll_phase_err_us", std::to_string(std::lround(res.phaseErrUs)))
+                .set("pll_req_dur_us", std::to_string(res.durUs));
+            pipe.exec();
+        } catch (const Error &err) {
+            console->debug("phase-lock telemetry write failed: {}", err.what());
+        }
     }
 }

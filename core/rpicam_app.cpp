@@ -117,6 +117,17 @@ static libcamera::PixelFormat mode_to_pixel_format(Mode const &mode)
 		{ Mode(0, 0, 10, true), libcamera::formats::SBGGR10_CSI2P },
 		{ Mode(0, 0, 12, false), libcamera::formats::SBGGR12 },
 		{ Mode(0, 0, 12, true), libcamera::formats::SBGGR12_CSI2P },
+		// 16-bit sensor modes (imx585 ClearHDR SRGGB16). The reference-proven
+		// path is PiSP COMP1 compressed raw: the INNO-MAKER stack's working
+		// 16-bit DNGs carry COMP1's magnitude-dependent 16/32/64 quantisation
+		// steps, so their FE compresses and their DNG writer decodes. A packed
+		// (16:P) request therefore maps to the compressed format, which our DNG
+		// writers already decode. Needs the libcamera cinemate-branch fix that
+		// exempts COMP1 buffers from the 16-bit endian swap.
+		// Unpacked (16:U) selects true uncompressed R16; the PiSP FE writes
+		// garbage on that path today, so treat 16:U as experimental.
+		{ Mode(0, 0, 16, false), libcamera::formats::SBGGR16 },
+		{ Mode(0, 0, 16, true), libcamera::formats::BGGR_PISP_COMP1 },
 	};
 
 	auto it = std::find_if(table.begin(), table.end(), [&mode] (auto &m) { return mode.bit_depth == m.first.bit_depth && mode.packed == m.first.packed; });

@@ -43,6 +43,16 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 	app.SetMetadataReadyCallback(std::bind(&Output::MetadataReady, output.get(), _1));
 
 	app.OpenCamera();
+
+	// 12-bit ClearHDR reaches the ISP still companded, so every preview and the
+	// DNG thumbnail render magenta while the recorded DNG — which carries a
+	// LinearizationTable — does not. ccmpPreview re-renders the lores frame from
+	// the raw Bayer with the decompand applied, and has to run before the stages
+	// that consume that frame. Inserted here rather than left to the
+	// post-process JSON because that file is written by the Cinemate installer,
+	// so an existing Pi would not have the entry. The stage no-ops on every
+	// other sensor mode.
+	app.EnsureFirstPostProcessingStage("ccmpPreview");
         //app.ConfigureViewfinder();
 	app.StartEncoder();
 	std::vector<std::shared_ptr<libcamera::Camera>> cameras = app.GetCameras();
@@ -114,6 +124,31 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			libcamera::StreamConfiguration const &cfg = app.RawStream()->configuration();
 			console->info("Raw stream: {}x{} : {} : {}", cfg.size.width, cfg.size.height, cfg.stride, cfg.pixelFormat.toString());
 
+			// Freeze the requested mode HERE, in the same statement as reading
+			// cfg, before anything below touches Redis. options->mode is a
+			// live pointer into the controller's redis-mutable state — reading
+			// it any later (readyAnnounced/announceReady are Redis round trips
+			// that can interleave with the subscriber thread) risks a
+			// mode-switch racing in between and silently mislabelling this
+			// stream's bit depth. cfg is the actual validated raw stream and
+			// cannot race, since it stays whatever StartCamera() just
+			// negotiated until the next reconfigure.
+			const unsigned int requested_width = options->mode.width;
+			const unsigned int requested_height = options->mode.height;
+			const unsigned int requested_bit_depth = options->mode.bit_depth;
+
+			// Whether the frozen values above can be believed to describe the
+			// stream cfg actually is. False on a dims mismatch: setSensorModeBitDepth()
+			// still gets requested_bit_depth below (it has nothing else to snapshot),
+			// but the encoder must not trust that value for the CCMP gate or the
+			// 16-bit keep-full-depth decision — see setSensorModeTrusted()'s comment
+			// and cinepi/ccmp_gate.hpp.
+			const bool mode_trusted = (requested_width == cfg.size.width && requested_height == cfg.size.height);
+			if (!mode_trusted)
+				console->warn("Requested mode {}x{} does not match the configured raw stream "
+							   "{}x{}; using the configured stream for binning and bit depth.",
+							   requested_width, requested_height, cfg.size.width, cfg.size.height);
+
 			/* ------------------------------------------------------------------ *
 			*  Announce that this cinepi-raw instance is fully initialised.      *
 			*  Key:  cinepi_ready_<camPort>   (e.g. cinepi_ready_cam0)           *
@@ -125,6 +160,16 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 				controller.announceReady(key);          // store one-shot flag
 			}
 
+			// Snapshot the validated sensor-mode bit depth for the encoder's
+			// 16-bit keep-full-depth decision, frozen above alongside cfg.
+			app.GetEncoder()->setSensorModeBitDepth(requested_bit_depth);
+			// Same snapshot, same reason: the CCMP decompand table is selected
+			// on the BINNING of the stream the camera actually configured —
+			// cfg.size, not the (possibly since-mutated) requested mode.
+			app.GetEncoder()->setSensorBinning(app.SensorBinning(cfg.size.width, cfg.size.height));
+			// Tell the encoder whether the two snapshots above can be
+			// believed at all — see setSensorModeTrusted()'s comment.
+			app.GetEncoder()->setSensorModeTrusted(mode_trusted);
 			app.GetEncoder()->reset_encoder();
 			controller.process_stream_info(cfg);
 

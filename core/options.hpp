@@ -99,7 +99,6 @@ struct Options
         Options()
         : set_default_lens_position(false), af_on_capture(false),
                 hdmi_port(-1),                    /* ‑1 = let DRM decide   */
-                keep16(false),                           // ← NEW default
                 options_("Valid options are", 120, 80), app_(nullptr)
 	{
 		using namespace boost::program_options;
@@ -185,6 +184,10 @@ struct Options
 			 "Height of viewfinder frames from the camera (distinct from the preview window size)")
 			("tuning-file", value<std::string>(&tuning_file)->default_value("-"),
 			 "Name of camera tuning file to use, omit this option for libcamera default behaviour")
+			("max-pixel-rate", value<double>(&max_pixel_rate)->default_value(0.0),
+			 "PiSP pixel-rate ceiling in MPix/s, matching the RP1 clock this board booted with: "
+			 "380 stock, 580 with the rp1-overclock overlay. Omit for the libcamera default. "
+			 "Setting this above what the hardware can drain corrupts wide modes silently")
 			("lores-width", value<unsigned int>(&lores_width)->default_value(0),
 			 "Width of low resolution frames (use 0 to omit low resolution stream")
 			("lores-height", value<unsigned int>(&lores_height)->default_value(0),
@@ -207,10 +210,6 @@ struct Options
 			"Sets AfMetering to  AfMeteringWindows an set region used, e.g. 0.25,0.25,0.5,0.5")
 			("lens-position", value<std::string>(&lens_position_)->default_value(""),
 			 "Set the lens to a particular focus position, expressed as a reciprocal distance (0 moves the lens to infinity), or \"default\" for the hyperfocal distance")
-			("hdr", value<std::string>(&hdr)->default_value("off")->implicit_value("auto"),
-			 "Enable High Dynamic Range, where supported. Available values are \"off\", \"auto\", "
-			 "\"sensor\" for sensor HDR (e.g. for Camera Module 3), "
-			 "\"single-exp\" for PiSP based single exposure multiframe HDR")
 			("metadata", value<std::string>(&metadata),
 			 "Save captured image metadata to a file or \"-\" for stdout")
 			("metadata-format", value<std::string>(&metadata_format)->default_value("json"),
@@ -266,6 +265,7 @@ struct Options
 	unsigned int viewfinder_width;
 	unsigned int viewfinder_height;
 	std::string tuning_file;
+	double max_pixel_rate;
 	bool qt_preview;
 	unsigned int lores_width;
 	unsigned int lores_height;
@@ -298,8 +298,8 @@ struct Options
 	*   0 = HDMI‑0  (RPi “main”)
 	*   1 = HDMI‑1  (RPi “aux”)  */
 	int hdmi_port;
-
-	bool keep16;          ///< store RAW as full 16-bit DNG, skip down-pack
+	// Mirror the DRM preview on the second active HDMI connector (--same-hdmi).
+	bool same_hdmi = false;
 
 	virtual bool Parse(int argc, char *argv[]);
 	virtual void Print() const;
