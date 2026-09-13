@@ -245,10 +245,20 @@ private:
      * Both values are consumed only through cinepi/dng_thumbnail.hpp's
      * thumbnail_geometry() -- setup_encoder()'s reservation and
      * dng_save()'s IFD1 write call the same formula, so they cannot
-     * disagree about a take's thumbnail dimensions. */
-    int thumb_mode_  = 0;   /* 0 off / 1 mono / 2 colour, this take     */
+     * disagree about a take's thumbnail dimensions. dng_save() also calls
+     * that header's add_thumbnail_ifd1_entries() to write IFD1's tags, so
+     * the geometry formula and the tag layout both have exactly one
+     * source, for every mode including JPEG (mode 3). */
+    int thumb_mode_  = 0;   /* 0 off / 1 mono / 2 colour / 3 colour JPEG, this take */
     int thumb_shift_ = 0;   /* clamp(thumbnailSize, 0, 12), this take   */
     bool thumb_lores_warned_ = false;  /* one warning per take, not per frame */
+    /* Mode 3 only: set once a JPEG-encoded frame overflows its own
+     * uncompressed-worst-case reservation and dng_save() skips the
+     * thumbnail for that frame (see dng_save()'s IFD1 block) -- same
+     * one-warning-per-take shape as thumb_lores_warned_, a separate flag
+     * because the two conditions are unrelated and can each recur on their
+     * own schedule within a take. */
+    bool thumb_jpeg_oversize_warned_ = false;
 
     /* ──  Reusable encoded-buffer pool  ───────────────────── */
     std::vector<uint8_t *> buffer_pool_;

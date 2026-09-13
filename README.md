@@ -276,12 +276,15 @@ raw frame just to show one. Two Redis keys control it:
 
 | Redis key | Range | Live? | What it does |
 |---|---|---|---|
-| `thumbnail` | 0 off / 1 mono / 2 colour | Live — read once at the first frame of each take, so a change lands on the *next* take, not mid-take | Whether IFD1 is written at all, and whether it's mono (1 byte/px) or colour (3 bytes/px). **Default 2 (colour)** — operator decision 2026-09-13; at the quarter-size default below, colour costs fewer bytes than mono did at half size, so there is no size/colour trade-off to make. `set thumbnail 1` gives mono, at a third of the bytes below, for anyone who wants it lighter still |
-| `thumbnail_size` | 0–12 (right shift of the lores plane) | Restarts the camera on change | How large the thumbnail is: 0 = the full lores plane, 1 = half each side, 2 = quarter, … **Default 2** |
+| `thumbnail` | 0 off / 1 mono / 2 colour / 3 colour JPEG | Live — read once at the first frame of each take, so a change lands on the *next* take, not mid-take | Whether IFD1 is written at all, and in what form. **Default 2 (colour)** — operator decision 2026-09-13; at the quarter-size default below, colour costs fewer bytes than mono did at half size, so there is no size/colour trade-off to make. `set thumbnail 1` gives mono, at a third of the bytes below, for anyone who wants it lighter still. `set thumbnail 3` gives colour JPEG (baseline, YCbCr 4:2:0, quality 85) — the smallest file of the four by a wide margin, but the most CPU (YUV→RGB conversion plus the JPEG encode itself), so it stays opt-in rather than the default |
+| `thumbnail_size` | 0–12 (right shift of the lores plane) | Restarts the camera on change | How large the thumbnail is: 0 = the full lores plane, 1 = half each side, 2 = quarter, … **Default 2**. Applies to every mode, JPEG included — a JPEG thumbnail is encoded at the same downscaled dimensions mono/colour would use at the same shift |
 
 The formula (`cinepi/dng_thumbnail.hpp`, `thumbnail_geometry()`): thumbnail
 bytes = `(lores_w >> thumbnail_size) × (lores_h >> thumbnail_size) × spp`,
-`spp` 3 for colour or 1 for mono. Measured per-frame cost at each shift
+`spp` 3 for colour or colour JPEG, 1 for mono. For JPEG (mode 3) this is a
+*reservation* — the uncompressed worst case a JPEG strip must fit inside —
+not the JPEG's actual size, which is smaller and scene-dependent; see below.
+Measured per-frame cost at each shift
 (`development/dng-thumbnail-cost/FINDINGS.md` §2; the 2026-09-13
 hardware-log entry in `cinemate-handbook`), **colour** — the shipped mode
 default; divide every figure by 3 for mono:
@@ -298,11 +301,24 @@ colour — 2,764,800 B/frame — is what CineMate 3.4 actually shipped with
 before this fix, on every frame regardless of shift (`thumbnail_size` was
 reseeded to 0 on every boot with no owner).
 
+**JPEG (`set thumbnail 3`), measured, not the reservation above:** three of
+the operator's takes, re-encoded at quality 85 4:2:0
+(`development/dng-thumbnail-cost/FINDINGS.md` §2b) — 9–16 KB per frame at
+640×360 (shift 1) against 230,400 B for mono at the same size, and 64–76 KB
+at the full 1280×720 lores plane (shift 0). Detailed or noisy scenes
+compress two to three times worse than these ordinary test shots did.
+Colour at a fraction of the mono cost, paid in CPU: mode 3 does the same
+YUV→RGB conversion mode 2 does, plus the JPEG encode itself, which is why
+it is the opt-in rather than the default on a processor-constrained camera.
+`dng_save()` checks the encoded size against the reservation above before
+writing it; a frame whose JPEG would not fit skips only that frame's
+thumbnail (one warning logged per take), never the frame itself.
+
 `thumbnail_size` is a per-install choice, not a per-take one — CineMate
 seeds it at boot from `image_capture.thumbnail_size` in `settings.jsonc`
 and it is not exposed as a live CLI verb, because changing it mid-session
 means a camera restart. `thumbnail` is safe to flip live with `set
-thumbnail <0|1|2>` since it only ever takes effect at the next take.
+thumbnail <0|1|2|3>` since it only ever takes effect at the next take.
 
 ## Live digital punch-in (center-crop preview)
 

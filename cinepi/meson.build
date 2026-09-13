@@ -49,6 +49,13 @@ mhd_dep = dependency('nadjieb_mjpeg_streamer', required : true)
 cinepi_raw_dep += mhd_dep
 cinepi_raw_dep += alsa_dep
 cinepi_raw_dep += udev_dep
+# The DNG thumbnail's JPEG mode (dng_encoder.cpp, thumbnail=3): jpeg_dep is
+# declared once, in image/meson.build (subdir('image') runs before
+# subdir('cinepi') in the root meson.build), where it is also folded into
+# rpicam_app_dep for encoder/mjpeg_encoder.cpp. dng_encoder.cpp is compiled
+# as one of THIS executable's own sources (not through rpicam_app), so its
+# #include <jpeglib.h> needs jpeg_dep on cinepi_raw_dep directly too.
+cinepi_raw_dep += jpeg_dep
 
 cinepi_raw = executable('cinepi-raw', sources,
              include_directories : [include_directories('..')],

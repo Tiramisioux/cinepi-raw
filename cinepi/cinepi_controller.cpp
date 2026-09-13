@@ -30,8 +30,19 @@ using namespace std::chrono;
 // The embedded thumbnail is the standard playback path -- raw decode is
 // far more demanding on the Pi and is no longer the pane's fallback (see
 // playback.py on the cinemate side). `set thumbnail 1` still gives mono,
-// at a third of the bytes, for anyone who wants it lighter still. A
-// standalone cinepi-raw run (no CineMate seeding image_capture.thumbnail
+// at a third of the bytes, for anyone who wants it lighter still.
+//
+// A fourth value, 3, shipped the same phase as this comment: colour JPEG
+// (kThumbnailJpegQuality = 85 in dng_encoder.cpp), the smallest file of the
+// four -- 9-16 KB per frame at 640x360 against 230,400 B for mono at the
+// same size (FINDINGS.md §2b, development/dng-thumbnail-cost/) -- but the
+// most CPU (YUV->RGB conversion plus the JPEG encode itself), which is why
+// it stays opt-in rather than the default: processor headroom is a real
+// constraint on this camera, and 2 (colour, uncompressed) trades none of it
+// away. `set thumbnail 3` is the way to reach it live; this default is
+// unchanged.
+//
+// A standalone cinepi-raw run (no CineMate seeding image_capture.thumbnail
 // into redis before launch), a flushed redis, or a start before that
 // seed runs now gets the same default CineMate ships.
 #define CP_DEF_THUMBNAIL 2
@@ -263,7 +274,14 @@ void CinePIController::sync(){
 
     auto thumbnail = pipe_replies.get<OptionalString>(8);
     if(thumbnail){
-        thumbnail_ = stoi(*thumbnail);
+        /* Clamped here too, not just in setup_encoder(): thumbnail_size_'s
+         * sync() read a few lines below already refuses an out-of-range
+         * resident value rather than pass it on, and this brings thumbnail_
+         * to the same standard -- 0..3 now that mode 3 (colour JPEG) exists.
+         * dng_save() clamps again regardless (defence in depth, not a
+         * substitute), but a value that never reaches options_->thumbnail
+         * out of range is safer than trusting the write path alone. */
+        thumbnail_ = std::clamp(stoi(*thumbnail), 0, 3);
     }else{
         thumbnail_ = CP_DEF_THUMBNAIL;
         redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_));
@@ -888,13 +906,17 @@ void CinePIController::mainThread(){
              * throws std::invalid_argument uncaught, from inside a pub/sub
              * callback -- matching the try/catch + !empty() shape every
              * other live numeric knob here already uses (CONTROL_KEY_HDR_
-             * BLEND etc.). dng_save() clamps to 0..2 regardless, but a
-             * value that never reaches options_->thumbnail at all is
-             * safer than trusting the write path to clamp what should
-             * never have parsed. */
+             * BLEND etc.). dng_save() clamps to 0..3 regardless (0 off, 1
+             * mono, 2 colour, 3 colour JPEG -- kThumbnailJpegQuality in
+             * dng_encoder.cpp), but a value that never reaches
+             * options_->thumbnail at all is safer than trusting the write
+             * path to clamp what should never have parsed. Mode 3 costs
+             * the most CPU (YUV->RGB plus the JPEG encode) for the fewest
+             * bytes per frame -- FINDINGS.md §2b,
+             * development/dng-thumbnail-cost/. */
             if(r && !r->empty()) {
                 try {
-                    options_->thumbnail = std::clamp(stoi(*r), 0, 2);
+                    options_->thumbnail = std::clamp(stoi(*r), 0, 3);
                 } catch (...) {}
             }
         }},

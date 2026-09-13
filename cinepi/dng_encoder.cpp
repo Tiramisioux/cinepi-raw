@@ -32,7 +32,14 @@
  #include "ifd_builder.hpp"
  #include "ccmp_gate.hpp"
  #include "dng_thumbnail.hpp"
- 
+
+ /* Thumbnail mode 3 (colour JPEG): libjpeg is already a cinepi-raw link
+  * dependency for the MJPEG preview (encoder/mjpeg_encoder.cpp) and the
+  * still-JPEG path (image/jpeg.cpp) -- jpeg_dep is declared once, in
+  * image/meson.build, and cinepi/meson.build adds it to cinepi_raw_dep so
+  * this translation unit can include the header. */
+ #include <jpeglib.h>
+
  #include <sys/mman.h>              
  #include <sys/types.h>
  #include <sys/stat.h>
@@ -63,14 +70,38 @@ static char CFA_GBRG[4] = { 1, 2, 0, 1 };
 
 // TIFF photometric interpretation values
 constexpr uint16_t PHOTOMETRIC_MINISBLACK = 1;
-constexpr uint16_t PHOTOMETRIC_RGB        = 2;
 constexpr uint16_t PHOTOMETRIC_CFA        = 32803; // DNG CFA
+// PHOTOMETRIC_RGB (=2) is no longer a file-scope constant here: the
+// thumbnail IFD1 block's own photometric choice (1 mono / 2 RGB / 6 YCbCr
+// for JPEG) now lives in cinepi/dng_thumbnail.hpp's
+// add_thumbnail_ifd1_entries(), which cannot depend on this file's globals
+// because tests/dng_thumbnail_test.cpp includes that header alone.
 
 // TIFF compression
 constexpr uint16_t COMPRESSION_NONE = 1;
 
 // Sample format
 constexpr uint16_t SAMPLEFORMAT_UINT = 1;
+
+/* jpeg_mem_dest()'s output-length parameter changed type across libjpeg
+ * releases (unsigned long -> size_t at 9d); same conditional typedef
+ * encoder/mjpeg_encoder.cpp and image/jpeg.cpp already use for the same
+ * reason -- copied, not reinvented, so this file agrees with them on
+ * whatever libjpeg the build actually links. */
+#if JPEG_LIB_VERSION_MAJOR > 9 || (JPEG_LIB_VERSION_MAJOR == 9 && JPEG_LIB_VERSION_MINOR >= 4)
+typedef size_t jpeg_mem_len_t;
+#else
+typedef unsigned long jpeg_mem_len_t;
+#endif
+
+/* Thumbnail mode 3 (colour JPEG): quality 85, chosen 2026-09-13 from the
+ * three settings actually measured (FINDINGS.md §2b,
+ * development/dng-thumbnail-cost/) -- visibly clean at 640x360, roughly
+ * double the bytes of quality 75, about half the bytes of quality 92, so
+ * 85 is the middle of that curve rather than either extreme. Named once
+ * here because dng_save() cites it in the "DNG writer:" log line as well
+ * as passing it to jpeg_set_quality(). */
+constexpr int kThumbnailJpegQuality = 85;
 
 
 struct BayerFormat
@@ -853,22 +884,33 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
                   options_ ? options_->thumbnail : -1,
                   options_ ? options_->thumbnailSize : -1);
     /* The pub/sub handler for CONTROL_KEY_THUMBNAIL already clamps live
-     * writes to [0, 2]; sync()'s boot-time read does not. Clamp again here
-     * so a raw `redis-cli set thumbnail 7` cannot reach dng_save() as a
-     * mode -- this function is the last point before that value becomes a
-     * buffer size and an IFD tag. */
-    thumb_mode_  = options_ ? std::clamp(options_->thumbnail, 0, 2) : 0;
+     * writes to [0, 3]; sync()'s boot-time read does the same (both in
+     * cinepi_controller.cpp). Clamp again here so a raw `redis-cli set
+     * thumbnail 7` cannot reach dng_save() as a mode -- this function is
+     * the last point before that value becomes a buffer size and an IFD
+     * tag. Mode 3 is colour JPEG (kThumbnailJpegQuality, above); dng_save()
+     * decides what "3" means byte-for-byte, this clamp only bounds it. */
+    thumb_mode_  = options_ ? std::clamp(options_->thumbnail, 0, 3) : 0;
     thumb_shift_ = options_ ? std::clamp(options_->thumbnailSize, 0, 12) : 0;
     thumb_lores_warned_ = false;   /* one warning per take, re-armed here */
+    thumb_jpeg_oversize_warned_ = false;   /* ditto, mode-3-only case */
 
-    /* Bytes this take's thumbnail actually needs -- 0 when off, so a take
-     * recorded with the toggle off gets none of this reserved, not the
-     * worst case every take used to pay regardless of mode. Single
+    /* Bytes this take's thumbnail reservation needs -- 0 when off, so a
+     * take recorded with the toggle off gets none of this reserved, not
+     * the worst case every take used to pay regardless of mode. Single
      * formula, shared with dng_save()'s IFD1 write below: see
-     * cinepi/dng_thumbnail.hpp. Measured cost at shift 0 is 2.7-2.8 MB per
-     * frame, +16% to +107% depending on mode (FINDINGS.md and the
-     * 2026-09-13 hardware-log entry, development/dng-thumbnail-cost/); the
-     * shipped default is shift 1 (~0.69 MB/frame). */
+     * cinepi/dng_thumbnail.hpp. For mode 3 (JPEG) this is the SAME
+     * uncompressed worst-case number mode 2 would need at this geometry,
+     * not an estimate of the JPEG's real size -- a JPEG strip must fit
+     * inside what its own uncompressed plane would have taken (dng_save()
+     * checks this before writing the strip), so reserving anything less
+     * would risk the overflow that already made write_pod() throw and
+     * silently drop a frame once, for the uncompressed modes, before this
+     * reservation existed. Measured cost at shift 0 is 2.7-2.8 MB per frame
+     * uncompressed, 60-130 KB actually written at JPEG quality 85
+     * (FINDINGS.md §2 and §2b, the 2026-09-13 hardware-log entry,
+     * development/dng-thumbnail-cost/); the shipped default is colour at
+     * shift 2 (~0.17 MB/frame). */
     const uint32_t thumb_reserved_bytes = static_cast<uint32_t>(
         thumbnail_geometry(dng_info.thumbWidth, dng_info.thumbHeight, thumb_shift_, thumb_mode_).bytes);
 
@@ -940,9 +982,13 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     {
         const ThumbGeometry thumb_g =
             thumbnail_geometry(dng_info.thumbWidth, dng_info.thumbHeight, thumb_shift_, thumb_mode_);
-        console->info("DNG writer: embedded lores thumbnail {} at {}x{} (shift {})",
-                      thumb_mode_ == 2 ? "colour" : "mono",
-                      thumb_g.width, thumb_g.height, thumb_shift_);
+        const char *mode_name = thumb_mode_ == 3 ? "jpeg" : thumb_mode_ == 2 ? "colour" : "mono";
+        if (thumb_mode_ == 3)
+            console->info("DNG writer: embedded lores thumbnail {} at {}x{} (shift {}, quality {})",
+                          mode_name, thumb_g.width, thumb_g.height, thumb_shift_, kThumbnailJpegQuality);
+        else
+            console->info("DNG writer: embedded lores thumbnail {} at {}x{} (shift {})",
+                          mode_name, thumb_g.width, thumb_g.height, thumb_shift_);
     }
     if (log_lut_)
         console->info("{}  LinearizationTable {} entries", log_lut_->params().describe(),
@@ -1376,8 +1422,10 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
      * Open decision 7, settled 2026-09-01: chained as IFD1 rather than
      * IFD0-with-raw-in-a-SubIFD. IFD0 above is untouched by this block --
      * same bytes, same offset, same next-IFD field left at 0 -- whenever
-     * `thumbnail` is 0 or the lores stream is absent, which is what makes
-     * the off position a genuine no-op.
+     * `thumbnail` is 0, the lores stream is absent, or (mode 3 only) this
+     * one frame's JPEG encode overflowed its reservation (see the
+     * kThumbnailJpegQuality block below) -- which is what makes each of
+     * those a genuine no-op rather than a smaller version of "on".
      *
      * thumb_mode_/thumb_shift_, NOT options_->thumbnail/thumbnailSize:
      * these are the snapshot setup_encoder() took at the start of THIS
@@ -1393,12 +1441,14 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
      * differently-shaped buffer (a mis-set lores format, a mid-stream
      * reconfigure this take's snapshot predates) would read past it.
      * Require the exact byte count the layout below assumes, and the
-     * pixel format that layout assumes too. */
-    const bool thumb_want = (thumb_mode_ == 1 || thumb_mode_ == 2);
+     * pixel format that layout assumes too. Mode 3 (JPEG) needs the same
+     * chroma planes mode 2 does -- its source pixels are RGB, converted
+     * from the same YUV420 lores buffer, before libjpeg ever sees them. */
+    const bool thumb_want = (thumb_mode_ >= 1 && thumb_mode_ <= 3);
     const bool thumb_lores_ok = thumb_want &&
         lomem && loinfo.width && loinfo.height && loinfo.stride &&
         loinfo.pixel_format == libcamera::formats::YUV420 &&
-        losize >= (thumb_mode_ == 2
+        losize >= ((thumb_mode_ == 2 || thumb_mode_ == 3)
             ? static_cast<size_t>(loinfo.stride) * loinfo.height
               + 2 * static_cast<size_t>(loinfo.stride / 2) * (loinfo.height / 2)
             : static_cast<size_t>(loinfo.stride) * loinfo.height);
@@ -1415,10 +1465,13 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
     if (thumb_lores_ok)
     {
-        const bool colour = (thumb_mode_ == 2);
+        const bool colour = (thumb_mode_ == 2 || thumb_mode_ == 3);
+        const bool jpeg_mode = (thumb_mode_ == 3);
         const int shift = thumb_shift_;
         /* tw/th/spp: the same formula setup_encoder() used to size the
-         * reservation this take's buffer got -- cinepi/dng_thumbnail.hpp. */
+         * reservation this take's buffer got -- cinepi/dng_thumbnail.hpp.
+         * tg.bytes is that same reservation; for mode 3 it is the
+         * uncompressed worst case the JPEG strip below must not exceed. */
         const ThumbGeometry tg = thumbnail_geometry(loinfo.width, loinfo.height, thumb_shift_, thumb_mode_);
         const uint32_t tw = tg.width;
         const uint32_t th = tg.height;
@@ -1463,6 +1516,39 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         thread_local std::vector<uint8_t> thumbRow;
         thumbRow.resize(static_cast<size_t>(tw) * spp);
 
+        /* Mode 3 (JPEG): libjpeg encodes into its own malloc'd buffer via
+         * jpeg_mem_dest below, not into `buf` -- the row loop that follows
+         * does not touch buf.offset for this mode, so thumbOff (just
+         * captured above) is still exactly where the compressed strip will
+         * land once dng_save() knows it fits and write_pod's it in, after
+         * the loop. One jpeg_compress_struct per call: dng_save() runs on
+         * a pool of encoder threads (thumbRow's own thread_local, just
+         * above, exists for the same reason), so this cannot be a
+         * function-level static the way a single-threaded caller could
+         * get away with. jpeg_std_error() (the plain default handler, no
+         * custom setjmp/longjmp) matches every other libjpeg call site in
+         * this codebase -- encoder/mjpeg_encoder.cpp, image/jpeg.cpp,
+         * cinepi/mjpegPreviewStage.cpp -- copied rather than reinvented. */
+        struct jpeg_compress_struct cinfo{};   /* value-init: no maybe-uninitialized
+                                                 * warning for the modes 1/2 path,
+                                                 * which never touches these two */
+        struct jpeg_error_mgr jerr{};
+        uint8_t *jpeg_out = nullptr;
+        jpeg_mem_len_t jpeg_out_size = 0;
+        if (jpeg_mode)
+        {
+            cinfo.err = jpeg_std_error(&jerr);
+            jpeg_create_compress(&cinfo);
+            cinfo.image_width      = tw;
+            cinfo.image_height     = th;
+            cinfo.input_components = 3;
+            cinfo.in_color_space    = JCS_RGB;
+            jpeg_set_defaults(&cinfo);     /* default 4:2:0 chroma subsampling for JCS_RGB input */
+            jpeg_set_quality(&cinfo, kThumbnailJpegQuality, TRUE);
+            jpeg_mem_dest(&cinfo, &jpeg_out, &jpeg_out_size);
+            jpeg_start_compress(&cinfo, TRUE);
+        }
+
         for (uint32_t y = 0; y < th; ++y)
         {
             const uint32_t srcY = std::min(y << shift, loinfo.height - 1);
@@ -1505,46 +1591,88 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                     thumbRow[3 * x + 2] = static_cast<uint8_t>(std::clamp(b, 0, 255));
                 }
             }
-            write_pod(buf, thumbRow.data(), thumbRow.size());
+            /* Sink differs by mode: mono/colour (1, 2) write the finished
+             * row straight into the take buffer, unchanged from before
+             * mode 3 existed; JPEG (3) hands the same row to libjpeg,
+             * which buffers it internally until it has enough for an MCU
+             * row -- jpeg_mem_dest is a non-suspending destination
+             * manager, so jpeg_write_scanlines() always consumes exactly
+             * the one row passed here, same as image/jpeg.cpp's
+             * YUYV_to_JPEG/YUV420_to_JPEG scanline loops. */
+            if (jpeg_mode)
+            {
+                JSAMPROW row_ptr[1] = { thumbRow.data() };
+                jpeg_write_scanlines(&cinfo, row_ptr, 1);
+            }
+            else
+                write_pod(buf, thumbRow.data(), thumbRow.size());
         }
-        const uint32_t thumbSize = buf.offset - thumbOff;
 
-        /* TIFF 6.0 requires every IFD to start on a word (2-byte, here
-         * kept to the stricter 4-byte) boundary. The strip is tw*th*spp
-         * bytes with no padding of its own, so an odd byte count -- mono
-         * at an odd width, or any width*3 that lands odd -- would
-         * otherwise leave IFD1 on an odd offset. */
-        if (buf.offset & 3)
+        bool thumb_written = !jpeg_mode;   /* modes 1/2 always write exactly tg.bytes */
+        uint32_t thumbSize = 0;
+
+        if (jpeg_mode)
         {
-            static const uint8_t zeros[4] = {0, 0, 0, 0};
-            write_pod(buf, zeros, 4 - (buf.offset & 3));
+            jpeg_finish_compress(&cinfo);
+            /* tg.bytes is the RESERVATION setup_encoder() sized this
+             * take's buffer_size against -- the uncompressed worst case at
+             * this geometry (cinepi/dng_thumbnail.hpp). Check before
+             * write_pod ever runs: never let write_pod() throw on a
+             * thumbnail, because that exception propagates out of
+             * dng_save() and drops the WHOLE frame (see the catch around
+             * dng_save() in encodeThread(), further down this file), not
+             * just its thumbnail. Skipping only the thumbnail for this one
+             * frame -- IFD0's next-IFD field stays 0, exactly like
+             * `thumbnail=0` -- costs one frame's playback proxy, not the
+             * frame itself. In practice a JPEG encode of real footage
+             * comes in far under this reservation (FINDINGS.md §2b: 9-16
+             * KB against a 691,200 B reservation at 640x360), so this is a
+             * guard against a pathological frame, not the common case. */
+            if (static_cast<size_t>(jpeg_out_size) <= tg.bytes)
+            {
+                write_pod(buf, jpeg_out, jpeg_out_size);
+                thumbSize = static_cast<uint32_t>(jpeg_out_size);
+                thumb_written = true;
+            }
+            else if (!thumb_jpeg_oversize_warned_)
+            {
+                console->warn("JPEG thumbnail encode produced {} B, over the {} B reservation "
+                              "at {}x{} quality {}; skipping the embedded thumbnail for frames "
+                              "in this take where this recurs", jpeg_out_size, tg.bytes, tw, th,
+                              kThumbnailJpegQuality);
+                thumb_jpeg_oversize_warned_ = true;
+            }
+            free(jpeg_out);
+            jpeg_destroy_compress(&cinfo);
         }
+        else
+            thumbSize = buf.offset - thumbOff;
 
-        IFDBuilder ifd1(tw, th);
-        ifd1.baseOffset = buf.usedSize;
+        if (thumb_written)
+        {
+            /* TIFF 6.0 requires every IFD to start on a word (2-byte, here
+             * kept to the stricter 4-byte) boundary. The strip is tw*th*spp
+             * bytes with no padding of its own for modes 1/2 (mode 3's
+             * JPEG strip is whatever length libjpeg produced), so an odd
+             * byte count would otherwise leave IFD1 on an odd offset. */
+            if (buf.offset & 3)
+            {
+                static const uint8_t zeros[4] = {0, 0, 0, 0};
+                write_pod(buf, zeros, 4 - (buf.offset & 3));
+            }
 
-        uint32_t subfileType = 1;                 /* thumbnail/reduced-res image */
-        uint16_t bitsArr[3]  = {8, 8, 8};          /* one per sample, TIFF-spec count */
-        uint16_t compression1 = COMPRESSION_NONE;
-        uint16_t phot1 = colour ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK;
-        uint16_t planar1 = 1;
+            IFDBuilder ifd1(tw, th);
+            ifd1.baseOffset = buf.usedSize;
 
-        ifd1.addEntry(254, TIFF_LONG , 1  , &subfileType);
-        ifd1.addEntry(256, TIFF_LONG , 1  , &tw);
-        ifd1.addEntry(257, TIFF_LONG , 1  , &th);
-        ifd1.addEntry(258, TIFF_SHORT, spp, bitsArr);
-        ifd1.addEntry(259, TIFF_SHORT, 1  , &compression1);
-        ifd1.addEntry(262, TIFF_SHORT, 1  , &phot1);
-        ifd1.addEntry(273, TIFF_LONG , 1  , &thumbOff);
-        ifd1.addEntry(277, TIFF_SHORT, 1  , &spp);
-        ifd1.addEntry(278, TIFF_LONG , 1  , &th);
-        ifd1.addEntry(279, TIFF_LONG , 1  , &thumbSize);
-        ifd1.addEntry(284, TIFF_SHORT, 1  , &planar1);
+            /* Single source for IFD1's tag layout, every mode --
+             * cinepi/dng_thumbnail.hpp. */
+            add_thumbnail_ifd1_entries(ifd1, tg, thumbOff, thumbSize);
 
-        ifd1.sortEntries(); ifd1.build(buf);
+            ifd1.sortEntries(); ifd1.build(buf);
 
-        /* chain IFD0 -> IFD1 */
-        *reinterpret_cast<uint32_t*>(buf.buffer + ifd.nextIfdFieldOffset) = ifd1.baseOffset;
+            /* chain IFD0 -> IFD1 */
+            *reinterpret_cast<uint32_t*>(buf.buffer + ifd.nextIfdFieldOffset) = ifd1.baseOffset;
+        }
     }
 
     return buf.usedSize;
