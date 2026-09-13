@@ -22,19 +22,25 @@ using namespace std::chrono;
 #define CP_DEF_SHUTTER 50
 #define CP_DEF_AWB 1
 #define CP_DEF_COMPRESS 0
-// 2 (colour). G10/G11 verified on hardware and the operator has made the
-// embedded thumbnail the standard playback path -- raw decode is far more
-// demanding on the Pi and is no longer the pane's fallback (see playback.py
-// on the cinemate side). A standalone cinepi-raw run (no CineMate seeding
-// image_capture.thumbnail into redis before launch), a flushed redis, or a
-// start before that seed runs now gets the same default CineMate ships.
-#define CP_DEF_THUMBNAIL 2
+// 1 (mono). Operator decision 2026-09-13, for efficiency: mono is one
+// byte per pixel against colour's three. The embedded thumbnail is the
+// standard playback path -- raw decode is far more demanding on the Pi
+// and is no longer the pane's fallback (see playback.py on the cinemate
+// side) -- so the Playback pane and its take strip render greyscale as a
+// result; `set thumbnail 2` restores colour at three times the bytes. A
+// standalone cinepi-raw run (no CineMate seeding image_capture.thumbnail
+// into redis before launch), a flushed redis, or a start before that
+// seed runs now gets the same default CineMate ships.
+#define CP_DEF_THUMBNAIL 1
 // thumbnail_size is a right-shift applied to the lores plane inside
 // dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 1 is
-// the default: half the lores plane, ~640x360 colour, ~0.69 MB/frame. Shift
-// 0 (full lores) was measured at ~2.76 MB/frame -- +22% on a 4K 12-bit
-// frame, +89% on HD 12-bit (FINDINGS.md and the 2026-09-13 hardware-log
-// entry, development/dng-thumbnail-cost/). CineMate seeds this key from
+// the default: half the lores plane. At the mono default above that is
+// 640x360 = 230,400 B/frame; 0 (full lores) is 1280x720 mono =
+// 921,600 B/frame, and 2 is 320x180 = 57,600 B/frame -- colour is three
+// times each figure (2,764,800 B/frame at shift 0 in colour, what
+// CineMate 3.4 actually shipped: +22% on a 4K 12-bit frame, +89% on HD
+// 12-bit -- FINDINGS.md and the 2026-09-13 hardware-log entry,
+// development/dng-thumbnail-cost/). CineMate seeds this key from
 // image_capture.thumbnail_size before cinepi-raw launches, so this default
 // only governs a standalone cinepi-raw run or a flushed redis. The redis
 // value found resident pre-feature (PI-008: thumbnail_size=50) predates
