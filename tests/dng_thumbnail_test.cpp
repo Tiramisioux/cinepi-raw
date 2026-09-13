@@ -269,13 +269,16 @@ int main()
     // reported for CINEPI_26-09-13_192414_F07_C00000_cam0's frames.
     check_one(1256, 720, 0, 2, 1256, 720, 3, 2712960, false, "1256x720 s0 colour");
 
-    // Shipped Phase-1-interim default, shift 1: half the lores plane,
-    // 640x360 colour, 691,200 B (~0.69 MB) -- FINDINGS.md §2's shift-1 column.
+    // THE SHIPPED DEFAULT, shift 1: half the lores plane, 640x360 colour,
+    // 691,200 B (~0.69 MB) -- FINDINGS.md §2's shift-1 column, and what
+    // cinepi_controller.cpp's CP_DEF_THUMBNAIL/CP_DEF_THUMBNAIL_SIZE pair
+    // produces on a standalone launch.
     check_one(1280, 720, 1, 2, 640, 360, 3, 691200, false, "1280x720 s1 colour");
 
-    // Shift 2: quarter plane, 320x180 colour, 172,800 B -- the shipped
-    // Phase-2 default (PLAN.md §2, cinepi_controller.cpp's CP_DEF_THUMBNAIL/
-    // CP_DEF_THUMBNAIL_SIZE).
+    // Shift 2: quarter plane, 320x180 colour, 172,800 B -- an interim
+    // default during the 2026-09-13 session, kept as a case because it is
+    // what the operator's first gate takes were recorded at (the
+    // hardware-log entries measure this size, not the shipped one).
     check_one(1280, 720, 2, 2, 320, 180, 3, 172800, false, "1280x720 s2 colour");
 
     // Mono (mode 1): same plane, spp 1, half the colour byte count.

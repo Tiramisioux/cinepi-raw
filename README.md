@@ -276,8 +276,8 @@ raw frame just to show one. Two Redis keys control it:
 
 | Redis key | Range | Live? | What it does |
 |---|---|---|---|
-| `thumbnail` | 0 off / 1 mono / 2 colour / 3 colour JPEG | Live — read once at the first frame of each take, so a change lands on the *next* take, not mid-take | Whether IFD1 is written at all, and in what form. **Default 2 (colour)** — operator decision 2026-09-13; at the quarter-size default below, colour costs fewer bytes than mono did at half size, so there is no size/colour trade-off to make. `set thumbnail 1` gives mono, at a third of the bytes below, for anyone who wants it lighter still. `set thumbnail 3` gives colour JPEG (baseline, YCbCr 4:2:0, quality 85) — the smallest file of the four by a wide margin, but the most CPU (YUV→RGB conversion plus the JPEG encode itself), so it stays opt-in rather than the default |
-| `thumbnail_size` | 0–12 (right shift of the lores plane) | Restarts the camera on change | How large the thumbnail is: 0 = the full lores plane, 1 = half each side, 2 = quarter, … **Default 2**. Applies to every mode, JPEG included — a JPEG thumbnail is encoded at the same downscaled dimensions mono/colour would use at the same shift |
+| `thumbnail` | 0 off / 1 mono / 2 colour / 3 colour JPEG | Live — read once at the first frame of each take, so a change lands on the *next* take, not mid-take | Whether IFD1 is written at all, and in what form. **Default 2 (colour)** — operator decision 2026-09-13; the embedded thumbnail is the pane's only playback path, so colour is what makes it a usable preview. `set thumbnail 1` gives mono, at a third of the bytes below, for anyone who wants it lighter. `set thumbnail 3` gives colour JPEG (baseline, YCbCr 4:2:0, quality 85) — the smallest file of the four by a wide margin, but the most CPU (YUV→RGB conversion plus the JPEG encode itself), so it stays opt-in rather than the default |
+| `thumbnail_size` | 0–12 (right shift of the lores plane) | Restarts the camera on change | How large the thumbnail is: 0 = the full lores plane, 1 = half each side, 2 = quarter, … **Default 1** (half each side). Applies to every mode, JPEG included — a JPEG thumbnail is encoded at the same downscaled dimensions mono/colour would use at the same shift |
 
 The formula (`cinepi/dng_thumbnail.hpp`, `thumbnail_geometry()`): thumbnail
 bytes = `(lores_w >> thumbnail_size) × (lores_h >> thumbnail_size) × spp`,
@@ -289,14 +289,14 @@ Measured per-frame cost at each shift
 hardware-log entry in `cinemate-handbook`), **colour** — the shipped mode
 default; divide every figure by 3 for mono:
 
-| Mode | Raw strip | shift 0 (full lores) | shift 1 (640×360) | shift 2 (320×180, **default**) |
+| Mode | Raw strip | shift 0 (full lores) | shift 1 (640×360, **default**) | shift 2 (320×180) |
 |---|---|---|---|---|
 | 4K 12-bit (3840×2160) | 12,441,600 B | +2,764,800 B = +22.2% | +691,200 B = +5.6% | +172,800 B = +1.4% |
 | 4K 16-bit ClearHDR (3840×2200, lores 1256×720) | 16,896,000 B | +2,712,960 B = +16.1% | +678,240 B = +4.0% | +169,560 B = +1.0% |
 | HD 12-bit (1920×1080) | 3,110,400 B | +2,764,800 B = +88.9% | +691,200 B = +22.2% | +172,800 B = +5.6% |
 
 In mono (`set thumbnail 1`), each figure above is a third: the shipped
-default (shift 2) is 57,600 B/frame instead of 172,800 B. Shift 0 in
+default (shift 1) is 230,400 B/frame instead of 691,200 B. Shift 0 in
 colour — 2,764,800 B/frame — is what CineMate 3.4 actually shipped with
 before this fix, on every frame regardless of shift (`thumbnail_size` was
 reseeded to 0 on every boot with no owner).
