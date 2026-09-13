@@ -185,14 +185,31 @@ public:
                 const unsigned sx0 = ccmp_preview_src_col(geom_, ox);
                 const unsigned sx1 = ccmp_preview_src_col(geom_, ox + 1);
 
-                const float s0 = sampleAndBlend(raw, sx0, sy0, det, y0[ox]);
-                const float s1 = sampleAndBlend(raw, sx1, sy0, det, y0[ox + 1]);
-                const float s2 = sampleAndBlend(raw, sx0, sy1, det, y1[ox]);
-                const float s3 = sampleAndBlend(raw, sx1, sy1, det, y1[ox + 1]);
+                unsigned hi[4];
+                const float w0 = quadBlend(raw, sx0, sy0, det, hi[0]);
+                const float w1 = quadBlend(raw, sx1, sy0, det, hi[1]);
+                const float w2 = quadBlend(raw, sx0, sy1, det, hi[2]);
+                const float w3 = quadBlend(raw, sx1, sy1, det, hi[3]);
 
-                const float smax = std::max(std::max(s0, s1), std::max(s2, s3));
-                u[ox / 2] = blend8(u[ox / 2], 128, smax);
-                v[ox / 2] = blend8(v[ox / 2], 128, smax);
+                /* The block agrees or nothing in it moves. Applied to the
+                 * COMBINED blend, so the anchor is covered too: a clamp code
+                 * straddling it speckles exactly the same way. */
+                const float s = clip_convergence_block(w0, w1, w2, w3);
+                if (s >= 0.99f)
+                    full_desat_ += 4;
+                else
+                {
+                    const unsigned worst = std::max(std::max(hi[0], hi[1]), std::max(hi[2], hi[3]));
+                    if (worst > max_undesat_)
+                        max_undesat_ = worst;
+                }
+
+                y0[ox] = blend8(y0[ox], white_, s);
+                y0[ox + 1] = blend8(y0[ox + 1], white_, s);
+                y1[ox] = blend8(y1[ox], white_, s);
+                y1[ox + 1] = blend8(y1[ox + 1], white_, s);
+                u[ox / 2] = blend8(u[ox / 2], 128, s);
+                v[ox / 2] = blend8(v[ox / 2], 128, s);
             }
         }
     }
@@ -201,7 +218,11 @@ private:
     /* Reads one raw quad, feeds the detector if attached, blends `y` toward
      * white_ by this quad's desaturation factor, and returns that factor so
      * the caller can fold it into the chroma block's maximum. */
-    float sampleAndBlend(const uint8_t *raw, unsigned sx, unsigned sy, ClipPlateauDetector *det, uint8_t &y) const
+    /* The blend this quad WANTS, and the highest code it carried. Nothing is
+     * written here: apply() decides per 2x2 block, because one pixel is never a
+     * clamp — clip_convergence.hpp. */
+    float quadBlend(const uint8_t *raw, unsigned sx, unsigned sy, ClipPlateauDetector *det,
+                    unsigned &peak_code) const
     {
         const uint16_t *r0 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy) * geom_.raw_stride);
         const uint16_t *r1 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy + 1) * geom_.raw_stride);
@@ -259,12 +280,7 @@ private:
         if (conv > s)
             s = conv;
 
-        if (s >= 0.99f)
-            ++full_desat_;
-        else if (mx > max_undesat_)
-            max_undesat_ = mx;
-
-        y = blend8(y, white_, s);
+        peak_code = mx;
         return s;
     }
 

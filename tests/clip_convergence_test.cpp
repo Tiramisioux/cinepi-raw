@@ -112,7 +112,7 @@ int main()
     /* Half way up the ratio ramp, well above the level gate. */
     {
         const float mx = 0.60f;
-        const float s = blend(mx, mx * 0.9825f, 0.1f);
+        const float s = blend(mx, mx * 0.9885f, 0.1f);
         check(std::fabs(s - 0.5f) < 0.02f, "mid-ramp ratio gives a half blend", "s=" + f2(s));
     }
     /* Just under the ratio floor: nothing, however bright. */
@@ -120,9 +120,16 @@ int main()
 
     /* The level ramp, at a ratio that would otherwise fire fully. */
     {
-        const float s = blend(0.20f, 0.20f, 0.05f);
+        const float s = blend(0.45f, 0.45f, 0.05f);
         check(s > 0.4f && s < 0.6f, "mid-level ramp halves the blend too", "s=" + f2(s));
     }
+
+    /* The mid-tones are where a per-pixel rule goes wrong: an ordinary colour
+     * can have its top two channels close, and one noisy pixel then fires on
+     * its own. The dimmest clamp measured is 0.56, so the gate sits far above
+     * anything here. */
+    check(blend(0.30f, 0.30f, 0.10f) == 0.f, "a converged MID-TONE is below the gate and ignored");
+    check(blend(0.39f, 0.39f, 0.10f) == 0.f, "and so is one just under it");
 
     /* The A/B against every build before this rule existed. */
     {
@@ -140,6 +147,15 @@ int main()
         check(a == b && b == c, "any two channels may be the pinned pair",
               "R+G " + f2(a) + "  G+B " + f2(b) + "  R+B " + f2(c));
     }
+
+    std::cout << "\none pixel is never a clamp\n";
+
+    /* The 2x2 block rule, which is what takes the isolated count to zero. A
+     * lone fired quad among unfired neighbours must come out at 0; a block
+     * where all four fire keeps its blend. */
+    check(clip_convergence_block(1.f, 0.f, 0.f, 0.f) == 0.f, "a lone fired quad in its block is suppressed");
+    check(clip_convergence_block(1.f, 1.f, 1.f, 1.f) == 1.f, "a block that agrees keeps the full blend");
+    check(clip_convergence_block(1.f, 0.8f, 0.9f, 1.f) == 0.8f, "a partly-agreeing block takes the weakest");
 
     std::cout << "\n" << (g_failures ? "FAILED " : "PASSED ") << g_failures << " failure(s)\n";
     return g_failures ? 1 : 0;
