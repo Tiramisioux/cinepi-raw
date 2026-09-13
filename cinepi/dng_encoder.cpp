@@ -31,6 +31,7 @@
  #include "utils.hpp"
  #include "ifd_builder.hpp"
  #include "ccmp_gate.hpp"
+ #include "dng_thumbnail.hpp"
  
  #include <sys/mman.h>              
  #include <sys/types.h>
@@ -833,31 +834,43 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      * check, and an unclamped shift is undefined behaviour on a 32-bit
      * width/height once it reaches the type's bit width. 12 already
      * collapses 1272 to 0. */
-    /* Always a colour thumbnail. This used to read options_->thumbnail, which
-     * is assigned only in CinePIController::sync() -- and sync() runs after
-     * the encoder is configured, so this read 0 whatever redis held. The
-     * camera reported "embedded lores thumbnail disabled" on every take while
-     * thumbnail=2 sat in redis and the lores stream was configured correctly.
-     * That ordering was never going to be visible from the redis side, which
-     * is why the key looked right the whole time.
-     *
-     * Rather than move the assignment earlier and leave a mode that has to
-     * win a race on every start, the choice is gone: every take gets a colour
-     * thumbnail. Playback wants one on every take, raw decode is far more
-     * expensive on the Pi than serving an embedded thumbnail, and a mode that
-     * is always 2 in practice is not worth the ordering hazard. */
-    thumb_mode_  = 2;
+    /* thumb_mode_ is a per-take snapshot of options_->thumbnail, read here
+     * rather than hard-coded to colour. It was hard-coded for a while, on
+     * the theory that CinePIController::sync() assigns options_->thumbnail
+     * AFTER the encoder is first configured, so this read would always see
+     * 0. That theory does not survive reading the source: sync() is the
+     * second statement of event_loop(), well before app.StartEncoder(),
+     * and this function is never called from there at all -- it runs
+     * lazily from EncodeBuffer() at the first frame of each take, always
+     * after sync() has already returned, and CONTROL_KEY_THUMBNAIL's
+     * pub/sub handler keeps options_->thumbnail live after that. No
+     * ordering hazard between sync() and this read is established; see the
+     * 2026-09-05 hardware-log entry for the full reading that retracted
+     * the original mechanism. Log the raw values first, by value, so the
+     * next time this is in question the log names them instead of
+     * implying them. */
+    console->info("DNG thumbnail options: thumbnail={} thumbnail_size={}",
+                  options_ ? options_->thumbnail : -1,
+                  options_ ? options_->thumbnailSize : -1);
+    /* The pub/sub handler for CONTROL_KEY_THUMBNAIL already clamps live
+     * writes to [0, 2]; sync()'s boot-time read does not. Clamp again here
+     * so a raw `redis-cli set thumbnail 7` cannot reach dng_save() as a
+     * mode -- this function is the last point before that value becomes a
+     * buffer size and an IFD tag. */
+    thumb_mode_  = options_ ? std::clamp(options_->thumbnail, 0, 2) : 0;
     thumb_shift_ = options_ ? std::clamp(options_->thumbnailSize, 0, 12) : 0;
     thumb_lores_warned_ = false;   /* one warning per take, re-armed here */
 
     /* Bytes this take's thumbnail actually needs -- 0 when off, so a take
      * recorded with the toggle off gets none of this reserved, not the
-     * worst case every take used to pay regardless of mode. */
-    const uint32_t thumb_reserved_bytes =
-        (thumb_mode_ == 0) ? 0u :
-        std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift_) *
-        std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift_) *
-        static_cast<uint32_t>(thumb_mode_ == 2 ? 3 : 1);
+     * worst case every take used to pay regardless of mode. Single
+     * formula, shared with dng_save()'s IFD1 write below: see
+     * cinepi/dng_thumbnail.hpp. Measured cost at shift 0 is 2.7-2.8 MB per
+     * frame, +16% to +107% depending on mode (FINDINGS.md and the
+     * 2026-09-13 hardware-log entry, development/dng-thumbnail-cost/); the
+     * shipped default is shift 1 (~0.69 MB/frame). */
+    const uint32_t thumb_reserved_bytes = static_cast<uint32_t>(
+        thumbnail_geometry(dng_info.thumbWidth, dng_info.thumbHeight, thumb_shift_, thumb_mode_).bytes);
 
     /* ──  Buffer sizing  ──────────────────────────────────────── */
     /* 64 KB covers the IFD and its out-of-line payloads; log adds an 8 KB
@@ -924,11 +937,13 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     if (thumb_mode_ == 0)
         console->info("DNG writer: raw-only frames; embedded lores thumbnail disabled");
     else
+    {
+        const ThumbGeometry thumb_g =
+            thumbnail_geometry(dng_info.thumbWidth, dng_info.thumbHeight, thumb_shift_, thumb_mode_);
         console->info("DNG writer: embedded lores thumbnail {} at {}x{} (shift {})",
                       thumb_mode_ == 2 ? "colour" : "mono",
-                      std::max<uint32_t>(1, dng_info.thumbWidth  >> thumb_shift_),
-                      std::max<uint32_t>(1, dng_info.thumbHeight >> thumb_shift_),
-                      thumb_shift_);
+                      thumb_g.width, thumb_g.height, thumb_shift_);
+    }
     if (log_lut_)
         console->info("{}  LinearizationTable {} entries", log_lut_->params().describe(),
                       log_lut_->inverse_size());
@@ -1402,9 +1417,12 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     {
         const bool colour = (thumb_mode_ == 2);
         const int shift = thumb_shift_;
-        const uint32_t tw = std::max<uint32_t>(1, loinfo.width  >> shift);
-        const uint32_t th = std::max<uint32_t>(1, loinfo.height >> shift);
-        const uint16_t spp = colour ? 3 : 1;
+        /* tw/th/spp: the same formula setup_encoder() used to size the
+         * reservation this take's buffer got -- cinepi/dng_thumbnail.hpp. */
+        const ThumbGeometry tg = thumbnail_geometry(loinfo.width, loinfo.height, thumb_shift_, thumb_mode_);
+        const uint32_t tw = tg.width;
+        const uint32_t th = tg.height;
+        const uint16_t spp = tg.spp;
 
         /* lomem is planar YUV420 (I420): Y at lomem, stride loinfo.stride;
          * U at lomem + stride*height, chroma stride stride/2; V right after

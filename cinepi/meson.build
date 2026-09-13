@@ -86,6 +86,16 @@ ifd_builder_test = executable('ifd_builder_test',
            install : false)
 test('ifd_builder', ifd_builder_test)
 
+# Unit tests for the DNG embedded-thumbnail geometry formula -- the single
+# source setup_encoder()'s buffer reservation and dng_save()'s IFD1 write
+# both call. No libcamera deps — it includes only cinepi/dng_thumbnail.hpp.
+# Run with `meson test`.
+dng_thumbnail_test = executable('dng_thumbnail_test',
+           '../tests/dng_thumbnail_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('dng_thumbnail', dng_thumbnail_test)
+
 # Unit tests for the CineMate Log curve engine. No libcamera / jsoncpp deps — it
 # includes only cinepi/log_lut.hpp (the spec loader in log_lut.cpp is what needs
 # jsoncpp, and it is not part of the tested core). Run with `meson test`.

@@ -267,6 +267,36 @@ redis-cli SET is_recording 0
 redis-cli PUBLISH cp_controls is_recording    # triggers 1 → 0 edge
 ```
 
+### DNG thumbnails
+
+Every DNG can carry a second, smaller image (IFD1) chained after the raw
+frame (IFD0) — an uncompressed 8-bit thumbnail at the lores stream's own
+aspect, used by CineMate's playback pane so it does not have to decode the
+raw frame just to show one. Two Redis keys control it:
+
+| Redis key | Range | Live? | What it does |
+|---|---|---|---|
+| `thumbnail` | 0 off / 1 mono / 2 colour | Live — read once at the first frame of each take, so a change lands on the *next* take, not mid-take | Whether IFD1 is written at all, and whether it's mono (1 byte/px) or colour (3 bytes/px) |
+| `thumbnail_size` | 0–12 (right shift of the lores plane) | Restarts the camera on change | How large the thumbnail is: 0 = the full lores plane, 1 = half each side, 2 = quarter, … Default **1** |
+
+The formula (`cinepi/dng_thumbnail.hpp`, `thumbnail_geometry()`): thumbnail
+bytes = `(lores_w >> thumbnail_size) × (lores_h >> thumbnail_size) × spp`,
+`spp` 3 for colour or 1 for mono. Measured per-frame cost at each shift
+(`development/dng-thumbnail-cost/FINDINGS.md` §2; the 2026-09-13
+hardware-log entry in `cinemate-handbook`), colour mode:
+
+| Mode | Raw strip | shift 0 (full lores) | shift 1 (640×360, **default**) | shift 2 (320×180) |
+|---|---|---|---|---|
+| 4K 12-bit (3840×2160) | 12,441,600 B | +2,764,800 B = +22.2% | +691,200 B = +5.6% | +172,800 B = +1.4% |
+| 4K 16-bit ClearHDR (3840×2200, lores 1256×720) | 16,896,000 B | +2,712,960 B = +16.1% | +678,240 B = +4.0% | +169,560 B = +1.0% |
+| HD 12-bit (1920×1080) | 3,110,400 B | +2,764,800 B = +88.9% | +691,200 B = +22.2% | +172,800 B = +5.6% |
+
+`thumbnail_size` is a per-install choice, not a per-take one — CineMate
+seeds it at boot from `image_capture.thumbnail_size` in `settings.jsonc`
+and it is not exposed as a live CLI verb, because changing it mid-session
+means a camera restart. `thumbnail` is safe to flip live with `set
+thumbnail <0|1|2>` since it only ever takes effect at the next take.
+
 ## Live digital punch-in (center-crop preview)
 
 Via Redis you can punch-in the HDMI preview while leaving the RAW recording untouched – good for C-mount lenses that don’t cover the whole

@@ -241,7 +241,11 @@ private:
      *      (0 when off) instead of worst-case colour bytes on every take
      *      regardless of mode, which is what reading options_ live would
      *      have required (the mode could otherwise change after the
-     *      buffer was sized but before the take that uses it starts). */
+     *      buffer was sized but before the take that uses it starts).
+     * Both values are consumed only through cinepi/dng_thumbnail.hpp's
+     * thumbnail_geometry() -- setup_encoder()'s reservation and
+     * dng_save()'s IFD1 write call the same formula, so they cannot
+     * disagree about a take's thumbnail dimensions. */
     int thumb_mode_  = 0;   /* 0 off / 1 mono / 2 colour, this take     */
     int thumb_shift_ = 0;   /* clamp(thumbnailSize, 0, 12), this take   */
     bool thumb_lores_warned_ = false;  /* one warning per take, not per frame */

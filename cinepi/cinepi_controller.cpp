@@ -30,12 +30,16 @@ using namespace std::chrono;
 // start before that seed runs now gets the same default CineMate ships.
 #define CP_DEF_THUMBNAIL 2
 // thumbnail_size is a right-shift applied to the lores plane inside
-// dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 0 is
-// the default: it is what every size/cost figure in the C9 plan and
-// GATES.md assumes (the 1272x720 lores frame, unscaled). The redis value
-// found resident pre-feature (PI-008: thumbnail_size=50) predates any
-// consumer of this key and is not a default worth preserving.
-#define CP_DEF_THUMBNAIL_SIZE 0
+// dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 1 is
+// the default: half the lores plane, ~640x360 colour, ~0.69 MB/frame. Shift
+// 0 (full lores) was measured at ~2.76 MB/frame -- +22% on a 4K 12-bit
+// frame, +89% on HD 12-bit (FINDINGS.md and the 2026-09-13 hardware-log
+// entry, development/dng-thumbnail-cost/). CineMate seeds this key from
+// image_capture.thumbnail_size before cinepi-raw launches, so this default
+// only governs a standalone cinepi-raw run or a flushed redis. The redis
+// value found resident pre-feature (PI-008: thumbnail_size=50) predates
+// any consumer of this key and is not a default worth preserving.
+#define CP_DEF_THUMBNAIL_SIZE 1
 
 /* ── imx585 ClearHDR live knobs ─────────────────────────────────────────────
  * The knobs are custom V4L2 controls on the sensor subdev; their IDs mirror
@@ -267,11 +271,14 @@ void CinePIController::sync(){
          * to 12 and, against CineMate's 1272-wide lores plane, produces
          * a 1x1 thumbnail (1272 >> 12 == 0, floored to 1) -- silently,
          * since dng_save() never rejects a shift, only floors it. Refuse
-         * and re-seed rather than accept a value that quietly launches
-         * the +7-22% write-cost feature and delivers nothing. Skipped
-         * when lores_width is 0 (no lores stream configured at all --
-         * standalone cinepi-raw with no --lores-width -- where the
-         * thumbnail is unreachable anyway; see dng_save()'s lomem guard). */
+         * and re-seed rather than accept a value that quietly pays the
+         * per-frame thumbnail cost (up to +89% on HD 12-bit at shift 0 --
+         * FINDINGS.md and the 2026-09-13 hardware-log entry,
+         * development/dng-thumbnail-cost/) and delivers a thumbnail no
+         * reader can use. Skipped when lores_width is 0 (no lores stream
+         * configured at all -- standalone cinepi-raw with no
+         * --lores-width -- where the thumbnail is unreachable anyway; see
+         * dng_save()'s lomem guard). */
         if (options_->lores_width && (options_->lores_width >> clamped) < 16) {
             console->warn("thumbnail_size={} (clamped {}) would collapse the {}px-wide "
                           "lores thumbnail below 16px; resetting to the default {}",
