@@ -84,6 +84,7 @@
 #include "ccmp_preview.hpp"
 #include "cinepi_recorder.hpp"
 #include "clip_neutralise.hpp"
+#include "clip_convergence.hpp"
 #include "clip_plateau.hpp"
 
 using Stream = libcamera::Stream;
@@ -191,6 +192,22 @@ public:
 		 * change. Either way, the periodic log line names which mode (auto,
 		 * override or off) is in force and reports the code actually used. */
 		colour_.sensor_clip_code = params.get<unsigned>("sensorClipCode", colour_.sensor_clip_code);
+
+		/* The second, level-free trigger — clip_convergence.hpp. It runs in BOTH
+		 * modes alongside the anchor, whichever fires harder, because an anchor
+		 * cannot see a clamp that landed below it and this rule cannot be fooled
+		 * by one that moved. Set clipConvergence to 0 to leave only the anchor,
+		 * which is every build before this one. */
+		convergence_.enabled = params.get<bool>("clipConvergence", convergence_.enabled);
+		convergence_.ratio_lo = params.get<float>("clipRatioLow", convergence_.ratio_lo);
+		convergence_.ratio_hi = params.get<float>("clipRatioHigh", convergence_.ratio_hi);
+		convergence_.level_lo = params.get<float>("clipLevelLow", convergence_.level_lo);
+		convergence_.level_hi = params.get<float>("clipLevelHigh", convergence_.level_hi);
+		/* The pedestal the convergence ratio is taken above. 3200 is the imx585's
+		 * ClearHDR black level — the same number the tuning file's rpi.black_level
+		 * and the DNG's BlackLevel tag carry. Only 16-bit needs it; the 12-bit
+		 * path gets black off inside the decompand table. */
+		black_level_ = params.get<unsigned>("blackLevel", black_level_);
 	}
 
 	void Configure() override;
@@ -241,6 +258,8 @@ private:
 	/* Shared: the colour/geometry knobs (Read()) and the shadow/real
 	 * detector, configured for whichever mode is active. */
 	CcmpPreviewColour colour_;
+	ClipConvergence convergence_;
+	unsigned black_level_ = 3200;
 	ClipPlateauDetector detector_;
 
 	static constexpr unsigned kMaxCodeReportFrames = 120;
@@ -377,6 +396,7 @@ void ccmpPreviewStage::configure12Bit(const StreamInfo &raw_info, const StreamIn
 	/* setColour() so highlightReference() below reports the level this take will
 	 * actually use, rather than the previous configure's. Process() sets it
 	 * again per frame for the live AWB gains. */
+	renderer_.setConvergence(convergence_);
 	renderer_.setColour(colour_);
 	renderer_.resetMaxCode();
 	frames_since_report_ = 0;
@@ -440,6 +460,8 @@ void ccmpPreviewStage::configure16Bit(const StreamInfo &raw_info, const StreamIn
 		lores_info.colour_space && lores_info.colour_space->range == libcamera::ColorSpace::Range::Full;
 	white_ = full_range ? 255 : 235;
 	neutraliser_.setWhite(white_);
+	neutraliser_.setLevels(black_level_, 65535);
+	neutraliser_.setConvergence(convergence_);
 
 	detector_.configure(16);
 	auto_anchor_ = 0;

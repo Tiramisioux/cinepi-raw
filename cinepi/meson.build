@@ -168,6 +168,16 @@ clip_plateau_test = executable('clip_plateau_test',
            install : false)
 test('clip_plateau', clip_plateau_test)
 
+# Unit tests for the level-free clamp trigger. Pure: it includes only
+# cinepi/clip_convergence.hpp. Its vectors are measurements from three real
+# takes, including the one case no anchor can decide -- a genuine white subject
+# sitting at the same level as a clamped one.
+clip_convergence_test = executable('clip_convergence_test',
+           '../tests/clip_convergence_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('clip_convergence', clip_convergence_test)
+
 # Unit tests for the CCMP12 attach gate (cinepi/ccmp_gate.hpp) -- whether
 # dng_encoder.cpp's setup_encoder() should even consider a decompand table,
 # including the round-2 sensor_mode_trusted refusal. No libcamera deps.

@@ -50,6 +50,7 @@
 #include <string>
 
 #include "ccmp_preview.hpp"
+#include "clip_convergence.hpp"
 #include "clip_plateau.hpp"
 
 class HighlightNeutraliser
@@ -109,6 +110,20 @@ public:
      * ColorSpace, the same way CcmpPreviewColour::rec709 is. Chroma always
      * ramps toward 128 regardless of range. */
     void setWhite(uint8_t y_white) { white_ = y_white; }
+
+    /* The raw levels the convergence rule normalises against: black is the
+     * sensor's pedestal (SensorBlackLevels when the pipeline reports one) and
+     * white the top of the container. Only the ratio between channels matters,
+     * so a black that is slightly off costs precision rather than correctness
+     * — but ignoring it entirely biases every ratio upward, toward firing. */
+    void setLevels(unsigned black, unsigned white)
+    {
+        black_ = static_cast<float>(black);
+        const float span = static_cast<float>(white) - black_;
+        inv_span_ = span > 1.f ? 1.f / span : 1.f / 65535.f;
+    }
+
+    void setConvergence(const ClipConvergence &c) { convergence_ = c; }
 
     unsigned anchor() const { return anchor_; }
 
@@ -214,6 +229,36 @@ private:
         if (mx > lo_)
             s = std::min(1.f, (static_cast<float>(mx) - lo_) * scale_);
 
+        /* The second trigger — clip_convergence.hpp. 16-bit is already linear,
+         * so the channels need only black off and a normalise to land in the
+         * domain that rule was measured in. Split by CFA rather than reusing
+         * the quad's own min/max: the 12-bit HD case that forced this rule pins
+         * R and G together while B stays low, which a min/max over four samples
+         * cannot see. Whichever trigger fires harder wins, so this can only add
+         * correction to what the anchor already does. */
+        const unsigned code[4] = { c0, c1, c2, c3 };
+        float cam[3] = { 0.f, 0.f, 0.f };
+        int greens = 0;
+        for (int i = 0; i < 4; ++i)
+        {
+            const float v = (static_cast<float>(code[i]) - black_) * inv_span_;
+            const float level = v > 0.f ? v : 0.f;
+            if (geom_.cfa[i] == CCMP_PREVIEW_G)
+            {
+                cam[CCMP_PREVIEW_G] += level;
+                ++greens;
+            }
+            else
+                cam[geom_.cfa[i]] = level;
+        }
+        if (greens > 1)
+            cam[CCMP_PREVIEW_G] /= static_cast<float>(greens);
+
+        const float conv = clip_convergence_blend(cam[CCMP_PREVIEW_R], cam[CCMP_PREVIEW_G],
+                                                  cam[CCMP_PREVIEW_B], convergence_);
+        if (conv > s)
+            s = conv;
+
         if (s >= 0.99f)
             ++full_desat_;
         else if (mx > max_undesat_)
@@ -236,6 +281,9 @@ private:
     float lo_ = 0.f;        /* raw code where the ramp starts                */
     float scale_ = 0.f;     /* 1/(anchor*rolloff); 0 = correction off        */
     uint8_t white_ = 235;   /* Y a fully desaturated pixel ramps to          */
+    float black_ = 0.f;     /* sensor pedestal, for the convergence ratio   */
+    float inv_span_ = 1.f / 65535.f;
+    ClipConvergence convergence_;
 
     /* Observability only, never read by apply() itself — see the accessors'
      * comments. mutable so apply() stays const, matching

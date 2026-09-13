@@ -75,6 +75,7 @@
 #include <vector>
 
 #include "ccmp_lut.hpp"
+#include "clip_convergence.hpp"
 #include "clip_plateau.hpp"
 
 /* Which colour a Bayer quad position carries. Matches dng_encoder.cpp's CFA
@@ -268,6 +269,11 @@ public:
     /* Bakes the white balance, the CCM and the exposure into one matrix, and
      * the gamma into a table. Detail 1 lives here: the gains are part of the
      * matrix, which is applied to values that have ALREADY been through lin_. */
+    /* The convergence trigger's thresholds; default-constructed is the
+     * measured shipping rule. Setting enabled=false leaves only the anchor,
+     * which is the A/B against every build before this one. */
+    void setConvergence(const ClipConvergence &c) { convergence_ = c; }
+
     void setColour(const CcmpPreviewColour &colour)
     {
         /* Mono has no AWB gains and no CCM — the tuning file carries neither,
@@ -495,11 +501,20 @@ private:
          * it cannot be measured after them. */
         const float peak = std::max(std::max(s[0], s[1]), std::max(s[2], s[3]));
 
+        /* The level-free half of the trigger — see clip_convergence.hpp. Read
+         * off the decompanded channels BEFORE the gains, for the same reason
+         * `peak` is: after them, a clamped quad and a saturated colour look
+         * alike. Mono has no CFA and no gains, so every quad is trivially
+         * converged and the rule would whiten the whole picture. */
+        const float conv = geom_.mono ? 0.f
+                                      : clip_convergence_blend(cam[CCMP_PREVIEW_R], cam[CCMP_PREVIEW_G],
+                                                               cam[CCMP_PREVIEW_B], convergence_);
+
         float lin[3];
         for (int row = 0; row < 3; ++row)
             lin[row] = m_[row * 3 + 0] * cam[0] + m_[row * 3 + 1] * cam[1] + m_[row * 3 + 2] * cam[2];
 
-        const float applied = desaturateHighlight(lin, peak);
+        const float applied = desaturateHighlight(lin, peak, conv);
         if (applied >= 0.99f)
             ++full_desat_;
         else if (hi > max_undesat_)
@@ -553,12 +568,20 @@ private:
      * well above the anchor while the body of the blown area sits below it and
      * desaturates by nothing, which is how both earlier anchors looked correct
      * in the log and did nothing on the picture. */
-    float desaturateHighlight(float lin[3], float peak) const
+    float desaturateHighlight(float lin[3], float peak, float conv) const
     {
-        if (peak <= hl_lo_)
+        /* Two independent triggers, whichever fires harder. `peak` against the
+         * table anchor is the original, and it is hardware-confirmed for full
+         * res and for both 16-bit modes, so it stays exactly as it was. `conv`
+         * catches what an anchor structurally cannot: a clamp that landed below
+         * it. Taking the max can only ever ADD correction, never remove any. */
+        float s = 0.f;
+        if (peak > hl_lo_)
+            s = std::min(1.f, (peak - hl_lo_) * hl_scale_);
+        if (conv > s)
+            s = conv;
+        if (!(s > 0.f))
             return 0.f;
-
-        const float s = std::min(1.f, (peak - hl_lo_) * hl_scale_);
         const float mx = std::max(lin[0], std::max(lin[1], lin[2]));
         for (int i = 0; i < 3; ++i)
             lin[i] += s * (mx - lin[i]);
@@ -623,6 +646,7 @@ private:
      * stays const: it describes the data that went through, not the renderer's
      * configuration. The stage serialises render() under its own mutex, so the
      * unsynchronised update is safe there. */
+    ClipConvergence convergence_;
     unsigned lut_clip_code_ = 0;
     unsigned resolved_clip_ = 0;
     mutable unsigned max_code_ = 0;
