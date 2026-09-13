@@ -51,10 +51,17 @@
  *      which is a colour cast in the blacks: the defect, one order of magnitude
  *      down.
  *
- * SCOPE. The caller gates this. It is correct only for a source that actually
- * companded — 12-bit ClearHDR — and decompanding a mode that did not is the
- * same defect with the sign flipped (ccmp_lut.hpp, and dng_encoder.cpp's own
- * scope comment).
+ * SCOPE. CcmpPreviewRenderer itself is correct only for a source that
+ * actually companded — 12-bit ClearHDR — and the caller gates it accordingly;
+ * decompanding a mode that did not compand is the same defect with the sign
+ * flipped (ccmp_lut.hpp, and dng_encoder.cpp's own scope comment).
+ *
+ * CcmpPreviewGeometry and the ccmp_preview_src_row/col() mapping below it are
+ * NOT scoped to 12-bit, though: they describe the raw layout and the
+ * nearest-quad footprint, neither of which has anything to do with
+ * companding. clip_neutralise.hpp's HighlightNeutraliser (16-bit ClearHDR's
+ * merge-clamp correction, over the ISP's own — uncompanded — render) reuses
+ * both rather than keeping a second copy that could drift from this one.
  */
 
 #ifndef CINEPI_CCMP_PREVIEW_HPP
@@ -68,6 +75,7 @@
 #include <vector>
 
 #include "ccmp_lut.hpp"
+#include "clip_plateau.hpp"
 
 /* Which colour a Bayer quad position carries. Matches dng_encoder.cpp's CFA
  * arrays (0 = R, 1 = G, 2 = B) so one convention serves both consumers. */
@@ -109,6 +117,23 @@ struct CcmpPreviewGeometry
                out_stride >= out_width;
     }
 };
+
+/* Nearest source quad, snapped to the even origin of a Bayer cell. Free
+ * functions rather than renderer methods so a second consumer of the same raw
+ * buffer -- clip_neutralise.hpp's HighlightNeutraliser, which walks the lores
+ * frame at the same resolution to read the raw quad under each pixel it
+ * neutralises -- uses the identical mapping instead of a second copy that
+ * could drift from this one. */
+inline unsigned ccmp_preview_src_row(const CcmpPreviewGeometry &geom, unsigned oy)
+{
+    const unsigned r = static_cast<unsigned>(static_cast<uint64_t>(oy) * geom.raw_height / geom.out_height);
+    return std::min(r & ~1u, geom.raw_height - 2);
+}
+inline unsigned ccmp_preview_src_col(const CcmpPreviewGeometry &geom, unsigned ox)
+{
+    const unsigned c = static_cast<unsigned>(static_cast<uint64_t>(ox) * geom.raw_width / geom.out_width);
+    return std::min(c & ~1u, geom.raw_width - 2);
+}
 
 struct CcmpPreviewColour
 {
@@ -319,6 +344,16 @@ public:
     bool ready() const { return ready_; }
     const CcmpPreviewGeometry &geometry() const { return geom_; }
 
+    /* Feeds every quad this render() touches to a ClipPlateauDetector, in
+     * SHADOW mode: nothing here reads it back, so attaching one cannot change
+     * a rendered byte (the existing tests assert exactly that). It exists so
+     * the 12-bit stage can measure, per frame, whether the fixed per-binning
+     * anchor (CcmpAnchor::clip_code) still matches the hardware at gains
+     * other than the one it was measured at -- see ccmp_lut.hpp's
+     * kT1Effective comment and the 2026-09-13 hardware-log entry. nullptr
+     * (the default) costs one pointer compare per quad. */
+    void setPlateauDetector(ClipPlateauDetector *det) { det_ = det; }
+
     /* The normalised level the highlight correction is referenced to, and the
      * highest raw code seen since the last resetMaxCode(). The second is what
      * says whether the first matches the sensor. */
@@ -360,8 +395,8 @@ public:
          * the 2x2 luma block it covers, which is what YUV420 means. */
         for (unsigned oy = 0; oy < oh; oy += 2)
         {
-            const unsigned sy0 = srcRow(oy);
-            const unsigned sy1 = srcRow(oy + 1);
+            const unsigned sy0 = ccmp_preview_src_row(geom_, oy);
+            const unsigned sy1 = ccmp_preview_src_row(geom_, oy + 1);
             uint8_t *y0 = yp + static_cast<size_t>(oy) * ys;
             uint8_t *y1 = yp + static_cast<size_t>(oy + 1) * ys;
             uint8_t *u = up + static_cast<size_t>(oy / 2) * cs;
@@ -369,8 +404,8 @@ public:
 
             for (unsigned ox = 0; ox < ow; ox += 2)
             {
-                const unsigned sx0 = srcCol(ox);
-                const unsigned sx1 = srcCol(ox + 1);
+                const unsigned sx0 = ccmp_preview_src_col(geom_, ox);
+                const unsigned sx1 = ccmp_preview_src_col(geom_, ox + 1);
 
                 float rgb[4][3];
                 quadRgb(raw, sx0, sy0, rgb[0]);
@@ -396,18 +431,6 @@ public:
 private:
     static constexpr size_t kGammaSize = 4096;
 
-    /* Nearest source quad, snapped to the even origin of a Bayer cell. */
-    unsigned srcRow(unsigned oy) const
-    {
-        const unsigned r = static_cast<unsigned>(static_cast<uint64_t>(oy) * geom_.raw_height / geom_.out_height);
-        return std::min(r & ~1u, geom_.raw_height - 2);
-    }
-    unsigned srcCol(unsigned ox) const
-    {
-        const unsigned c = static_cast<unsigned>(static_cast<uint64_t>(ox) * geom_.raw_width / geom_.out_width);
-        return std::min(c & ~1u, geom_.raw_width - 2);
-    }
-
     /* One Bayer quad -> gamma-encoded R'G'B' in 0..1. */
     void quadRgb(const uint8_t *raw, unsigned sx, unsigned sy, float out[3]) const
     {
@@ -426,6 +449,15 @@ private:
         const unsigned hi = std::max(std::max(c0, c1), std::max(c2, c3));
         if (hi > max_code_)
             max_code_ = hi;
+
+        /* Shadow-mode feed: the quad's min alongside the max already computed
+         * above is exactly what ClipPlateauDetector::add() wants, and it costs
+         * nothing extra to compute since c0..c3 are already in registers. */
+        if (det_)
+        {
+            const unsigned lo = std::min(std::min(c0, c1), std::min(c2, c3));
+            det_->add(lo, hi);
+        }
 
         const float s[4] = { lin_[c0], lin_[c1], lin_[c2], lin_[c3] };
 
@@ -578,6 +610,8 @@ private:
 
     bool ready_ = false;
     CcmpPreviewGeometry geom_;
+    /* Shadow-mode only — see setPlateauDetector(). Not owned. */
+    ClipPlateauDetector *det_ = nullptr;
     std::vector<float> lin_;
     float m_[9] = { 1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f };
     float gamma_[kGammaSize] = {};

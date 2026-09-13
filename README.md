@@ -367,6 +367,7 @@ The log should show `Selected sensor format: 3856x2180-SRGGB16_1X16` and
 - analogue gain caps at code 80 (≈ 15.8×, ISO 1580 in CineMate terms)
 - each 3856×2180 DNG is ≈ 16.9 MB (plan storage bandwidth: 15 fps ≈ 252 MB/s)
 - set exposure and colour gains manually via Redis (`iso`, `shutter_s`/`shutter_a`, `cg_rb`)
+- the sensor's HG/LG merge still clamps digitally in 16-bit — no compander is involved, but a blown highlight still arrives with R, G and B on nearly the same raw code, which renders pink under real white-balance gains the same way 12-bit's clamp renders magenta. `ccmpPreview` keeps the ISP's own render (it is correct everywhere else) and neutralises only that zone in place, in the HDMI preview, the MJPEG view and the embedded DNG thumbnail; the clamp code is not a sensor constant (it moves with analogue gain), so the anchor is measured off the raw every frame rather than looked up in a table. Above the code-80 analogue-gain cap, a higher ISO only adds ISP digital gain to the preview and thumbnail — the recorded DNG does not get brighter.
 
 ### 12-bit ClearHDR (CCMP12)
 

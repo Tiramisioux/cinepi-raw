@@ -23,9 +23,17 @@
  * not chosen: on the binned mode's middle segment one code is 64 L, so two
  * channels of one neutral patch land on grid points that are not in the same
  * ratio. That residual is the sensor's, not the renderer's.
+ *
+ * run_neutraliser() and run_shadow_detector() below cover the two other
+ * pure-header consumers this file's include already pulls in transitively
+ * (clip_plateau.hpp) or explicitly (clip_neutralise.hpp): the 16-bit
+ * ClearHDR in-place neutraliser, and CcmpPreviewRenderer's shadow-mode
+ * detector hook. Same reason as the rest of this file — no libcamera, same
+ * code that ships.
  */
 
 #include "cinepi/ccmp_preview.hpp"
+#include "cinepi/clip_neutralise.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -582,6 +590,222 @@ void run_mono()
           "Y1=" + std::to_string(px.y) + " Y2=" + std::to_string(px2.y));
 }
 
+/* ── HighlightNeutraliser: 16-bit ClearHDR's in-place clamp correction ──────
+ *
+ * Unlike the 12-bit renderer, this class does not build the YUV it corrects —
+ * it is handed the ISP's own render and a raw plane, and has to find the same
+ * quad under a pixel the ISP already produced. The geometry here (3840x2200
+ * -> 640x360, raw_shift 0) is the real 16-bit ClearHDR 4K shape, and the two
+ * non-clamped patches (a bright neutral well under the anchor, and a
+ * saturated red) exist so the test also proves the correction stays OUT of
+ * areas that are merely bright or merely colourful — the same distinction
+ * desaturateHighlight() draws for 12-bit, on a pixel this class never
+ * rendered itself. */
+void run_neutraliser()
+{
+    std::cout << "\nHighlightNeutraliser: 16-bit in-place clamp correction\n";
+
+    CcmpPreviewGeometry geom;
+    geom.raw_width = 3840;
+    geom.raw_height = 2200;
+    geom.raw_stride = static_cast<size_t>(geom.raw_width) * 2;
+    geom.raw_shift = 0; /* 16-bit container, 16-bit mode: nothing to shift off */
+    geom.out_width = 640;
+    geom.out_height = 360;
+    geom.out_stride = geom.out_width;
+
+    HighlightNeutraliser n;
+    std::string err;
+    if (!n.configure(geom, &err))
+    {
+        check(false, "neutraliser configure", err);
+        return;
+    }
+    const double kRolloff = 0.02;
+    n.setWhite(235);
+
+    /* Raw: left half (x < 1920) every quad at the take-191155 plateau code
+     * 54100. Right half split into a bright neutral patch (G 45000, R 25000,
+     * B 26500 — well under any anchor this plateau will produce) and a
+     * saturated red patch (R 50000, G 10000, B 8000) — neither converged
+     * (mn/mx far below 0.9) nor anywhere near the clamp. */
+    std::vector<uint8_t> raw(geom.raw_stride * geom.raw_height, 0);
+    const uint16_t neutral[4] = { 25000, 45000, 45000, 26500 }; /* R,G,G,B raster order */
+    const uint16_t red[4] = { 50000, 10000, 10000, 8000 };
+    for (unsigned y = 0; y < geom.raw_height; ++y)
+    {
+        uint16_t *row = reinterpret_cast<uint16_t *>(raw.data() + static_cast<size_t>(y) * geom.raw_stride);
+        const unsigned parity_row = (y & 1u) * 2;
+        for (unsigned x = 0; x < geom.raw_width; ++x)
+        {
+            if (x < 1920)
+                row[x] = 54100;
+            else if (x < 2880)
+                row[x] = neutral[parity_row + (x & 1u)];
+            else
+                row[x] = red[parity_row + (x & 1u)];
+        }
+    }
+
+    /* Lores: the ISP's own render, stood in for by hand. Left half already
+     * pink (the defect this class exists to fix); right half an arbitrary,
+     * distinguishable colour that must come through untouched. */
+    std::vector<uint8_t> orig(geom.out_stride * geom.out_height * 3 / 2, 0);
+    uint8_t *oy_ = orig.data();
+    uint8_t *ou_ = oy_ + geom.out_stride * geom.out_height;
+    uint8_t *ov_ = ou_ + (geom.out_stride / 2) * (geom.out_height / 2);
+    for (unsigned y = 0; y < geom.out_height; ++y)
+        for (unsigned x = 0; x < geom.out_width; ++x)
+            oy_[y * geom.out_stride + x] = (x < 320) ? 217 : 150;
+    for (unsigned y = 0; y < geom.out_height / 2; ++y)
+        for (unsigned x = 0; x < geom.out_width / 2; ++x)
+        {
+            const size_t idx = y * (geom.out_stride / 2) + x;
+            ou_[idx] = (x < 160) ? 138 : 100;
+            ov_[idx] = (x < 160) ? 140 : 160;
+        }
+
+    /* Anchor 0 (off) must leave the buffer byte-identical, even with a
+     * detector attached — the detector only ever READS the raw plane. */
+    ClipPlateauDetector det;
+    check(det.configure(16), "detector configure(16)");
+    n.setAnchor(0, kRolloff);
+
+    std::vector<uint8_t> pass1 = orig;
+    n.apply(raw.data(), pass1.data(), &det);
+    check(pass1 == orig, "anchor 0 leaves the lores byte-identical, detector attached or not");
+
+    ClipPlateauDetector::Result result;
+    check(det.detect(result), "the detector finds the plateau during the anchor-0 pass");
+    check(result.floor >= 54000 && result.floor <= 54100, "floor lands in the measured plateau",
+          "floor=" + std::to_string(result.floor));
+
+    /* Adopt the measured anchor (what ccmpPreviewStage.cpp's Process() does
+     * after detect()), and reset the observability counters so the numbers
+     * checked below describe only the pass that follows -- the anchor-0 pass
+     * above legitimately reports every quad as "undesaturated", including the
+     * 54100 plateau, which would otherwise poison maxUndesaturatedCode(). */
+    n.setAnchor(result.anchor, kRolloff);
+    n.resetMaxCode();
+
+    std::vector<uint8_t> pass2 = orig;
+    n.apply(raw.data(), pass2.data(), nullptr);
+
+    bool left_white = true;
+    std::string left_detail;
+    for (unsigned y = 0; y < geom.out_height && left_white; ++y)
+        for (unsigned x = 0; x < 320; ++x)
+        {
+            const uint8_t got = pass2[y * geom.out_stride + x];
+            if (got != 235)
+            {
+                left_white = false;
+                left_detail = "first bad at (" + std::to_string(x) + "," + std::to_string(y) +
+                              ") Y=" + std::to_string(got);
+                break;
+            }
+        }
+    check(left_white, "left half (the clamp) reaches white Y=235", left_detail);
+
+    bool chroma_ok = true;
+    for (unsigned y = 0; y < geom.out_height / 2 && chroma_ok; ++y)
+        for (unsigned x = 0; x < 160; ++x)
+        {
+            const size_t idx = y * (geom.out_stride / 2) + x;
+            if (pass2[geom.out_stride * geom.out_height + idx] != 128 ||
+                pass2[geom.out_stride * geom.out_height + (geom.out_stride / 2) * (geom.out_height / 2) + idx] != 128)
+                chroma_ok = false;
+        }
+    check(chroma_ok, "left half chroma reaches neutral U=V=128");
+
+    /* Right half of Y, U and V must match the untouched original exactly. */
+    bool right_untouched = true;
+    for (unsigned y = 0; y < geom.out_height && right_untouched; ++y)
+        for (unsigned x = 320; x < geom.out_width; ++x)
+            if (pass2[y * geom.out_stride + x] != orig[y * geom.out_stride + x])
+                right_untouched = false;
+    for (unsigned y = 0; y < geom.out_height / 2 && right_untouched; ++y)
+        for (unsigned x = 160; x < geom.out_width / 2; ++x)
+        {
+            const size_t idx = y * (geom.out_stride / 2) + x;
+            const size_t voff = (geom.out_stride / 2) * (geom.out_height / 2);
+            if (pass2[geom.out_stride * geom.out_height + idx] != orig[geom.out_stride * geom.out_height + idx] ||
+                pass2[geom.out_stride * geom.out_height + voff + idx] != orig[geom.out_stride * geom.out_height + voff + idx])
+                right_untouched = false;
+        }
+    check(right_untouched, "right half (neutral-bright and saturated-red patches) is untouched");
+
+    check(n.fullyDesaturated() > 0, "the plateau is reported fully desaturated",
+          "fullyDesaturated=" + std::to_string(n.fullyDesaturated()));
+    check(n.maxUndesaturatedCode() < static_cast<unsigned>(result.anchor * 0.98),
+          "the brightest untouched code sits well under the anchor",
+          "maxUndesaturatedCode=" + std::to_string(n.maxUndesaturatedCode()) +
+          " anchor=" + std::to_string(result.anchor));
+    check(n.maxCodeSeen() == 54100, "and the peak code seen is the plateau itself",
+          "maxCodeSeen=" + std::to_string(n.maxCodeSeen()));
+}
+
+/* ── CcmpPreviewRenderer's shadow-mode detector hook (12-bit) ───────────────
+ *
+ * The 12-bit path's own rendering must not change by one byte when a
+ * ClipPlateauDetector is attached — the detector only ever reads what
+ * quadRgb() already computed. This is the check the hardware-log's open
+ * question ("do the 12-bit anchors also drift with gain?") depends on being
+ * true: the shadow measurement has to be free to run on every take without
+ * risk to the picture. */
+void run_shadow_detector()
+{
+    std::cout << "\nshadow-mode plateau detector (12-bit)\n";
+
+    CcmpParams params;
+    if (!ccmp_params_for_binning(1.0, params))
+    {
+        check(false, "shadow params for binning");
+        return;
+    }
+    CcmpLut lut;
+    std::string err;
+    if (!lut.build(params, &err))
+    {
+        check(false, "shadow lut.build", err);
+        return;
+    }
+
+    CcmpPreviewGeometry geom = geometry_for(3856, 2180, 640, 360);
+    CcmpPreviewRenderer r;
+    if (!r.configure(geom, lut, &err))
+    {
+        check(false, "shadow configure", err);
+        return;
+    }
+    CcmpPreviewColour colour;
+    colour.r_gain = kRGain;
+    colour.b_gain = kBGain;
+    r.setColour(colour);
+
+    /* The 2026-09-06/07 measured take: every photosite clamped on one code,
+     * 2974, the middle of that take's magenta area. */
+    const std::vector<uint8_t> raw = make_clamped_frame(geom, 2974);
+
+    std::vector<uint8_t> without(geom.out_stride * geom.out_height * 3 / 2, 0);
+    r.render(raw.data(), without.data());
+
+    ClipPlateauDetector det;
+    check(det.configure(12), "shadow detector configure(12)");
+    r.setPlateauDetector(&det);
+
+    std::vector<uint8_t> with(geom.out_stride * geom.out_height * 3 / 2, 0);
+    r.render(raw.data(), with.data());
+    r.setPlateauDetector(nullptr);
+
+    check(without == with, "attaching the shadow detector changes no rendered byte");
+
+    ClipPlateauDetector::Result result;
+    check(det.detect(result), "shadow detector finds the plateau");
+    check(result.floor >= 2970 && result.floor <= 2978, "floor within 4 codes of the measured 2974",
+          "floor=" + std::to_string(result.floor));
+}
+
 } // namespace
 
 /* The anchor has to differ per binning, or fixing full res leaves HD magenta —
@@ -611,6 +835,8 @@ int main()
     run_common();
     run_mono();
     run_anchor_table();
+    run_neutraliser();
+    run_shadow_detector();
 
     std::cout << "\n" << (g_failures ? "FAILED " : "PASSED ") << g_failures << " failure(s)\n";
     return g_failures ? 1 : 0;
