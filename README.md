@@ -276,25 +276,27 @@ raw frame just to show one. Two Redis keys control it:
 
 | Redis key | Range | Live? | What it does |
 |---|---|---|---|
-| `thumbnail` | 0 off / 1 mono / 2 colour | Live — read once at the first frame of each take, so a change lands on the *next* take, not mid-take | Whether IFD1 is written at all, and whether it's mono (1 byte/px) or colour (3 bytes/px). **Default 1 (mono)** — operator decision 2026-09-13, for efficiency; the Playback pane and its take strip render greyscale as a result. `set thumbnail 2` restores colour, at three times the bytes below |
-| `thumbnail_size` | 0–12 (right shift of the lores plane) | Restarts the camera on change | How large the thumbnail is: 0 = the full lores plane, 1 = half each side, 2 = quarter, … Default **1** |
+| `thumbnail` | 0 off / 1 mono / 2 colour | Live — read once at the first frame of each take, so a change lands on the *next* take, not mid-take | Whether IFD1 is written at all, and whether it's mono (1 byte/px) or colour (3 bytes/px). **Default 2 (colour)** — operator decision 2026-09-13; at the quarter-size default below, colour costs fewer bytes than mono did at half size, so there is no size/colour trade-off to make. `set thumbnail 1` gives mono, at a third of the bytes below, for anyone who wants it lighter still |
+| `thumbnail_size` | 0–12 (right shift of the lores plane) | Restarts the camera on change | How large the thumbnail is: 0 = the full lores plane, 1 = half each side, 2 = quarter, … **Default 2** |
 
 The formula (`cinepi/dng_thumbnail.hpp`, `thumbnail_geometry()`): thumbnail
 bytes = `(lores_w >> thumbnail_size) × (lores_h >> thumbnail_size) × spp`,
 `spp` 3 for colour or 1 for mono. Measured per-frame cost at each shift
 (`development/dng-thumbnail-cost/FINDINGS.md` §2; the 2026-09-13
-hardware-log entry in `cinemate-handbook`), **mono** — the shipped mode
-default; multiply every figure by 3 for colour:
+hardware-log entry in `cinemate-handbook`), **colour** — the shipped mode
+default; divide every figure by 3 for mono:
 
-| Mode | Raw strip | shift 0 (full lores) | shift 1 (640×360, **default**) | shift 2 (320×180) |
+| Mode | Raw strip | shift 0 (full lores) | shift 1 (640×360) | shift 2 (320×180, **default**) |
 |---|---|---|---|---|
-| 4K 12-bit (3840×2160) | 12,441,600 B | +921,600 B = +7.4% | +230,400 B = +1.9% | +57,600 B = +0.5% |
-| 4K 16-bit ClearHDR (3840×2200, lores 1256×720) | 16,896,000 B | +904,320 B = +5.4% | +226,080 B = +1.3% | +56,520 B = +0.3% |
-| HD 12-bit (1920×1080) | 3,110,400 B | +921,600 B = +29.6% | +230,400 B = +7.4% | +57,600 B = +1.9% |
+| 4K 12-bit (3840×2160) | 12,441,600 B | +2,764,800 B = +22.2% | +691,200 B = +5.6% | +172,800 B = +1.4% |
+| 4K 16-bit ClearHDR (3840×2200, lores 1256×720) | 16,896,000 B | +2,712,960 B = +16.1% | +678,240 B = +4.0% | +169,560 B = +1.0% |
+| HD 12-bit (1920×1080) | 3,110,400 B | +2,764,800 B = +88.9% | +691,200 B = +22.2% | +172,800 B = +5.6% |
 
-In colour (`set thumbnail 2`), each figure above triples: shift 0 is
-2,764,800 B/frame (+22.2% at 4K 12-bit, +88.9% at HD 12-bit) — this is
-what CineMate 3.4 actually shipped with before this fix.
+In mono (`set thumbnail 1`), each figure above is a third: the shipped
+default (shift 2) is 57,600 B/frame instead of 172,800 B. Shift 0 in
+colour — 2,764,800 B/frame — is what CineMate 3.4 actually shipped with
+before this fix, on every frame regardless of shift (`thumbnail_size` was
+reseeded to 0 on every boot with no owner).
 
 `thumbnail_size` is a per-install choice, not a per-take one — CineMate
 seeds it at boot from `image_capture.thumbnail_size` in `settings.jsonc`

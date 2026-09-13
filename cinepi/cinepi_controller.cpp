@@ -22,30 +22,34 @@ using namespace std::chrono;
 #define CP_DEF_SHUTTER 50
 #define CP_DEF_AWB 1
 #define CP_DEF_COMPRESS 0
-// 1 (mono). Operator decision 2026-09-13, for efficiency: mono is one
-// byte per pixel against colour's three. The embedded thumbnail is the
-// standard playback path -- raw decode is far more demanding on the Pi
-// and is no longer the pane's fallback (see playback.py on the cinemate
-// side) -- so the Playback pane and its take strip render greyscale as a
-// result; `set thumbnail 2` restores colour at three times the bytes. A
+// 2 (colour). Operator decision 2026-09-13 (final, supersedes an interim
+// mono default): colour at quarter size (see CP_DEF_THUMBNAIL_SIZE below,
+// 320x180 = 172,800 B/frame) costs fewer bytes than mono at half size
+// (640x360 = 230,400 B/frame) while giving the Playback pane a real
+// colour preview, so there is no longer a size/colour trade-off to make.
+// The embedded thumbnail is the standard playback path -- raw decode is
+// far more demanding on the Pi and is no longer the pane's fallback (see
+// playback.py on the cinemate side). `set thumbnail 1` still gives mono,
+// at a third of the bytes, for anyone who wants it lighter still. A
 // standalone cinepi-raw run (no CineMate seeding image_capture.thumbnail
 // into redis before launch), a flushed redis, or a start before that
 // seed runs now gets the same default CineMate ships.
-#define CP_DEF_THUMBNAIL 1
+#define CP_DEF_THUMBNAIL 2
 // thumbnail_size is a right-shift applied to the lores plane inside
-// dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 1 is
-// the default: half the lores plane. At the mono default above that is
-// 640x360 = 230,400 B/frame; 0 (full lores) is 1280x720 mono =
-// 921,600 B/frame, and 2 is 320x180 = 57,600 B/frame -- colour is three
-// times each figure (2,764,800 B/frame at shift 0 in colour, what
+// dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 2 is
+// the default: quarter the lores plane. At the colour default above that
+// is 320x180 = 172,800 B/frame -- +1.4% on a 4K 12-bit frame, +1.0% on 4K
+// 16-bit ClearHDR (1256x720 lores, 314x180 = 169,560 B), +5.6% on HD
+// 12-bit. Shift 0 (full lores) in colour is 2,764,800 B/frame, what
 // CineMate 3.4 actually shipped: +22% on a 4K 12-bit frame, +89% on HD
-// 12-bit -- FINDINGS.md and the 2026-09-13 hardware-log entry,
-// development/dng-thumbnail-cost/). CineMate seeds this key from
-// image_capture.thumbnail_size before cinepi-raw launches, so this default
-// only governs a standalone cinepi-raw run or a flushed redis. The redis
-// value found resident pre-feature (PI-008: thumbnail_size=50) predates
-// any consumer of this key and is not a default worth preserving.
-#define CP_DEF_THUMBNAIL_SIZE 1
+// 12-bit (FINDINGS.md and the 2026-09-13 hardware-log entry,
+// development/dng-thumbnail-cost/); shift 1 is 691,200 B. Mono is a third
+// of each figure. CineMate seeds this key from image_capture.thumbnail_size
+// before cinepi-raw launches, so this default only governs a standalone
+// cinepi-raw run or a flushed redis. The redis value found resident
+// pre-feature (PI-008: thumbnail_size=50) predates any consumer of this
+// key and is not a default worth preserving.
+#define CP_DEF_THUMBNAIL_SIZE 2
 
 /* ── imx585 ClearHDR live knobs ─────────────────────────────────────────────
  * The knobs are custom V4L2 controls on the sensor subdev; their IDs mirror
