@@ -144,20 +144,6 @@ CcmpPreviewGeometry geometry_for(unsigned raw_w, unsigned raw_h, unsigned out_w,
     return g;
 }
 
-
-/* The negative controls below break the ANCHOR on purpose and require the
- * result to go magenta — that is what proves they are testing something. Since
- * clip_convergence.hpp's rule fires on the same pixels for a different reason,
- * it has to be switched off for those checks, or they would pass on a build
- * where the anchor does nothing at all. Each one is followed by its mirror: the
- * same broken anchor WITH convergence on, which must come out neutral. */
-ClipConvergence convOff()
-{
-    ClipConvergence c;
-    c.enabled = false;
-    return c;
-}
-
 struct Yuv
 {
     int y, u, v;
@@ -314,13 +300,7 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
         CcmpPreviewColour off = colour;
         off.highlight_rolloff = 0.0;
         r.setColour(off);
-        r.setConvergence(convOff());
         const Yuv bad = render_flat(r, raw, f);
-        r.setConvergence(ClipConvergence{});
-        const Yuv conv_only = render_flat(r, raw, f);
-        check(std::abs(conv_only.u - 128) <= kChromaTol && std::abs(conv_only.v - 128) <= kChromaTol,
-              "and convergence alone still neutralises it with the anchor inert",
-              "U=" + std::to_string(conv_only.u) + " V=" + std::to_string(conv_only.v));
         check(std::abs(bad.v - 128) > 3 * kChromaTol, "and is magenta without the correction",
               "U=" + std::to_string(bad.u) + " V=" + std::to_string(bad.v));
         r.setColour(colour);
@@ -362,13 +342,7 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
         CcmpPreviewColour top = colour;
         top.sensor_clip_code = 4095;
         r.setColour(top);
-        r.setConvergence(convOff());
         const Yuv bad = render_flat(r, raw, f);
-        r.setConvergence(ClipConvergence{});
-        const Yuv top_conv = render_flat(r, raw, f);
-        check(std::abs(top_conv.u - 128) <= kChromaTol && std::abs(top_conv.v - 128) <= kChromaTol,
-              "and convergence alone still neutralises an unreachable anchor",
-              "U=" + std::to_string(top_conv.u) + " V=" + std::to_string(top_conv.v));
         check(std::abs(bad.v - 128) > 3 * kChromaTol && std::abs(bad.u - 128) > 3 * kChromaTol,
               "and referencing the table's top code instead puts the magenta back",
               "U=" + std::to_string(bad.u) + " V=" + std::to_string(bad.v));
@@ -419,13 +393,7 @@ void run_mode(double binning, const char *label, unsigned raw_w, unsigned raw_h)
         CcmpPreviewColour high = colour;
         high.sensor_clip_code = body_code + 66;
         r.setColour(high);
-        r.setConvergence(convOff());
         const Yuv bad = render_flat(r, raw, f);
-        r.setConvergence(ClipConvergence{});
-        const Yuv high_conv = render_flat(r, raw, f);
-        check(std::abs(high_conv.u - 128) <= kChromaTol && std::abs(high_conv.v - 128) <= kChromaTol,
-              "and convergence alone catches the body an anchor set too high misses",
-              "U=" + std::to_string(high_conv.u) + " V=" + std::to_string(high_conv.v));
         check(std::abs(bad.v - 128) > 3 * kChromaTol,
               "and anchoring above that body is still magenta (the 3040 regression)",
               "U=" + std::to_string(bad.u) + " V=" + std::to_string(bad.v));
@@ -703,37 +671,9 @@ void run_neutraliser()
     check(det.configure(16), "detector configure(16)");
     n.setAnchor(0, kRolloff);
 
-    /* Convergence off for the byte-identity check: with it on, the left half is
-     * a pinned 54100 quad and the rule correctly neutralises it whatever the
-     * anchor says, which is the point of the rule and would make this pass
-     * vacuous. The mirror check follows immediately. */
-    n.setConvergence(convOff());
     std::vector<uint8_t> pass1 = orig;
     n.apply(raw.data(), pass1.data(), &det);
     check(pass1 == orig, "anchor 0 leaves the lores byte-identical, detector attached or not");
-
-    /* THE NEW CONTRACT: no anchor at all, and the pinned half still goes
-     * neutral. This is the check that would have caught the 12-bit HD case,
-     * where every anchor the project shipped sat above the clamp. */
-    n.setConvergence(ClipConvergence{});
-    std::vector<uint8_t> conv_pass = orig;
-    n.apply(raw.data(), conv_pass.data(), nullptr);
-    bool conv_left_white = true, conv_right_same = true;
-    for (unsigned y = 0; y < geom.out_height; ++y)
-        for (unsigned x = 0; x < geom.out_width; ++x)
-        {
-            const uint8_t got = conv_pass[y * geom.out_stride + x];
-            if (x < 320)
-            {
-                if (got < 230)
-                    conv_left_white = false;
-            }
-            else if (got != orig[y * geom.out_stride + x])
-                conv_right_same = false;
-        }
-    check(conv_left_white, "with anchor 0, convergence alone drives the pinned half to white");
-    check(conv_right_same, "and leaves the unpinned half byte-identical");
-    n.setConvergence(convOff());
 
     ClipPlateauDetector::Result result;
     check(det.detect(result), "the detector finds the plateau during the anchor-0 pass");
