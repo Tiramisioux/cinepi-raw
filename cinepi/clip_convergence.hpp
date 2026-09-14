@@ -41,17 +41,6 @@
  * agrees with every other one, so a dark frame is trivially "converged". The
  * gate is what keeps this off the shadows, not what identifies the clamp.
  *
- * ONE PIXEL IS NEVER A CLAMP. Even with the gate raised, a per-pixel rule on
- * noisy data fires on a few hundred scattered pixels per frame — measured at
- * 245 and 498 on the two 16-bit takes — and scattered single pixels driven to
- * white are exactly as objectionable as the pink they replaced. A clamp is a
- * REGION: it covers a lamp, a window, a sky. So the callers take the WEAKEST
- * blend across each 2x2 output block and apply that to all four pixels, which
- * costs nothing (both render loops already walk in 2x2 blocks for YUV420
- * chroma) and takes the isolated count to zero on all three takes, for about
- * 1% of coverage at the blob edge. Use clip_convergence_block() rather than
- * applying the per-pixel value directly.
- *
  * This is a MONITORING correction. It has no counterpart in the recorded DNG
  * and must not grow one: the file's job is to carry the clamped channels as
  * they were, so a grade can decide what to do with them.
@@ -68,19 +57,15 @@ struct ClipConvergence
      * ratio_hi the pixel is driven fully neutral. The measured separation is
      * 0.912/0.939-p95 for real colour against 0.992-p5 for the clamp, so the
      * ramp sits in the gap rather than on either population. */
-    float ratio_lo = 0.98f;
-    float ratio_hi = 0.997f;
+    float ratio_lo = 0.97f;
+    float ratio_hi = 0.995f;
 
     /* Ramp on the brightest channel, normalised linear above black. Keeps the
      * rule off the shadows, where channels agree for a different reason. The
-     * dimmest clamp measured is 0.56 of full scale, so this sits well under
-     * both measured clamps while keeping the rule out of the mid-tones, where
-     * an ordinary colour can have its top two channels close together and a
-     * single noisy pixel then fires on its own. The first shipped values were
-     * 0.15/0.25 and that is exactly what went wrong: white speckle in every
-     * HDR mode. */
-    float level_lo = 0.40f;
-    float level_hi = 0.50f;
+     * dimmest clamp measured is 0.56 of full scale; the brightest thing this
+     * excludes is a shadow at 0.01. */
+    float level_lo = 0.15f;
+    float level_hi = 0.25f;
 
     bool enabled = true;
 };
@@ -117,14 +102,6 @@ inline float clip_convergence_blend(float r, float g, float b, const ClipConverg
     const float s_ratio = r_span > 1e-6f ? std::min(1.f, (ratio - c.ratio_lo) / r_span) : 1.f;
     const float s_level = l_span > 1e-6f ? std::min(1.f, (mx - c.level_lo) / l_span) : 1.f;
     return s_ratio * s_level;
-}
-
-/* The weakest of a 2x2 output block — see "ONE PIXEL IS NEVER A CLAMP". Applied
- * to the COMBINED blend (anchor and convergence both), because the anchor
- * speckles for the same reason whenever the clamp code straddles it. */
-inline float clip_convergence_block(float s0, float s1, float s2, float s3)
-{
-    return std::min(std::min(s0, s1), std::min(s2, s3));
 }
 
 #endif /* CINEPI_CLIP_CONVERGENCE_HPP */

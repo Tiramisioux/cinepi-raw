@@ -413,33 +413,11 @@ public:
                 const unsigned sx0 = ccmp_preview_src_col(geom_, ox);
                 const unsigned sx1 = ccmp_preview_src_col(geom_, ox + 1);
 
-                float lin[4][3], want[4];
-                unsigned hi[4];
-                quadLinear(raw, sx0, sy0, lin[0], want[0], hi[0]);
-                quadLinear(raw, sx1, sy0, lin[1], want[1], hi[1]);
-                quadLinear(raw, sx0, sy1, lin[2], want[2], hi[2]);
-                quadLinear(raw, sx1, sy1, lin[3], want[3], hi[3]);
-
-                /* One pixel is never a clamp: the block agrees or nothing in it
-                 * moves. This covers the anchor as well as the convergence rule,
-                 * since a clamp code straddling the anchor speckles the same way. */
-                const float s = clip_convergence_block(want[0], want[1], want[2], want[3]);
-                if (s >= 0.99f)
-                    full_desat_ += 4;
-                else
-                {
-                    const unsigned worst = std::max(std::max(hi[0], hi[1]), std::max(hi[2], hi[3]));
-                    if (worst > max_undesat_)
-                        max_undesat_ = worst;
-                }
-
                 float rgb[4][3];
-                for (int q = 0; q < 4; ++q)
-                {
-                    applyDesaturation(lin[q], s);
-                    for (int row = 0; row < 3; ++row)
-                        rgb[q][row] = gammaEncode(lin[q][row]);
-                }
+                quadRgb(raw, sx0, sy0, rgb[0]);
+                quadRgb(raw, sx1, sy0, rgb[1]);
+                quadRgb(raw, sx0, sy1, rgb[2]);
+                quadRgb(raw, sx1, sy1, rgb[3]);
 
                 y0[ox] = luma(rgb[0]);
                 y0[ox + 1] = luma(rgb[1]);
@@ -460,8 +438,7 @@ private:
     static constexpr size_t kGammaSize = 4096;
 
     /* One Bayer quad -> gamma-encoded R'G'B' in 0..1. */
-    void quadLinear(const uint8_t *raw, unsigned sx, unsigned sy, float lin[3], float &blend,
-                    unsigned &peak_code) const
+    void quadRgb(const uint8_t *raw, unsigned sx, unsigned sy, float out[3]) const
     {
         const uint16_t *r0 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy) * geom_.raw_stride);
         const uint16_t *r1 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy + 1) * geom_.raw_stride);
@@ -533,13 +510,18 @@ private:
                                       : clip_convergence_blend(cam[CCMP_PREVIEW_R], cam[CCMP_PREVIEW_G],
                                                                cam[CCMP_PREVIEW_B], convergence_);
 
+        float lin[3];
         for (int row = 0; row < 3; ++row)
             lin[row] = m_[row * 3 + 0] * cam[0] + m_[row * 3 + 1] * cam[1] + m_[row * 3 + 2] * cam[2];
 
-        /* The blend this quad WANTS. What it gets is decided per 2x2 block in
-         * render(), because one pixel is never a clamp — clip_convergence.hpp. */
-        blend = highlightBlend(peak, conv);
-        peak_code = hi;
+        const float applied = desaturateHighlight(lin, peak, conv);
+        if (applied >= 0.99f)
+            ++full_desat_;
+        else if (hi > max_undesat_)
+            max_undesat_ = hi;
+
+        for (int row = 0; row < 3; ++row)
+            out[row] = gammaEncode(lin[row]);
     }
 
     /* ── the clipped-channel cast ─────────────────────────────────────────────
@@ -586,7 +568,7 @@ private:
      * well above the anchor while the body of the blown area sits below it and
      * desaturates by nothing, which is how both earlier anchors looked correct
      * in the log and did nothing on the picture. */
-    float highlightBlend(float peak, float conv) const
+    float desaturateHighlight(float lin[3], float peak, float conv) const
     {
         /* Two independent triggers, whichever fires harder. `peak` against the
          * table anchor is the original, and it is hardware-confirmed for full
@@ -598,19 +580,12 @@ private:
             s = std::min(1.f, (peak - hl_lo_) * hl_scale_);
         if (conv > s)
             s = conv;
-        return s > 0.f ? s : 0.f;
-    }
-
-    /* Drive a quad to neutral by `s`; it clamps to white downstream. Split from
-     * the decision above so render() can take the weakest blend across a 2x2
-     * block BEFORE any of the four pixels is touched. */
-    static void applyDesaturation(float lin[3], float s)
-    {
         if (!(s > 0.f))
-            return;
+            return 0.f;
         const float mx = std::max(lin[0], std::max(lin[1], lin[2]));
         for (int i = 0; i < 3; ++i)
             lin[i] += s * (mx - lin[i]);
+        return s;
     }
 
     float gammaEncode(float lin) const
