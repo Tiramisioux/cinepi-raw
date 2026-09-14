@@ -49,6 +49,13 @@ mhd_dep = dependency('nadjieb_mjpeg_streamer', required : true)
 cinepi_raw_dep += mhd_dep
 cinepi_raw_dep += alsa_dep
 cinepi_raw_dep += udev_dep
+# The DNG thumbnail's JPEG mode (dng_encoder.cpp, thumbnail=3): jpeg_dep is
+# declared once, in image/meson.build (subdir('image') runs before
+# subdir('cinepi') in the root meson.build), where it is also folded into
+# rpicam_app_dep for encoder/mjpeg_encoder.cpp. dng_encoder.cpp is compiled
+# as one of THIS executable's own sources (not through rpicam_app), so its
+# #include <jpeglib.h> needs jpeg_dep on cinepi_raw_dep directly too.
+cinepi_raw_dep += jpeg_dep
 
 cinepi_raw = executable('cinepi-raw', sources,
              include_directories : [include_directories('..')],
@@ -85,6 +92,16 @@ ifd_builder_test = executable('ifd_builder_test',
            include_directories : [include_directories('..')],
            install : false)
 test('ifd_builder', ifd_builder_test)
+
+# Unit tests for the DNG embedded-thumbnail geometry formula -- the single
+# source setup_encoder()'s buffer reservation and dng_save()'s IFD1 write
+# both call. No libcamera deps — it includes only cinepi/dng_thumbnail.hpp.
+# Run with `meson test`.
+dng_thumbnail_test = executable('dng_thumbnail_test',
+           '../tests/dng_thumbnail_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('dng_thumbnail', dng_thumbnail_test)
 
 # Unit tests for the CineMate Log curve engine. No libcamera / jsoncpp deps — it
 # includes only cinepi/log_lut.hpp (the spec loader in log_lut.cpp is what needs

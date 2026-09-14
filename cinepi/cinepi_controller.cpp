@@ -22,20 +22,45 @@ using namespace std::chrono;
 #define CP_DEF_SHUTTER 50
 #define CP_DEF_AWB 1
 #define CP_DEF_COMPRESS 0
-// 2 (colour). G10/G11 verified on hardware and the operator has made the
-// embedded thumbnail the standard playback path -- raw decode is far more
-// demanding on the Pi and is no longer the pane's fallback (see playback.py
-// on the cinemate side). A standalone cinepi-raw run (no CineMate seeding
-// image_capture.thumbnail into redis before launch), a flushed redis, or a
-// start before that seed runs now gets the same default CineMate ships.
-#define CP_DEF_THUMBNAIL 2
+// 3 (colour JPEG). Operator decision 2026-09-13, the settled one after two
+// same-day revisions (mono at half, then colour at quarter, then this). The
+// embedded thumbnail is the Playback pane's ONLY path to a picture -- raw
+// decode is far more demanding on the Pi and is not the pane's fallback (see
+// playback.py on the cinemate side) -- so the default has to be a mode that
+// gives a real preview, and JPEG gives a colour one for a fortieth of the
+// bytes uncompressed colour costs at the same size.
+//
+// Measured on hardware the same day at 4K 16-bit ClearHDR with CineMate Log
+// 12 (the 2026-09-13 benchmark entry in cinemate-handbook's hardware log):
+// JPEG at shift 1 is ~16 KB/frame against 678,240 B for uncompressed colour,
+// and costs +4.0 ms/frame of encode time (+18% over no thumbnail at all) --
+// the most of the four modes, but against a 40 ms frame budget at 25 fps,
+// with zero dropped frames and a disk queue that never exceeded 2. On a
+// log-encoded take the LUT pass dominates dng_save() so completely that the
+// thumbnail's whole cost is a small fraction of it.
+//
+// Modes 0-2 (off / mono / uncompressed colour) are unchanged and fully
+// supported; CineMate's settings editor exposes only an on/off toggle over
+// this key, and everything else is reachable from settings.jsonc or
+// `set thumbnail`.
+#define CP_DEF_THUMBNAIL 3
 // thumbnail_size is a right-shift applied to the lores plane inside
-// dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 0 is
-// the default: it is what every size/cost figure in the C9 plan and
-// GATES.md assumes (the 1272x720 lores frame, unscaled). The redis value
-// found resident pre-feature (PI-008: thumbnail_size=50) predates any
-// consumer of this key and is not a default worth preserving.
-#define CP_DEF_THUMBNAIL_SIZE 0
+// dng_save() (0 = full lores resolution, 1 = half, 2 = quarter, ...). 1 is
+// the default: half the lores plane, 640x360 from a 16:9 lores stream and
+// 628x360 from the ClearHDR one. At the JPEG default above that is roughly
+// 16 KB/frame (measured); at mode 2, uncompressed colour, the same size is
+// 691,200 B -- +5.6% on a 4K 12-bit frame, +4.0% on 4K 16-bit ClearHDR,
+// +22.2% on HD 12-bit. Shift 0 (full lores) in colour is 2,764,800 B/frame, what
+// CineMate 3.4 actually shipped: +22% on a 4K 12-bit frame, +89% on HD
+// 12-bit; shift 2 (quarter, the previous default) is 172,800 B/frame
+// (FINDINGS.md and the 2026-09-13 hardware-log entry,
+// development/dng-thumbnail-cost/). Mono is a third of each figure.
+// CineMate seeds this key from image_capture.thumbnail_size before
+// cinepi-raw launches, so this default only governs a standalone
+// cinepi-raw run or a flushed redis. The redis value found resident
+// pre-feature (PI-008: thumbnail_size=50) predates any consumer of this
+// key and is not a default worth preserving.
+#define CP_DEF_THUMBNAIL_SIZE 1
 
 /* ── imx585 ClearHDR live knobs ─────────────────────────────────────────────
  * The knobs are custom V4L2 controls on the sensor subdev; their IDs mirror
@@ -249,7 +274,14 @@ void CinePIController::sync(){
 
     auto thumbnail = pipe_replies.get<OptionalString>(8);
     if(thumbnail){
-        thumbnail_ = stoi(*thumbnail);
+        /* Clamped here too, not just in setup_encoder(): thumbnail_size_'s
+         * sync() read a few lines below already refuses an out-of-range
+         * resident value rather than pass it on, and this brings thumbnail_
+         * to the same standard -- 0..3 now that mode 3 (colour JPEG) exists.
+         * dng_save() clamps again regardless (defence in depth, not a
+         * substitute), but a value that never reaches options_->thumbnail
+         * out of range is safer than trusting the write path alone. */
+        thumbnail_ = std::clamp(stoi(*thumbnail), 0, 3);
     }else{
         thumbnail_ = CP_DEF_THUMBNAIL;
         redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_));
@@ -267,11 +299,14 @@ void CinePIController::sync(){
          * to 12 and, against CineMate's 1272-wide lores plane, produces
          * a 1x1 thumbnail (1272 >> 12 == 0, floored to 1) -- silently,
          * since dng_save() never rejects a shift, only floors it. Refuse
-         * and re-seed rather than accept a value that quietly launches
-         * the +7-22% write-cost feature and delivers nothing. Skipped
-         * when lores_width is 0 (no lores stream configured at all --
-         * standalone cinepi-raw with no --lores-width -- where the
-         * thumbnail is unreachable anyway; see dng_save()'s lomem guard). */
+         * and re-seed rather than accept a value that quietly pays the
+         * per-frame thumbnail cost (up to +89% on HD 12-bit at shift 0 --
+         * FINDINGS.md and the 2026-09-13 hardware-log entry,
+         * development/dng-thumbnail-cost/) and delivers a thumbnail no
+         * reader can use. Skipped when lores_width is 0 (no lores stream
+         * configured at all -- standalone cinepi-raw with no
+         * --lores-width -- where the thumbnail is unreachable anyway; see
+         * dng_save()'s lomem guard). */
         if (options_->lores_width && (options_->lores_width >> clamped) < 16) {
             console->warn("thumbnail_size={} (clamped {}) would collapse the {}px-wide "
                           "lores thumbnail below 16px; resetting to the default {}",
@@ -871,13 +906,17 @@ void CinePIController::mainThread(){
              * throws std::invalid_argument uncaught, from inside a pub/sub
              * callback -- matching the try/catch + !empty() shape every
              * other live numeric knob here already uses (CONTROL_KEY_HDR_
-             * BLEND etc.). dng_save() clamps to 0..2 regardless, but a
-             * value that never reaches options_->thumbnail at all is
-             * safer than trusting the write path to clamp what should
-             * never have parsed. */
+             * BLEND etc.). dng_save() clamps to 0..3 regardless (0 off, 1
+             * mono, 2 colour, 3 colour JPEG -- kThumbnailJpegQuality in
+             * dng_encoder.cpp), but a value that never reaches
+             * options_->thumbnail at all is safer than trusting the write
+             * path to clamp what should never have parsed. Mode 3 costs
+             * the most CPU (YUV->RGB plus the JPEG encode) for the fewest
+             * bytes per frame -- FINDINGS.md §2b,
+             * development/dng-thumbnail-cost/. */
             if(r && !r->empty()) {
                 try {
-                    options_->thumbnail = std::clamp(stoi(*r), 0, 2);
+                    options_->thumbnail = std::clamp(stoi(*r), 0, 3);
                 } catch (...) {}
             }
         }},
