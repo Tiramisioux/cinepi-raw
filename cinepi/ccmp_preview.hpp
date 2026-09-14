@@ -51,17 +51,10 @@
  *      which is a colour cast in the blacks: the defect, one order of magnitude
  *      down.
  *
- * SCOPE. CcmpPreviewRenderer itself is correct only for a source that
- * actually companded — 12-bit ClearHDR — and the caller gates it accordingly;
- * decompanding a mode that did not compand is the same defect with the sign
- * flipped (ccmp_lut.hpp, and dng_encoder.cpp's own scope comment).
- *
- * CcmpPreviewGeometry and the ccmp_preview_src_row/col() mapping below it are
- * NOT scoped to 12-bit, though: they describe the raw layout and the
- * nearest-quad footprint, neither of which has anything to do with
- * companding. clip_neutralise.hpp's HighlightNeutraliser (16-bit ClearHDR's
- * merge-clamp correction, over the ISP's own — uncompanded — render) reuses
- * both rather than keeping a second copy that could drift from this one.
+ * SCOPE. The caller gates this. It is correct only for a source that actually
+ * companded — 12-bit ClearHDR — and decompanding a mode that did not is the
+ * same defect with the sign flipped (ccmp_lut.hpp, and dng_encoder.cpp's own
+ * scope comment).
  */
 
 #ifndef CINEPI_CCMP_PREVIEW_HPP
@@ -75,8 +68,6 @@
 #include <vector>
 
 #include "ccmp_lut.hpp"
-#include "clip_convergence.hpp"
-#include "clip_plateau.hpp"
 
 /* Which colour a Bayer quad position carries. Matches dng_encoder.cpp's CFA
  * arrays (0 = R, 1 = G, 2 = B) so one convention serves both consumers. */
@@ -118,23 +109,6 @@ struct CcmpPreviewGeometry
                out_stride >= out_width;
     }
 };
-
-/* Nearest source quad, snapped to the even origin of a Bayer cell. Free
- * functions rather than renderer methods so a second consumer of the same raw
- * buffer -- clip_neutralise.hpp's HighlightNeutraliser, which walks the lores
- * frame at the same resolution to read the raw quad under each pixel it
- * neutralises -- uses the identical mapping instead of a second copy that
- * could drift from this one. */
-inline unsigned ccmp_preview_src_row(const CcmpPreviewGeometry &geom, unsigned oy)
-{
-    const unsigned r = static_cast<unsigned>(static_cast<uint64_t>(oy) * geom.raw_height / geom.out_height);
-    return std::min(r & ~1u, geom.raw_height - 2);
-}
-inline unsigned ccmp_preview_src_col(const CcmpPreviewGeometry &geom, unsigned ox)
-{
-    const unsigned c = static_cast<unsigned>(static_cast<uint64_t>(ox) * geom.raw_width / geom.out_width);
-    return std::min(c & ~1u, geom.raw_width - 2);
-}
 
 struct CcmpPreviewColour
 {
@@ -189,7 +163,7 @@ struct CcmpPreviewColour
      *
      * AND IT IS PER BINNING, which is why this is only the override and the
      * real values sit in the table: the same physical clamp lands on ~2900 at
-     * b=1 and ~2344 at b=4, so one shared number fixes full res and leaves HD
+     * b=1 and ~2582 at b=4, so one shared number fixes full res and leaves HD
      * magenta. */
     unsigned sensor_clip_code = 0;
 
@@ -269,11 +243,6 @@ public:
     /* Bakes the white balance, the CCM and the exposure into one matrix, and
      * the gamma into a table. Detail 1 lives here: the gains are part of the
      * matrix, which is applied to values that have ALREADY been through lin_. */
-    /* The convergence trigger's thresholds; default-constructed is the
-     * measured shipping rule. Setting enabled=false leaves only the anchor,
-     * which is the A/B against every build before this one. */
-    void setConvergence(const ClipConvergence &c) { convergence_ = c; }
-
     void setColour(const CcmpPreviewColour &colour)
     {
         /* Mono has no AWB gains and no CCM — the tuning file carries neither,
@@ -350,16 +319,6 @@ public:
     bool ready() const { return ready_; }
     const CcmpPreviewGeometry &geometry() const { return geom_; }
 
-    /* Feeds every quad this render() touches to a ClipPlateauDetector, in
-     * SHADOW mode: nothing here reads it back, so attaching one cannot change
-     * a rendered byte (the existing tests assert exactly that). It exists so
-     * the 12-bit stage can measure, per frame, whether the fixed per-binning
-     * anchor (CcmpAnchor::clip_code) still matches the hardware at gains
-     * other than the one it was measured at -- see ccmp_lut.hpp's
-     * kT1Effective comment and the 2026-09-13 hardware-log entry. nullptr
-     * (the default) costs one pointer compare per quad. */
-    void setPlateauDetector(ClipPlateauDetector *det) { det_ = det; }
-
     /* The normalised level the highlight correction is referenced to, and the
      * highest raw code seen since the last resetMaxCode(). The second is what
      * says whether the first matches the sensor. */
@@ -401,8 +360,8 @@ public:
          * the 2x2 luma block it covers, which is what YUV420 means. */
         for (unsigned oy = 0; oy < oh; oy += 2)
         {
-            const unsigned sy0 = ccmp_preview_src_row(geom_, oy);
-            const unsigned sy1 = ccmp_preview_src_row(geom_, oy + 1);
+            const unsigned sy0 = srcRow(oy);
+            const unsigned sy1 = srcRow(oy + 1);
             uint8_t *y0 = yp + static_cast<size_t>(oy) * ys;
             uint8_t *y1 = yp + static_cast<size_t>(oy + 1) * ys;
             uint8_t *u = up + static_cast<size_t>(oy / 2) * cs;
@@ -410,36 +369,14 @@ public:
 
             for (unsigned ox = 0; ox < ow; ox += 2)
             {
-                const unsigned sx0 = ccmp_preview_src_col(geom_, ox);
-                const unsigned sx1 = ccmp_preview_src_col(geom_, ox + 1);
-
-                float lin[4][3], want[4];
-                unsigned hi[4];
-                quadLinear(raw, sx0, sy0, lin[0], want[0], hi[0]);
-                quadLinear(raw, sx1, sy0, lin[1], want[1], hi[1]);
-                quadLinear(raw, sx0, sy1, lin[2], want[2], hi[2]);
-                quadLinear(raw, sx1, sy1, lin[3], want[3], hi[3]);
-
-                /* One pixel is never a clamp: the block agrees or nothing in it
-                 * moves. This covers the anchor as well as the convergence rule,
-                 * since a clamp code straddling the anchor speckles the same way. */
-                const float s = clip_convergence_block(want[0], want[1], want[2], want[3]);
-                if (s >= 0.99f)
-                    full_desat_ += 4;
-                else
-                {
-                    const unsigned worst = std::max(std::max(hi[0], hi[1]), std::max(hi[2], hi[3]));
-                    if (worst > max_undesat_)
-                        max_undesat_ = worst;
-                }
+                const unsigned sx0 = srcCol(ox);
+                const unsigned sx1 = srcCol(ox + 1);
 
                 float rgb[4][3];
-                for (int q = 0; q < 4; ++q)
-                {
-                    applyDesaturation(lin[q], s);
-                    for (int row = 0; row < 3; ++row)
-                        rgb[q][row] = gammaEncode(lin[q][row]);
-                }
+                quadRgb(raw, sx0, sy0, rgb[0]);
+                quadRgb(raw, sx1, sy0, rgb[1]);
+                quadRgb(raw, sx0, sy1, rgb[2]);
+                quadRgb(raw, sx1, sy1, rgb[3]);
 
                 y0[ox] = luma(rgb[0]);
                 y0[ox + 1] = luma(rgb[1]);
@@ -459,9 +396,20 @@ public:
 private:
     static constexpr size_t kGammaSize = 4096;
 
+    /* Nearest source quad, snapped to the even origin of a Bayer cell. */
+    unsigned srcRow(unsigned oy) const
+    {
+        const unsigned r = static_cast<unsigned>(static_cast<uint64_t>(oy) * geom_.raw_height / geom_.out_height);
+        return std::min(r & ~1u, geom_.raw_height - 2);
+    }
+    unsigned srcCol(unsigned ox) const
+    {
+        const unsigned c = static_cast<unsigned>(static_cast<uint64_t>(ox) * geom_.raw_width / geom_.out_width);
+        return std::min(c & ~1u, geom_.raw_width - 2);
+    }
+
     /* One Bayer quad -> gamma-encoded R'G'B' in 0..1. */
-    void quadLinear(const uint8_t *raw, unsigned sx, unsigned sy, float lin[3], float &blend,
-                    unsigned &peak_code) const
+    void quadRgb(const uint8_t *raw, unsigned sx, unsigned sy, float out[3]) const
     {
         const uint16_t *r0 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy) * geom_.raw_stride);
         const uint16_t *r1 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy + 1) * geom_.raw_stride);
@@ -478,15 +426,6 @@ private:
         const unsigned hi = std::max(std::max(c0, c1), std::max(c2, c3));
         if (hi > max_code_)
             max_code_ = hi;
-
-        /* Shadow-mode feed: the quad's min alongside the max already computed
-         * above is exactly what ClipPlateauDetector::add() wants, and it costs
-         * nothing extra to compute since c0..c3 are already in registers. */
-        if (det_)
-        {
-            const unsigned lo = std::min(std::min(c0, c1), std::min(c2, c3));
-            det_->add(lo, hi);
-        }
 
         const float s[4] = { lin_[c0], lin_[c1], lin_[c2], lin_[c3] };
 
@@ -524,22 +463,18 @@ private:
          * it cannot be measured after them. */
         const float peak = std::max(std::max(s[0], s[1]), std::max(s[2], s[3]));
 
-        /* The level-free half of the trigger — see clip_convergence.hpp. Read
-         * off the decompanded channels BEFORE the gains, for the same reason
-         * `peak` is: after them, a clamped quad and a saturated colour look
-         * alike. Mono has no CFA and no gains, so every quad is trivially
-         * converged and the rule would whiten the whole picture. */
-        const float conv = geom_.mono ? 0.f
-                                      : clip_convergence_blend(cam[CCMP_PREVIEW_R], cam[CCMP_PREVIEW_G],
-                                                               cam[CCMP_PREVIEW_B], convergence_);
-
+        float lin[3];
         for (int row = 0; row < 3; ++row)
             lin[row] = m_[row * 3 + 0] * cam[0] + m_[row * 3 + 1] * cam[1] + m_[row * 3 + 2] * cam[2];
 
-        /* The blend this quad WANTS. What it gets is decided per 2x2 block in
-         * render(), because one pixel is never a clamp — clip_convergence.hpp. */
-        blend = highlightBlend(peak, conv);
-        peak_code = hi;
+        const float applied = desaturateHighlight(lin, peak);
+        if (applied >= 0.99f)
+            ++full_desat_;
+        else if (hi > max_undesat_)
+            max_undesat_ = hi;
+
+        for (int row = 0; row < 3; ++row)
+            out[row] = gammaEncode(lin[row]);
     }
 
     /* ── the clipped-channel cast ─────────────────────────────────────────────
@@ -586,31 +521,16 @@ private:
      * well above the anchor while the body of the blown area sits below it and
      * desaturates by nothing, which is how both earlier anchors looked correct
      * in the log and did nothing on the picture. */
-    float highlightBlend(float peak, float conv) const
+    float desaturateHighlight(float lin[3], float peak) const
     {
-        /* Two independent triggers, whichever fires harder. `peak` against the
-         * table anchor is the original, and it is hardware-confirmed for full
-         * res and for both 16-bit modes, so it stays exactly as it was. `conv`
-         * catches what an anchor structurally cannot: a clamp that landed below
-         * it. Taking the max can only ever ADD correction, never remove any. */
-        float s = 0.f;
-        if (peak > hl_lo_)
-            s = std::min(1.f, (peak - hl_lo_) * hl_scale_);
-        if (conv > s)
-            s = conv;
-        return s > 0.f ? s : 0.f;
-    }
+        if (peak <= hl_lo_)
+            return 0.f;
 
-    /* Drive a quad to neutral by `s`; it clamps to white downstream. Split from
-     * the decision above so render() can take the weakest blend across a 2x2
-     * block BEFORE any of the four pixels is touched. */
-    static void applyDesaturation(float lin[3], float s)
-    {
-        if (!(s > 0.f))
-            return;
+        const float s = std::min(1.f, (peak - hl_lo_) * hl_scale_);
         const float mx = std::max(lin[0], std::max(lin[1], lin[2]));
         for (int i = 0; i < 3; ++i)
             lin[i] += s * (mx - lin[i]);
+        return s;
     }
 
     float gammaEncode(float lin) const
@@ -658,8 +578,6 @@ private:
 
     bool ready_ = false;
     CcmpPreviewGeometry geom_;
-    /* Shadow-mode only — see setPlateauDetector(). Not owned. */
-    ClipPlateauDetector *det_ = nullptr;
     std::vector<float> lin_;
     float m_[9] = { 1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f };
     float gamma_[kGammaSize] = {};
@@ -671,7 +589,6 @@ private:
      * stays const: it describes the data that went through, not the renderer's
      * configuration. The stage serialises render() under its own mutex, so the
      * unsynchronised update is safe there. */
-    ClipConvergence convergence_;
     unsigned lut_clip_code_ = 0;
     unsigned resolved_clip_ = 0;
     mutable unsigned max_code_ = 0;

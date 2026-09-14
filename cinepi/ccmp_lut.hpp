@@ -130,7 +130,7 @@ struct CcmpAnchor
      *
      * It has to be per binning because the code a given scene level lands on
      * is per binning — the compander is applied to b*L and divided back by b,
-     * so the same clamp sits at 2900-ish at b=1 and 2344-ish at b=4. Anchoring
+     * so the same clamp sits at 2900-ish at b=1 and 2582-ish at b=4. Anchoring
      * both on one number is why HD stayed magenta after full res was fixed. */
     unsigned clip_code;
 };
@@ -141,25 +141,23 @@ inline constexpr CcmpAnchor kT1Effective[] = {
      * both p1 values for margin. Confirmed on hardware: full res renders blown
      * highlights neutral at this anchor.
      *
-     * clip_code b=4: MEASURED on the camera 2026-09-14 at analogue gain code
-     * 80 — under a blown highlight in HD 12-bit ClearHDR the plateau detector
-     * read floors of 2392, 2432, 2468, 2468 and 2652. Anchored 48 codes below
-     * the lowest of those, the same margin b=1 carries.
+     * clip_code b=4: DERIVED, then CONFIRMED IN PLACE — not measured from a
+     * binned take, so it is still the softer of the two numbers. It applies the
+     * peak-to-floor ratio measured at b=1 (1.0378) to the one binned peak the
+     * log had (2723), plus the same 48-code margin, which puts the anchor-to-
+     * peak band at 0.082 stops against 0.078 at b=1.
      *
-     * IT WAS 2582 UNTIL THEN, DERIVED FROM b=1'S PEAK-TO-FLOOR RATIO, AND THE
-     * NUMBER THAT "CONFIRMED" IT WAS STRUCTURALLY INCAPABLE OF FALSIFYING IT.
-     * The stage logged `highest uncorrected 2581` against `clip anchor 2582`,
-     * and that was read as the signature of an anchor placed correctly. But
-     * maxUndesaturatedCode() is the highest code that did NOT fully desaturate,
-     * and everything at or above the anchor always does — so it pins to
-     * anchor-1 whenever anything bright sits below the anchor. It reads exactly
-     * the same when the anchor is right and when the clamp zone extends 190
-     * codes below it, which is what was really happening: HD rendered pink
-     * through that whole band while the log looked like the b=1 success, until
-     * an operator reported it. A number that cannot come out wrong is not
-     * evidence. */
+     * Confirmed on hardware 2026-09-07: binned ClearHDR renders blown
+     * highlights neutral, and the stage reports `highest uncorrected 2581`
+     * against this anchor of 2582 — i.e. everything at or above it is fully
+     * corrected and the uncorrected ceiling sits exactly one code below, which
+     * is the signature of an anchor placed correctly rather than one that
+     * merely happens to be low enough. A direct measurement (record a binned
+     * 12-bit ClearHDR take with a blown highlight, read the codes under the
+     * magenta area of its embedded thumbnail, as was done for b=1) would still
+     * be worth taking if this mode is ever re-tuned. */
     { 1.0, 500.3389, 2900 },   /* full res 3856x2180 */
-    { 4.0, 500.9431, 2344 },   /* 2x2 binned 1928x1090 */
+    { 4.0, 500.9431, 2582 },   /* 2x2 binned 1928x1090 */
 };
 
 /* Curve parameters for one mode. `binning` is the only input that varies. */
