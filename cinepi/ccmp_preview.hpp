@@ -188,7 +188,7 @@ struct CcmpPreviewColour
      *
      * AND IT IS PER BINNING, which is why this is only the override and the
      * real values sit in the table: the same physical clamp lands on ~2900 at
-     * b=1 and ~2344 at b=4, so one shared number fixes full res and leaves HD
+     * b=1 and ~2582 at b=4, so one shared number fixes full res and leaves HD
      * magenta. */
     unsigned sensor_clip_code = 0;
 
