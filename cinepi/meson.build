@@ -148,12 +148,35 @@ test('ccmp_log_compose', ccmp_log_compose_test)
 # Unit tests for the CCMP12 preview renderer — the raw-Bayer path that keeps the
 # HDMI/MJPEG previews out of the magenta the DNG's LinearizationTable already
 # fixes. No libcamera deps: ccmp_preview.hpp is pure by construction, which is
-# what lets the decompand-before-gains ordering be asserted off-device.
+# what lets the decompand-before-gains ordering be asserted off-device. Also
+# covers clip_neutralise.hpp's HighlightNeutraliser (16-bit ClearHDR's
+# in-place clamp correction) and CcmpPreviewRenderer's shadow-mode detector
+# hook, both pulled in transitively/explicitly — see the test file's header.
 ccmp_preview_test = executable('ccmp_preview_test',
            '../tests/ccmp_preview_test.cpp',
            include_directories : [include_directories('..')],
            install : false)
 test('ccmp_preview', ccmp_preview_test)
+
+# Unit tests for the ClearHDR merge-clamp plateau detector (cinepi/
+# clip_plateau.hpp) — the per-frame measurement that replaces a tabulated
+# anchor for 16-bit ClearHDR, where the clamp code moves with analogue gain.
+# No libcamera deps, integer arithmetic only. Run with `meson test`.
+clip_plateau_test = executable('clip_plateau_test',
+           '../tests/clip_plateau_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('clip_plateau', clip_plateau_test)
+
+# Unit tests for the level-free clamp trigger. Pure: it includes only
+# cinepi/clip_convergence.hpp. Its vectors are measurements from three real
+# takes, including the one case no anchor can decide -- a genuine white subject
+# sitting at the same level as a clamped one.
+clip_convergence_test = executable('clip_convergence_test',
+           '../tests/clip_convergence_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('clip_convergence', clip_convergence_test)
 
 # Unit tests for the CCMP12 attach gate (cinepi/ccmp_gate.hpp) -- whether
 # dng_encoder.cpp's setup_encoder() should even consider a decompand table,
