@@ -616,6 +616,38 @@ void sparse_sampling_does_not_change_the_verdict()
     }
 }
 
+/* Rule 3's refusal has to be DISTINGUISHABLE from the others, because a caller
+ * that latches must treat it differently: every other "no" means this frame had
+ * nothing to measure and the previous answer still stands, while this one means
+ * the data is no longer clamped and the previous answer is now actively harmful.
+ * ccmpPreviewStage learned that the hard way -- see its comment. */
+void full_scale_refusal_is_flagged_as_such()
+{
+    /* Unclamped: a ramp that runs all the way to the container top. */
+    ClipCeilingDetector d;
+    d.reset(4095, 64, kRGGB);
+    for (int c = 0; c < kClipChanCount; ++c)
+        for (unsigned v = 3800; v <= 4095; ++v)
+            for (int n = 0; n < 40; ++n)
+                d.add(v, static_cast<uint8_t>(c));
+    const ClipCeilingDetector::Result r = d.detect();
+    check(!r.found, "full scale: still refused");
+    check(r.full_scale, "and the refusal is flagged as full-scale",
+          r.why ? r.why : "?");
+
+    /* And a refusal for any OTHER reason must NOT set it, or a caller would
+     * throw away a good ceiling every time the lamp left the frame. */
+    ClipCeilingDetector dark;
+    dark.reset(4095, 64, kRGGB);
+    for (int c = 0; c < kClipChanCount; ++c)
+        for (int n = 0; n < 5000; ++n)
+            dark.add(300, static_cast<uint8_t>(c));
+    const ClipCeilingDetector::Result rd = dark.detect();
+    check(!rd.found, "a dark frame: still refused");
+    check(!rd.full_scale, "and is NOT flagged full-scale",
+          rd.why ? rd.why : "?");
+}
+
 int main()
 {
     std::cout << "clip_ceiling_test\n";
@@ -629,6 +661,7 @@ int main()
     tungsten_two_channel_clamp();
     neutral_wall_is_not_a_clamp();
     full_scale_is_not_a_clamp();
+    full_scale_refusal_is_flagged_as_such();
     tiny_specular_is_not_a_clamp();
     trailing_highlight_is_not_a_clamp();
     dark_frame_says_nothing();

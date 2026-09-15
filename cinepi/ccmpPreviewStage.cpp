@@ -466,13 +466,33 @@ void ccmpPreviewStage::measureClamp(const uint8_t *raw)
 						  r.ceiling, now, 1.0 - colour_.highlight_rolloff);
 		}
 	}
-	/* A refusal deliberately does nothing. The last good answer is kept rather
-	 * than snapping back to nominal white the moment the lamp leaves frame: the
-	 * clamp is a property of the sensor at this gain, not of what happens to be
-	 * in shot, and a monitor that jumps a third of a stop every time you pan off
-	 * the highlight is worse than one that is slightly stale. Configure() is
-	 * what clears it, which is right — that is where the gain and the mode can
-	 * actually have changed. */
+	/* Most refusals deliberately do nothing. The last good answer is kept
+	 * rather than snapping back to nominal white the moment the lamp leaves
+	 * frame: the clamp is a property of the sensor at this gain, not of what
+	 * happens to be in shot, and a monitor that jumps a third of a stop every
+	 * time you pan off the highlight is worse than one that is slightly stale.
+	 *
+	 * ONE REFUSAL IS DIFFERENT, and missing that cost a blown monitor on the
+	 * rig at 20:52 on 2026-09-15: 73.6% of the preview at full white, because a
+	 * ceiling of 35968 stayed latched while the sensor started delivering data
+	 * that ran to 65462. What had happened is that ClearHDR silently stopped
+	 * being applied — "No sensor subdev accepted wide_dynamic_range ... Device
+	 * or resource busy" — so the sensor was producing ordinary 16-bit SDR with
+	 * no clamp in it, and every code above 55% of scale was being whitened as
+	 * though it were clipped.
+	 *
+	 * Full scale is the one refusal that says the DATA has changed character,
+	 * not that this frame had nothing to offer. A latched ceiling cannot
+	 * survive it: on unclamped data there is nothing to correct, and the safe
+	 * state is the one where this stage does nothing at all. */
+	if (r.full_scale && renderer_.usingMeasuredCeiling())
+	{
+		console->warn("ccmpPreview: data now reaches full scale (peak {}), so nothing is "
+					  "clamped — dropping the measured ceiling of {:.0f} and leaving the "
+					  "picture alone. ClearHDR may not be applied to the sensor.",
+					  r.peak, renderer_.clipCeiling());
+		renderer_.setClipCeiling(0.0);
+	}
 
 	/* Same window discipline as the peak-code report below: a fresh histogram
 	 * each time, so one old frame's highlight cannot hold the answer up. */

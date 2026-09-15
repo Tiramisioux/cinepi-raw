@@ -162,6 +162,19 @@ public:
         unsigned long sampled      = 0;
         /* Why found is false; nullptr when it is true. Static storage. */
         const char *why = nullptr;
+        /* Set when the refusal was rule 3 — the data runs to the top of the
+         * container, so there is no clamp to find.
+         *
+         * THIS IS NOT THE SAME KIND OF "NO" AS THE OTHERS, and a caller that
+         * latches needs to tell them apart. Every other refusal means "nothing
+         * measurable in THIS frame" — no blown highlight, too few samples, a
+         * body too small — and the right response is to keep whatever was
+         * measured before, because the sensor's clamp has not moved just
+         * because the operator panned off the lamp. This one means the data is
+         * not clamped AT ALL any more, so a previously latched ceiling is now
+         * describing a sensor state that no longer exists, and anything above
+         * it will be whitened on a frame where nothing is clipped. */
+        bool     full_scale = false;
     };
 
     /*
@@ -261,6 +274,7 @@ public:
             static_cast<unsigned long>(white_) * kFullScalePct)
         {
             r.why = "data reaches full scale";
+            r.full_scale = true;
             return r;
         }
 
