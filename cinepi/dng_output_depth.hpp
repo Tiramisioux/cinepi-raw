@@ -72,7 +72,19 @@ inline DngOutputDepth resolve_dng_output_depth(unsigned container,
                                                unsigned sensor_bit_depth,
                                                bool     trusted,
                                                bool     packed,
-                                               bool     compressed)
+                                               /* Deliberately not read any
+                                                * more — see the 10-bit branch
+                                                * below. Kept in the signature
+                                                * because it is part of this
+                                                * rule's documented input
+                                                * space, the truth table in
+                                                * tests/dng_output_depth_test.cpp
+                                                * sweeps it, and "COMP1 is not a
+                                                * discriminator" is a measured
+                                                * result worth stating rather
+                                                * than an argument worth
+                                                * deleting. */
+                                               [[maybe_unused]] bool compressed)
 {
     /* A VC4 stream (container != 16) carries its rows at their native depth
      * already, and an untrusted snapshot says nothing about this stream at
