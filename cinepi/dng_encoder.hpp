@@ -79,6 +79,12 @@ public:
 		// take's. Only the generation moves — clip_ceiling_white_ is left
 		// alone on purpose, so any frame of the previous take still draining
 		// through encodeThread() keeps reading the answer measured for IT.
+		//
+		// This runs on the rec trigger with the PREVIOUS take's frames still
+		// in encode_queue_ (cinepi_raw.cpp leaves them flushing), which is why
+		// EncodeItem carries its own ceiling_gen stamped at enqueue. Bumping a
+		// counter that frames only read at dequeue would relabel every one of
+		// those stragglers into this new take.
 		{
 			std::lock_guard<std::mutex> lk(encode_mutex_);
 			clip_ceiling_claimed_ = false;
@@ -97,6 +103,34 @@ public:
 		// "done" mid-flush. Let the balanced accounting own this value.
 	}
 
+    /* What one frame needs to know about its take's WhiteLevel, resolved in
+     * encodeThread() and handed to dng_save() whole.
+     *
+     * It is a struct rather than three more scalars on an already 11-parameter
+     * signature, and it exists so dng_save() does NOT reach into the latch
+     * itself: the value is read once, in encodeThread, immediately after the
+     * wait and under the same lock that settles it. Reading it later — mid-
+     * frame, while a newer take may already have published — is exactly the
+     * bug this shape removes. */
+    struct ClipCeilingJob
+    {
+        /* The take this frame belongs to. Stamped at ENQUEUE (EncodeBuffer2),
+         * never read live from clip_ceiling_gen_ at dequeue: resetFrameCount()
+         * bumps that counter on the rec trigger while the previous take is
+         * still draining, so a dequeue-time read relabels a straggler into the
+         * new take and lets it claim a measurement that is not its to make. */
+        uint64_t gen     = 0;
+        /* This frame owns the measurement and owes every other frame of its
+         * take a published answer. */
+        bool     publish = false;
+        /* The take's answer, for frames that did not measure. 0 means "keep
+         * the nominal dng_info.white" — which is also what a frame gets when
+         * the wait timed out or the generation on offer belongs to someone
+         * else, so a missing answer degrades to today's behaviour rather than
+         * to another take's number. */
+        uint32_t white   = 0;
+    };
+
 	size_t dng_save(int thread_num,
 		const uint8_t *mem_buf,
 		const uint8_t *raw,
@@ -107,7 +141,7 @@ public:
 		const libcamera::ControlList &metadata,
 		int64_t timestamp_us,
 		int64_t tc_frame_count,
-		uint64_t publish_clip_ceiling_gen);
+		const ClipCeilingJob &ceiling);
 
 	int bufferSize(){
 		return disk_buffer_.size();
@@ -277,6 +311,7 @@ private:
     uint64_t                clip_ceiling_resolved_gen_ {0};   // guarded by clip_ceiling_mutex_
     uint32_t                clip_ceiling_white_    {0};       // guarded by clip_ceiling_mutex_
 
+
     /* ──  DNG thumbnail (IFD1)  ─────────────────────────────
      * Snapshotted once per configure in setup_encoder() from
      * options_->thumbnail/thumbnailSize, exactly like log_lut_ above --
@@ -435,6 +470,12 @@ private:
 		uint64_t index;
 		std::string folder;
 		int64_t tc_frame_count { 0 }; // pre-computed TC frame number, set under encode_mutex_
+		// The take this frame belongs to, stamped at enqueue under
+		// encode_mutex_ — the same mutex resetFrameCount() bumps the counter
+		// under, so a frame cannot be stamped with a generation that is
+		// changing. Stamped here for the same reason `folder` is: by the time
+		// a frame is encoded, the camera may already be in the next take.
+		uint64_t ceiling_gen { 0 };
 	};
 	std::queue<EncodeItem> encode_queue_;
 	std::mutex encode_mutex_;

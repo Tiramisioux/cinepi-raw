@@ -401,6 +401,30 @@ void dark_frame_says_nothing()
                   : std::string("why: ") + (r.why ? r.why : "?"));
 }
 
+void a_converged_midtone_is_not_a_clamp()
+{
+    /* The floor rule, exercised on its own. A big, converged, perfectly
+     * terminating population -- everything the other rules ask for -- but
+     * sitting at a fifth of the range. No ClearHDR clamp has ever been
+     * measured below ~0.55 of the container, so this is a misread, and
+     * adopting it would declare four fifths of the frame blown.
+     *
+     * Distinct from dark_frame_says_nothing(): that one has nothing above the
+     * floor at all and refuses trivially. This one has a real candidate and
+     * must still be turned down. */
+    ClipCeilingDetector d;
+    d.reset(65535, 3200, kRGGB);
+    for (int c = 0; c < kClipChanCount; ++c)
+    {
+        band(d, static_cast<uint8_t>(c), 12800, 13400, 500000);   /* ~0.2 of range */
+        band(d, static_cast<uint8_t>(c),  3300,  9000, 200000);
+    }
+    const ClipCeilingDetector::Result r = d.detect();
+    check(!r.found, "converged midtone: refused, candidate ceiling implausibly low",
+          r.found ? "wrongly claimed " + std::to_string(r.ceiling)
+                  : std::string("why: ") + (r.why ? r.why : "?"));
+}
+
 void empty_frame_says_nothing()
 {
     ClipCeilingDetector d;
@@ -418,20 +442,30 @@ void add_row_matches_add()
         even[x] = static_cast<uint16_t>((x & 1u) ? 3000 : 2000);  /* G : R */
         odd[x]  = static_cast<uint16_t>((x & 1u) ? 1000 : 3000);  /* B : G */
     }
+    /* Enough row pairs to clear kMinSamples. This test shipped comparing
+     * 128 samples, which is under that floor -- detect() returned before it
+     * computed a peak at all and the assertion passed on 0 == 0, checking
+     * nothing. Same failure the shift test was caught on; it is easy to write
+     * and invisible once written, so both now assert they are non-vacuous. */
     ClipCeilingDetector a, b;
     a.reset(4095, 200, kRGGB);
     b.reset(4095, 200, kRGGB);
-    for (unsigned y = 0; y < 2; ++y)
-        a.add_row((y & 1u) ? odd.data() : even.data(), 64, y);
-    for (size_t x = 0; x < 64; ++x)
-    {
-        b.add(even[x], (x & 1u) ? kClipChanG : kClipChanR);
-        b.add(odd[x],  (x & 1u) ? kClipChanB : kClipChanG);
-    }
+    for (unsigned pair = 0; pair < 64; ++pair)
+        for (unsigned y = 0; y < 2; ++y)
+            a.add_row((y & 1u) ? odd.data() : even.data(), 64, y);
+    for (unsigned pair = 0; pair < 64; ++pair)
+        for (size_t x = 0; x < 64; ++x)
+        {
+            b.add(even[x], (x & 1u) ? kClipChanG : kClipChanR);
+            b.add(odd[x],  (x & 1u) ? kClipChanB : kClipChanG);
+        }
     const ClipCeilingDetector::Result ra = a.detect(), rb = b.detect();
-    check(ra.sampled == rb.sampled && ra.sampled == 128,
+    check(ra.peak > 0 && ra.second > 0, "add_row: the comparison is not vacuous",
+          "peak " + std::to_string(ra.peak) + ", second " + std::to_string(ra.second));
+    check(ra.sampled == rb.sampled && ra.peak == rb.peak && ra.second == rb.second,
           "add_row derives the CFA phase from row parity",
-          "sampled " + std::to_string(ra.sampled) + "/" + std::to_string(rb.sampled));
+          "sampled " + std::to_string(ra.sampled) + "/" + std::to_string(rb.sampled) +
+          ", peak " + std::to_string(ra.peak) + "/" + std::to_string(rb.peak));
 }
 
 void shift_matches_the_real_packers()
@@ -515,6 +549,7 @@ int main()
     tiny_specular_is_not_a_clamp();
     trailing_highlight_is_not_a_clamp();
     dark_frame_says_nothing();
+    a_converged_midtone_is_not_a_clamp();
     empty_frame_says_nothing();
     add_row_matches_add();
     shift_matches_the_real_packers();

@@ -83,6 +83,8 @@ jobs:
             -DCCMP_LOG_GOLDEN_DIR="\"${PWD}/resources/ccmp_log_luts\""
           build_and_run ccmp_preview
           build_and_run ccmp_gate
+          build_and_run clip_ceiling \
+            -DCLIP_CEILING_DATA_DIR="\"${PWD}/tests/data\""
 
           exit "$fail"
 

@@ -331,6 +331,12 @@ void DngEncoder::stopThreads()
         encode_cond_var_.notify_all();
     if (disk_was_running)
         disk_cond_var_.notify_all();
+    /* A frame waiting for its take's WhiteLevel is parked on NEITHER of the
+     * two above, so without this it only leaves on the 2 s timeout and
+     * ~DngEncoder() blocks on the join for that long. The wait's predicate
+     * already tests stop_encode_; this is what gives it a chance to run. */
+    if (encode_was_running)
+        clip_ceiling_cv_.notify_all();
 
     for (auto &thread : encode_threads_)
     {
@@ -453,6 +459,9 @@ void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const 
             return;
 
         std::lock_guard<std::mutex> lock(encode_mutex_);
+        /* Stamp the take under encode_mutex_ — the same lock resetFrameCount()
+         * bumps the counter under — so this frame's generation cannot be the
+         * one that is changing. See ClipCeilingJob::gen. */
         EncodeItem item = {
             mem,
             size,
@@ -463,7 +472,9 @@ void DngEncoder::EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const 
             metadata,
             timestamp_us,
             index_++,
-            options_ ? options_->folder : std::string()
+            options_ ? options_->folder : std::string(),
+            0,                      /* tc_frame_count, set at dequeue */
+            clip_ceiling_gen_
         };
         encode_queue_.push(item);
         frames_in_flight_.fetch_add(1, std::memory_order_relaxed);
@@ -1112,7 +1123,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                             const libcamera::ControlList       &metadata,
                             int64_t                             timestamp_us,
                             int64_t                             tc_frame_count,
-                            uint64_t                            publish_clip_ceiling_gen)
+                            const ClipCeilingJob               &ceiling)
 {
     thread_local std::vector<uint8_t> rowBuf;
     thread_local std::vector<uint16_t> row16Buf;
@@ -1155,7 +1166,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
      * observed landing there. */
     constexpr unsigned kRowStride = 3;
     ClipCeilingDetector ceiling_det;
-    const bool measuring = publish_clip_ceiling_gen && !mono_;
+    const bool measuring = ceiling.publish && !mono_;
     if (measuring)
     {
         const uint8_t cfa[4] = {
@@ -1437,8 +1448,8 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
      * including the mono case it never measured at all: a waiter that blocks
      * on a frame which decided nothing would stall the take. 0 means "keep
      * the nominal dng_info.white". */
-    uint32_t clip_white = 0;
-    if (publish_clip_ceiling_gen)
+    uint32_t clip_white = ceiling.white;
+    if (ceiling.publish)
     {
         uint32_t measured = 0;
         if (measuring)
@@ -1465,16 +1476,19 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
 
         {
             std::lock_guard<std::mutex> lk(clip_ceiling_mutex_);
-            clip_ceiling_white_        = measured;
-            clip_ceiling_resolved_gen_ = publish_clip_ceiling_gen;
+            /* Never let the published generation go BACKWARDS. A frame of an
+             * older take finishing after a newer take has already published
+             * would otherwise overwrite the live answer with a stale one, and
+             * every frame still waiting on the newer take would then be handed
+             * a number measured from a different scene. */
+            if (ceiling.gen >= clip_ceiling_resolved_gen_)
+            {
+                clip_ceiling_white_        = measured;
+                clip_ceiling_resolved_gen_ = ceiling.gen;
+            }
         }
         clip_ceiling_cv_.notify_all();
         clip_white = measured;
-    }
-    else
-    {
-        std::lock_guard<std::mutex> lk(clip_ceiling_mutex_);
-        clip_white = clip_ceiling_white_;
     }
 
 
@@ -1975,13 +1989,10 @@ void DngEncoder::encodeThread(int num)
 
     while (true)
     {
-        /* Non-zero if THIS frame owns the take's ClearHDR clamp measurement,
-         * in which case it owes every other frame of the take a published
-         * answer stamped with that generation. my_ceiling_gen is the take this
-         * frame belongs to, which is not necessarily the take that is
-         * recording by the time the frame is encoded. */
-        uint64_t publish_ceiling_gen = 0;
-        uint64_t my_ceiling_gen      = 0;
+        /* This frame's view of its take's WhiteLevel: which take it belongs
+         * to, whether it owes the others a measurement, and (once the wait
+         * below has settled) the answer itself. */
+        ClipCeilingJob ceiling;
 
         /* ──  Get the next job from the queue  ───────────────── */
         {
@@ -1998,14 +2009,19 @@ void DngEncoder::encodeThread(int num)
 
             /* Claim the ClearHDR clamp measurement for this take. Dequeue is
              * FIFO under this mutex — the same property the TC origin below
-             * relies on — so the first claim is by definition the take's first
-             * frame, which is the only frame allowed to decide WhiteLevel
-             * (dng_encoder.hpp says why it must not change mid-take). */
-            my_ceiling_gen = clip_ceiling_gen_;
-            if (!clip_ceiling_claimed_)
+             * relies on — so the first frame OF THIS GENERATION to arrive is
+             * the take's first frame, and it is the only one allowed to decide
+             * WhiteLevel (dng_encoder.hpp says why it must not change
+             * mid-take).
+             *
+             * The generation test is what keeps a straggler out. A frame of
+             * the previous take is still stamped with ITS take, so it fails
+             * this and cannot take a claim that belongs to the new one. */
+            ceiling.gen = encode_item.ceiling_gen;
+            if (ceiling.gen == clip_ceiling_gen_ && !clip_ceiling_claimed_)
             {
                 clip_ceiling_claimed_ = true;
-                publish_ceiling_gen   = my_ceiling_gen;
+                ceiling.publish       = true;
             }
 
             /* ── TC step: computed here, under encode_mutex_, so frames are
@@ -2116,7 +2132,7 @@ void DngEncoder::encodeThread(int num)
                 }
                 e->clip_ceiling_cv_.notify_all();
             }
-        } ceiling_publisher { this, publish_ceiling_gen };
+        } ceiling_publisher { this, ceiling.publish ? ceiling.gen : 0 };
 
 
         /* ────────────────────────────────────────────────────── */
@@ -2172,13 +2188,21 @@ void DngEncoder::encodeThread(int num)
          * publisher guard below covers the throw; this timeout covers whatever
          * it does not, at the cost of the first frames falling back to the
          * nominal WhiteLevel, which is the pre-existing behaviour. */
-        if (!publish_ceiling_gen)
+        if (!ceiling.publish)
         {
             std::unique_lock<std::mutex> lk(clip_ceiling_mutex_);
-            clip_ceiling_cv_.wait_for(lk, std::chrono::seconds(2), [this, my_ceiling_gen] {
-                return clip_ceiling_resolved_gen_ >= my_ceiling_gen ||
+            clip_ceiling_cv_.wait_for(lk, std::chrono::seconds(2), [this, &ceiling] {
+                return clip_ceiling_resolved_gen_ >= ceiling.gen ||
                        stop_encode_.load(std::memory_order_acquire);
             });
+            /* Take the answer ONLY if it belongs to this frame's take, and take
+             * it HERE, under the lock that settled it — not later inside
+             * dng_save(), by when a newer take may have published over it.
+             * Anything else (a timeout, a shutdown wake, a generation that is
+             * not ours) leaves white at 0, i.e. the nominal WhiteLevel, which
+             * is the pre-change behaviour and never another take's number. */
+            if (clip_ceiling_resolved_gen_ == ceiling.gen)
+                ceiling.white = clip_ceiling_white_;
         }
 
         size_t tiff_size = 0;
@@ -2195,7 +2219,7 @@ void DngEncoder::encodeThread(int num)
                 encode_item.met,
                 encode_item.timestamp_us,
                 encode_item.tc_frame_count,
-                publish_ceiling_gen);
+                ceiling);
         }
         catch (const std::exception &e)
         {

@@ -350,8 +350,15 @@ Requirements:
 ### 16-bit ClearHDR
 
 The sensor outputs one 16-bit linear Bayer frame; cinepi-raw records it as true
-16-bit DNGs (BlackLevel 3200, WhiteLevel 65535, no compression, no linearization
-table needed). This is the quality path — full linear data, manual exposure only.
+16-bit DNGs (BlackLevel 3200, no compression, no linearization table needed).
+This is the quality path — full linear data, manual exposure only.
+
+WhiteLevel is **measured, not 65535**. The HG/LG merge clamps well below the
+container — between 55% and 89% of it across every mode measured — so declaring
+the container's full scale meant no converter ever saw a clipped pixel and blown
+highlights rendered magenta. cinepi-raw now reads where the data actually stops
+on each take's first frame and writes that, constant for the take. See
+`cinepi/clip_ceiling.hpp`.
 
 Start with the `--hdr sensor` flag and a 16-bit unpacked mode:
 
