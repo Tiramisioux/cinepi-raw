@@ -94,8 +94,14 @@ class IFDBuilder
     };
 
 public:
-    explicit IFDBuilder(uint32_t width = 0, uint32_t height = 0)
-        : w(width), h(height) {}
+    /* No geometry ctor on purpose. This builds a TIFF directory out of the
+     * entries you add and nothing else -- image dimensions are the caller's
+     * to state, as tags 256/257, which every caller already does (see
+     * dng_encoder.cpp's IFD0 and add_thumbnail_ifd1_entries() for IFD1).
+     * An earlier signature took width/height and stored them in fields no
+     * member ever read; they were dead from this file's first commit and
+     * clang flagged them (-Wunused-private-field). Having build() emit
+     * 256/257 from them instead would have written those tags twice. */
 
     /* add one tag – payload is copied immediately into `data`         */
     void addEntry(uint16_t tag,
@@ -223,6 +229,5 @@ public:
     uint32_t nextIfdFieldOffset{0};  /* set by build(); see above */
 
 private:
-    uint32_t w{}, h{};
     std::vector<Pending> entries_;
 };

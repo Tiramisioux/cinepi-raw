@@ -158,7 +158,7 @@ static void check_ifd1_tags(int mode, const char *label)
     const uint32_t stripOffset = 0x40;   // arbitrary: this test never writes a real strip
     const uint32_t stripBytes  = 12345;  // arbitrary, distinct from tg.bytes on purpose
 
-    IFDBuilder ifd1(tg.width, tg.height);
+    IFDBuilder ifd1;
     ifd1.baseOffset = buf.usedSize;
     add_thumbnail_ifd1_entries(ifd1, tg, stripOffset, stripBytes);
     ifd1.sortEntries();

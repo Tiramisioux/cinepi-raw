@@ -1426,7 +1426,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     uint16_t planar  = 1;
     uint16_t sampFmt = SAMPLEFORMAT_UINT;
     static const uint8_t v[4] = {1, 4, 0, 0};
-    IFDBuilder ifd(info.width, info.height);
+    IFDBuilder ifd;
     ifd.baseOffset = buf.usedSize;
 
     uint16_t bits       = dng_info.bits;
@@ -1810,7 +1810,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                 write_pod(buf, zeros, 4 - (buf.offset & 3));
             }
 
-            IFDBuilder ifd1(tw, th);
+            IFDBuilder ifd1;
             ifd1.baseOffset = buf.usedSize;
 
             /* Single source for IFD1's tag layout, every mode --

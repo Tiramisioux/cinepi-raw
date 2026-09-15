@@ -124,7 +124,7 @@ static void test_single_ifd_unchanged()
     MemoryBuffer buf{mem.data(), 0, 0, static_cast<uint32_t>(mem.size())};
     write_uint32(buf, 0);   // stand-in for a TIFF header's IFD0-offset slot
 
-    IFDBuilder ifd0(0, 0);
+    IFDBuilder ifd0;
     build_ifd0(ifd0, buf);
 
     auto chain = indep::walk_chain(mem.data(), buf.usedSize, ifd0.baseOffset);
@@ -146,14 +146,14 @@ static void test_two_ifd_chain()
     std::vector<uint8_t> memSingle(4096, 0xCC);
     MemoryBuffer bufSingle{memSingle.data(), 0, 0, static_cast<uint32_t>(memSingle.size())};
     write_uint32(bufSingle, 0);
-    IFDBuilder ifd0Single(0, 0);
+    IFDBuilder ifd0Single;
     build_ifd0(ifd0Single, bufSingle);
 
     std::vector<uint8_t> mem(4096, 0xCC);
     MemoryBuffer buf{mem.data(), 0, 0, static_cast<uint32_t>(mem.size())};
     write_uint32(buf, 0);   // TIFF header IFD0-offset slot
 
-    IFDBuilder ifd0(0, 0);
+    IFDBuilder ifd0;
     build_ifd0(ifd0, buf);
 
     // Before any chaining, IFD0's bytes must be identical to the
@@ -166,7 +166,7 @@ static void test_two_ifd_chain()
 
     // Chain a second IFD after it -- exactly dng_save()'s own pattern:
     // build IFD1, then patch ifd0's recorded next-IFD field offset.
-    IFDBuilder ifd1(0, 0);
+    IFDBuilder ifd1;
     ifd1.baseOffset = buf.usedSize;
     static uint32_t thumbW = 128, thumbH = 64;
     static uint32_t subfileType = 1;
