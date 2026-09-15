@@ -1111,7 +1111,8 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                             [[maybe_unused]] size_t             losize,
                             const libcamera::ControlList       &metadata,
                             int64_t                             timestamp_us,
-                            int64_t                             tc_frame_count)
+                            int64_t                             tc_frame_count,
+                            uint64_t                            publish_clip_ceiling_gen)
 {
     thread_local std::vector<uint8_t> rowBuf;
     thread_local std::vector<uint16_t> row16Buf;
@@ -1126,6 +1127,42 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     write_pod (buf, "II", 2);           /* little-endian */
     write_uint16(buf, 42);              /* TIFF magic    */
     write_uint32(buf, 0);               /* IFD-0 offset (patched later) */
+
+    /* ──  ClearHDR clamp measurement (this frame only)  ───────────
+     *
+     * Only the take's first frame measures — see the latch comment in
+     * dng_encoder.hpp for why the answer must not change mid-take. The counting
+     * rides along inside the row loops below, which already touch every sample,
+     * so the whole measurement costs one extra pass over a third of ONE frame
+     * per take and nothing at all on the rest.
+     *
+     * Not attempted for mono: there are no colour channels to converge, which
+     * is the signature the detector keys on, and with no white balance there is
+     * no magenta to fix either.
+     *
+     * kRowStride 3 rather than an even stride ON PURPOSE. Sampling every 3rd
+     * row alternates Bayer phase (0,3,6,9 -> even,odd,even,odd), so all four
+     * CFA positions are seen; any even stride would lock onto one row parity
+     * and never count blue at all.
+     *
+     * NOT COVERED: the two COMP1 -> packed12/packed10 branches below, which go
+     * straight from compressed bytes to packed bytes with no uint16 row in
+     * between, so there is nothing to count without adding a decode pass. They
+     * simply never call add_row(), the detector sees zero samples, detect()
+     * refuses, and the take keeps its nominal WhiteLevel — i.e. today's
+     * behaviour, which is the right failure. Wiring them up is a second pass
+     * over the frame and should wait until a ClearHDR take is actually
+     * observed landing there. */
+    constexpr unsigned kRowStride = 3;
+    ClipCeilingDetector ceiling_det;
+    const bool measuring = publish_clip_ceiling_gen && !mono_;
+    if (measuring)
+    {
+        const uint8_t cfa[4] = {
+            static_cast<uint8_t>(dng_info.bayer_order[0]), static_cast<uint8_t>(dng_info.bayer_order[1]),
+            static_cast<uint8_t>(dng_info.bayer_order[2]), static_cast<uint8_t>(dng_info.bayer_order[3]) };
+        ceiling_det.reset((1u << dng_info.bits) - 1u, cfa);
+    }
 
     /* ── 1. Raw image copy (packing if 12-bit) ─────────────────── */
     const uint32_t rawOff = buf.offset;
@@ -1176,6 +1213,8 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
             }
 
             log_lut_->encode_row(lin, row16Buf.data(), info.width);
+            if (measuring && y % kRowStride == 0)
+                ceiling_det.add_row(row16Buf.data(), info.width, y);
             if (target == 12)
                 pack_row_12bit(row16Buf.data(), rowBuf.data(), info.width);
             else
@@ -1223,6 +1262,8 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
             for (uint32_t y = 0; y < info.height; ++y)
             {
                 unpack_pisp_comp1_row_to_16(raw + y * info.stride, row16Buf.data(), info.width);
+                if (measuring && y % kRowStride == 0)
+                    ceiling_det.add_row(row16Buf.data(), info.width, y);
                 write_pod(buf, row16Buf.data(), rowBytes);
             }
         }
@@ -1235,6 +1276,8 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         for (uint32_t y = 0; y < info.height; ++y) {
             const uint16_t *src = reinterpret_cast<const uint16_t *>(
                                     raw + y * info.stride);
+            if (measuring && y % kRowStride == 0)
+                ceiling_det.add_row(src, info.width, y, 4);   /* pack_row_16_to_12bit's >> 4 */
             pack_row_16_to_12bit(src, rowBuf.data(), info.width);
             write_pod(buf, rowBuf.data(), rowPacked);
         }
@@ -1254,6 +1297,8 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         for (uint32_t y = 0; y < info.height; ++y) {
             const uint16_t *src = reinterpret_cast<const uint16_t *>(
                                     raw + y * info.stride);
+            if (measuring && y % kRowStride == 0)
+                ceiling_det.add_row(src, info.width, y, 6);   /* pack_row_16_to_10bit's >> 6 */
             pack_row_16_to_10bit(src, rowBuf.data(), info.width);
             write_pod(buf, rowBuf.data(), rowPacked);
         }
@@ -1284,6 +1329,8 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                  * justified in the low 12 bits. */
                 src = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
             }
+            if (measuring && y % kRowStride == 0)
+                ceiling_det.add_row(src, info.width, y);
             pack_row_12bit(src, rowBuf.data(), info.width);
             write_pod(buf, rowBuf.data(), rowPacked);
         }
@@ -1327,6 +1374,8 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
                  * never reachable — see the branch comment above. */
                 src = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
             }
+            if (measuring && y % kRowStride == 0)
+                ceiling_det.add_row(src, info.width, y);
             pack_row_10bit(src, rowBuf.data(), info.width);
             write_pod(buf, rowBuf.data(), rowPacked);
         }
@@ -1336,11 +1385,87 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         /* 14- or 16-bit → copy verbatim, one active row each */
         const uint32_t rowBytes = (info.width * dng_info.bits + 7) / 8;
         for (uint32_t y = 0; y < info.height; ++y)
+        {
+            if (measuring && y % kRowStride == 0)
+                ceiling_det.add_row(reinterpret_cast<const uint16_t *>(raw + y * info.stride),
+                                    info.width, y);
             write_pod(buf, raw + y * info.stride, rowBytes);
+        }
     }
 
     /* exact size we really wrote */
     const uint32_t rawSize = buf.offset - rawOff;
+
+    /* ──  2b. The take's WhiteLevel  ──────────────────────────────
+     *
+     * The measuring frame resolves the clamp and publishes it; every other
+     * frame of the take adopts what it published (encodeThread() has already
+     * waited for it, so this is a read, not a wait). See clip_ceiling.hpp for
+     * why a clamp short of the container makes highlights magenta, and
+     * dng_encoder.hpp for why the answer is per take and not per frame.
+     *
+     * The publisher ALWAYS publishes, including when it found nothing and
+     * including the mono case it never measured at all: a waiter that blocks
+     * on a frame which decided nothing would stall the take. 0 means "keep
+     * the nominal dng_info.white". */
+    uint32_t clip_white = 0;
+    if (publish_clip_ceiling_gen)
+    {
+        uint32_t measured = 0;
+        if (measuring)
+        {
+            const ClipCeilingDetector::Result cr = ceiling_det.detect();
+            if (cr.found)
+            {
+                /* Into the TAG's domain. Under a LinearizationTable a reader
+                 * applies the curve before reading the level tags, so
+                 * WhiteLevel describes the table's OUTPUT and the ceiling code
+                 * has to go through the same table to get there. Same chain in
+                 * the same order as the BlackLevel and 0xC618 blocks below —
+                 * log first, then CCMP, then neither — because the three must
+                 * agree about which curve is live.
+                 *
+                 * No black-level floor is checked here: the detector already
+                 * refuses a ceiling below a third of full scale, and every
+                 * pedestal this encoder writes sits near 5% of it. */
+                uint32_t w = cr.ceiling;
+                if (log_lut_ && cr.ceiling < log_lut_->inverse_size())
+                    w = log_lut_->inverse()[cr.ceiling];
+                else if (ccmp_lut_ && cr.ceiling < ccmp_lut_->size())
+                    w = ccmp_lut_->table()[cr.ceiling];
+
+                /* Only ever LOWER it. Raising WhiteLevel above the curve's own
+                 * output range would claim headroom the table cannot produce. */
+                if (w < dng_info.white)
+                    measured = w;
+            }
+
+            if (measured)
+                console->info("ClearHDR clamp: WhiteLevel {} -> {} ({:.1f}% of nominal), "
+                              "stored code {} of {}, body {} samples of {}",
+                              dng_info.white, measured, 100.0 * measured / dng_info.white,
+                              cr.ceiling, (1u << dng_info.bits) - 1u,
+                              cr.band_samples, cr.sampled);
+            else
+                console->info("ClearHDR clamp: none adopted, WhiteLevel stays {} ({})",
+                              dng_info.white,
+                              cr.found ? "measured ceiling not below nominal"
+                                       : (cr.why ? cr.why : "no verdict"));
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(clip_ceiling_mutex_);
+            clip_ceiling_white_        = measured;
+            clip_ceiling_resolved_gen_ = publish_clip_ceiling_gen;
+        }
+        clip_ceiling_cv_.notify_all();
+        clip_white = measured;
+    }
+    else
+    {
+        std::lock_guard<std::mutex> lk(clip_ceiling_mutex_);
+        clip_white = clip_ceiling_white_;
+    }
 
 
 
@@ -1454,7 +1579,10 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     int32_t blackRat[8];
     for (int i = 0; i < 4; ++i) { blackRat[2 * i] = black[i]; blackRat[2 * i + 1] = 1; }
     ifd.addEntry(0xC61A, TIFF_RATIONAL, 4, blackRat);
-    uint16_t white16 = static_cast<uint16_t>(dng_info.white);
+    /* The take's measured ClearHDR clamp when there is one, else the curve's
+     * nominal full scale. Section 2b resolved this; clip_white is 0 whenever
+     * no clamp was adopted, which is every non-ClearHDR mode. */
+    uint16_t white16 = static_cast<uint16_t>(clip_white ? clip_white : dng_info.white);
     ifd.addEntry(0xC61D, TIFF_SHORT, 1, &white16);
 
     /* LinearizationTable — the log curve (composed with the CCMP decompand
@@ -1837,6 +1965,14 @@ void DngEncoder::encodeThread(int num)
 
     while (true)
     {
+        /* Non-zero if THIS frame owns the take's ClearHDR clamp measurement,
+         * in which case it owes every other frame of the take a published
+         * answer stamped with that generation. my_ceiling_gen is the take this
+         * frame belongs to, which is not necessarily the take that is
+         * recording by the time the frame is encoded. */
+        uint64_t publish_ceiling_gen = 0;
+        uint64_t my_ceiling_gen      = 0;
+
         /* ──  Get the next job from the queue  ───────────────── */
         {
             std::unique_lock<std::mutex> lock(encode_mutex_);
@@ -1849,6 +1985,18 @@ void DngEncoder::encodeThread(int num)
 
             encode_item = encode_queue_.front();
             encode_queue_.pop();
+
+            /* Claim the ClearHDR clamp measurement for this take. Dequeue is
+             * FIFO under this mutex — the same property the TC origin below
+             * relies on — so the first claim is by definition the take's first
+             * frame, which is the only frame allowed to decide WhiteLevel
+             * (dng_encoder.hpp says why it must not change mid-take). */
+            my_ceiling_gen = clip_ceiling_gen_;
+            if (!clip_ceiling_claimed_)
+            {
+                clip_ceiling_claimed_ = true;
+                publish_ceiling_gen   = my_ceiling_gen;
+            }
 
             /* ── TC step: computed here, under encode_mutex_, so frames are
              *    processed in FIFO order and each frame's own sensor timestamp
@@ -1938,6 +2086,29 @@ void DngEncoder::encodeThread(int num)
         frames_ = encode_item.index;
         console->trace("Thread[{}] encode frame: {}", num, encode_item.index);
 
+        /* If this frame owns the measurement, it owes the others an answer on
+         * every exit path. dng_save() publishes on the way through; this
+         * publishes "nothing found" if it did not get that far. */
+        struct CeilingPublisher
+        {
+            DngEncoder *e;
+            uint64_t    gen;
+            ~CeilingPublisher()
+            {
+                if (!gen)
+                    return;
+                {
+                    std::lock_guard<std::mutex> lk(e->clip_ceiling_mutex_);
+                    if (e->clip_ceiling_resolved_gen_ >= gen)
+                        return;
+                    e->clip_ceiling_white_        = 0;
+                    e->clip_ceiling_resolved_gen_ = gen;
+                }
+                e->clip_ceiling_cv_.notify_all();
+            }
+        } ceiling_publisher { this, publish_ceiling_gen };
+
+
         /* ────────────────────────────────────────────────────── */
         /*  RAM back-pressure + aligned allocation               */
         /* ────────────────────────────────────────────────────── */
@@ -1976,6 +2147,30 @@ void DngEncoder::encodeThread(int num)
         /* ────────────────────────────────────────────────────── */
         auto start_time = std::chrono::high_resolution_clock::now();
 
+        /* ──  The take's WhiteLevel must be settled before this frame's tags
+         *     are written  ────────────────────────────────────────
+         *
+         * Non-measuring frames wait for the first frame's verdict, so every
+         * DNG in a take carries the SAME WhiteLevel. Skipping the wait would
+         * let the first few frames race past with the nominal value and put an
+         * exposure step at the head of the clip — the exact defect the
+         * per-take latch exists to prevent.
+         *
+         * The wait is bounded and the predicate also breaks on shutdown: a
+         * measuring frame that dies before publishing (dng_save throws, the
+         * buffer alloc fails) must not be able to hang the encoder. The
+         * publisher guard below covers the throw; this timeout covers whatever
+         * it does not, at the cost of the first frames falling back to the
+         * nominal WhiteLevel, which is the pre-existing behaviour. */
+        if (!publish_ceiling_gen)
+        {
+            std::unique_lock<std::mutex> lk(clip_ceiling_mutex_);
+            clip_ceiling_cv_.wait_for(lk, std::chrono::seconds(2), [this, my_ceiling_gen] {
+                return clip_ceiling_resolved_gen_ >= my_ceiling_gen ||
+                       stop_encode_.load(std::memory_order_acquire);
+            });
+        }
+
         size_t tiff_size = 0;
         try
         {
@@ -1989,7 +2184,8 @@ void DngEncoder::encodeThread(int num)
                 encode_item.losize,
                 encode_item.met,
                 encode_item.timestamp_us,
-                encode_item.tc_frame_count);
+                encode_item.tc_frame_count,
+                publish_ceiling_gen);
         }
         catch (const std::exception &e)
         {

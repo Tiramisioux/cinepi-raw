@@ -21,6 +21,7 @@
 #include "cinepi_frameinfo.hpp"
 #include "log_lut.hpp"
 #include "ccmp_lut.hpp"
+#include "clip_ceiling.hpp"
 
 
 class DngEncoder : public Encoder
@@ -73,6 +74,16 @@ public:
 		index_ = 0;
 		tc_origin_set_ = false;   // force re-capture of wall-clock origin on next frame
 		tc_frame_count_ = 0;      // prevent stale value from previous take appearing in stats
+		// Re-arm the ClearHDR clamp measurement for the new take: the merge
+		// ceiling is an operating point, so last take's answer is not this
+		// take's. Only the generation moves — clip_ceiling_white_ is left
+		// alone on purpose, so any frame of the previous take still draining
+		// through encodeThread() keeps reading the answer measured for IT.
+		{
+			std::lock_guard<std::mutex> lk(encode_mutex_);
+			clip_ceiling_claimed_ = false;
+			++clip_ceiling_gen_;
+		}
 		dropped_frames_ = 0;
 		write_failures_.store(0, std::memory_order_relaxed);  // reset disk-write-failure count
 		buffer_hwm_.store(0, std::memory_order_relaxed);  // reset disk-backlog high-water mark
@@ -95,7 +106,8 @@ public:
 		size_t losize,
 		const libcamera::ControlList &metadata,
 		int64_t timestamp_us,
-		int64_t tc_frame_count);
+		int64_t tc_frame_count,
+		uint64_t publish_clip_ceiling_gen);
 
 	int bufferSize(){
 		return disk_buffer_.size();
@@ -230,6 +242,40 @@ private:
      * a 16-bit container, and 0 when the row is already right-justified. Set
      * beside log_lut_ and only meaningful while it is non-null. */
     unsigned log_src_shift_ = 0;
+
+    /* ──  ClearHDR clamp latch (WhiteLevel)  ─────────────────
+     *
+     * The ClearHDR merge stops well below the container, but WhiteLevel is
+     * written from the curve's nominal full scale, so no converter sees a
+     * clipped pixel and every blown highlight renders magenta. clip_ceiling.hpp
+     * has the mechanism in full. These four carry the measured answer.
+     *
+     * RESOLVED EXACTLY ONCE PER TAKE, from the take's FIRST frame, and held.
+     * That is a hard requirement, not an optimisation: WhiteLevel is the
+     * normalisation denominator, so re-deciding it mid-take would step the
+     * whole frame's exposure (~0.18 EV at the measured clamp) and put a visible
+     * jump in a graded clip. resetFrameCount() clears the latch on the rec
+     * trigger; encodeThread() claims the measuring role under encode_mutex_,
+     * where the FIFO dequeue order makes "first claim" mean "frame 0"; every
+     * other frame waits on the CV until the answer is published.
+     *
+     * clip_ceiling_white_ is 0 for "no clamp found, keep the nominal
+     * dng_info.white" — which is also what a refusal publishes, so a waiter
+     * can never block on a frame that decided nothing.
+     *
+     * SCOPED BY GENERATION, not by a plain flag, because resetFrameCount()
+     * runs on the rec trigger while the PREVIOUS take may still have frames
+     * in flight. A straggler carrying generation N finds N already resolved
+     * and reads its own take's answer; only frames of the new generation wait.
+     * A bare "resolved" flag would instead send those stragglers to sleep
+     * until the next take's first frame published — up to the full timeout
+     * each, stalling the flush of a take that was already finished. */
+    std::mutex              clip_ceiling_mutex_;
+    std::condition_variable clip_ceiling_cv_;
+    uint64_t                clip_ceiling_gen_      {1};   // guarded by encode_mutex_
+    bool                    clip_ceiling_claimed_  {false};   // guarded by encode_mutex_
+    uint64_t                clip_ceiling_resolved_gen_ {0};   // guarded by clip_ceiling_mutex_
+    uint32_t                clip_ceiling_white_    {0};       // guarded by clip_ceiling_mutex_
 
     /* ──  DNG thumbnail (IFD1)  ─────────────────────────────
      * Snapshotted once per configure in setup_encoder() from
