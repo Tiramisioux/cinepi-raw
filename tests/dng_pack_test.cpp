@@ -465,6 +465,92 @@ static void test_pack_row_16_to_10bit() {
     }
 }
 
+// round_16_to_10bit / pack_row_16_to_10bit_rounded: the rounding repack the
+// COMP1 path needs. Distinct from pack_row_16_to_10bit's bare >> 6 ONLY when
+// the low six bits are non-zero, which on a real row means a lossy COMP1
+// reconstruction rather than known-zero padding.
+static void test_round_16_to_10bit() {
+    std::printf("test_round_16_to_10bit\n");
+    // On an exact v<<6 the two agree — this is what lets the same 10-bit DNG
+    // layout serve both the unpacked and the COMP1 path.
+    {
+        bool same = true;
+        for (uint32_t v = 0; v < 1024; ++v)
+            if (round_16_to_10bit(static_cast<uint16_t>(v << 6)) != v) { same = false; break; }
+        CHECK(same, "round_16_to_10bit(v<<6) == v for all 1024 codes");
+    }
+    // Rounds at the half-step, rather than truncating.
+    {
+        CHECK(round_16_to_10bit(64 * 5 +  0) == 5, "round: exact stays put");
+        CHECK(round_16_to_10bit(64 * 5 + 31) == 5, "round: below half rounds down");
+        CHECK(round_16_to_10bit(64 * 5 + 32) == 6, "round: at half rounds up");
+        CHECK(round_16_to_10bit(64 * 5 + 63) == 6, "round: above half rounds up");
+        // The bare >> 6 truncates all four to 5 — that difference is the point.
+        CHECK(static_cast<uint16_t>((64 * 5 + 63) >> 6) == 5,
+              "the truncating shift really does differ here");
+    }
+    // 65535 + 32 would wrap a uint16, and >> 6 of the unwrapped sum is 1024 —
+    // one past the 10-bit white level. Both hazards are handled.
+    {
+        CHECK(round_16_to_10bit(65535) == 1023, "round_16_to_10bit clamps 65535 to white");
+        CHECK(round_16_to_10bit(65504) == 1023, "round_16_to_10bit: 1023<<6 stays 1023");
+    }
+}
+
+static void test_pack_row_16_to_10bit_rounded() {
+    std::printf("test_pack_row_16_to_10bit_rounded\n");
+    // Byte-for-byte identical to pack_row_16_to_10bit whenever the source is a
+    // clean v<<6 row, across every width including the ragged tails.
+    {
+        bool same = true;
+        size_t bad_w = 0;
+        for (uint32_t w = 1; w <= 33 && same; ++w) {
+            std::vector<uint16_t> src(w);
+            for (uint32_t x = 0; x < w; ++x)
+                src[x] = static_cast<uint16_t>(((x * 37u) & 0x3FF) << 6);
+            const size_t n = (static_cast<size_t>(w) * 10u + 7u) / 8u;
+            std::vector<uint8_t> a(n, 0), b(n, 0);
+            pack_row_16_to_10bit(src.data(), a.data(), w);
+            pack_row_16_to_10bit_rounded(src.data(), b.data(), w);
+            for (size_t i = 0; i < n; ++i)
+                if (a[i] != b[i]) { same = false; bad_w = w; break; }
+        }
+        CHECK(same, "rounded == truncating on exact v<<6 rows, widths 1..33");
+        if (!same) std::printf("  first differing width: %zu\n", bad_w);
+    }
+    // And genuinely different once the padding bits carry something: a row of
+    // v<<6 | 32 must round every sample UP by one code.
+    {
+        const uint16_t src[4] = { static_cast<uint16_t>((100 << 6) | 32),
+                                  static_cast<uint16_t>((200 << 6) | 32),
+                                  static_cast<uint16_t>((300 << 6) | 63),
+                                  static_cast<uint16_t>((400 << 6) | 32) };
+        const uint16_t exp[4] = { 101, 201, 301, 401 };
+        uint8_t dst[5] = {0};
+        uint16_t back[4] = {0};
+        pack_row_16_to_10bit_rounded(src, dst, 4);
+        unpack_row_10bit(dst, back, 4);
+        CHECK(words_equal("rounds up", back, exp, 4),
+              "rounded packer lifts half-step samples to the next code");
+    }
+    // Same byte-count contract as its truncating sibling: exactly (w*10+7)/8
+    // bytes at every width, never a byte more.
+    {
+        bool clean = true;
+        for (uint32_t w = 1; w <= 64; ++w) {
+            const size_t exact = (static_cast<size_t>(w) * 10u + 7u) / 8u;
+            std::vector<uint16_t> src(w);
+            for (uint32_t x = 0; x < w; ++x)
+                src[x] = static_cast<uint16_t>((x * 1013u) & 0xFFFF);
+            std::vector<uint8_t> dst(exact + 8, 0xEE);
+            pack_row_16_to_10bit_rounded(src.data(), dst.data(), w);
+            for (size_t i = exact; i < dst.size(); ++i)
+                if (dst[i] != 0xEE) { clean = false; break; }
+        }
+        CHECK(clean, "rounded packer writes exactly (w*10+7)/8 bytes, widths 1..64");
+    }
+}
+
 // ── TIER 2: MIPI CSI-2 unpackers ─────────────────────────────────────────────
 
 // Build the CSI2 RAW12 byte triple for two right-justified 12-bit values, per
@@ -674,6 +760,165 @@ static void test_unpack_pisp_comp1_row_to_packed12() {
     }
 }
 
+// unpack_pisp_comp1_row_to_packed10: COMP1 -> packed 10-bit, the branch a
+// 10-bit imx519 mode takes on a Pi 5 (cinemate resolves packing 'P' for that
+// sensor, and libcamera's PiSP handler turns a CSI2-packed request into COMP1).
+//
+// The checks below also PIN THE MEASUREMENT that decided this path exists at
+// all — see unpack_pisp_comp1_row_to_packed10()'s comment in dng_pack.hpp. If a
+// libpisp change ever alters the dequant curves, these fail and the trade has
+// to be re-argued rather than silently re-taken.
+static void test_unpack_pisp_comp1_row_to_packed10() {
+    std::printf("test_unpack_pisp_comp1_row_to_packed10\n");
+
+    // The lattice claim. Every value the decoder can emit passes through
+    // pisp_dequantize_fast() (index-clamped) and then the +2048 offset, so
+    // iterating the LUT domain covers a SUPERSET of the reachable set — which
+    // makes an "always on the 64-grid" result here strictly stronger than one
+    // measured over the reachable set alone.
+    {
+        int off_grid[4] = {0, 0, 0, 0};
+        int clamped[4]  = {0, 0, 0, 0};
+        for (int qmode = 0; qmode < 4; ++qmode)
+            for (int q = 0; q < 1024; ++q) {
+                const uint16_t d = add_pisp_comp1_offset(pisp_dequantize_fast(q, qmode));
+                if (d == 65535) { clamped[qmode]++; continue; }   // saturation, not a level
+                if (d % 64) off_grid[qmode]++;
+            }
+        CHECK(off_grid[1] == 0, "qmode 1 decodes only onto the 64-grid");
+        CHECK(off_grid[2] == 0, "qmode 2 decodes only onto the 64-grid");
+        CHECK(off_grid[3] == 0, "qmode 3 decodes only onto the 64-grid");
+        CHECK(off_grid[0] >  0, "qmode 0 is the one mode with sub-64 detail");
+        CHECK(clamped[2] > 0 && clamped[3] > 0,
+              "qmodes 2 and 3 do reach the 65535 clamp");
+        if (off_grid[1] || off_grid[2] || off_grid[3])
+            std::printf("  off-grid counts: q1=%d q2=%d q3=%d\n",
+                        off_grid[1], off_grid[2], off_grid[3]);
+    }
+
+    // The result. For every value the decoder can emit, the rounded 10-bit
+    // sample implies the SAME original sensor code as the 12-bit sample it
+    // replaces — so the two extra bits the 12-bit file was spending carry
+    // nothing recoverable. (A reader scales a 12-bit sample by /4 to reach the
+    // 10-bit domain; ties go half-up in both, which is why they never split.)
+    {
+        int disagreements = 0;
+        for (int qmode = 0; qmode < 4; ++qmode)
+            for (int q = 0; q < 1024; ++q) {
+                const uint16_t d    = add_pisp_comp1_offset(pisp_dequantize_fast(q, qmode));
+                const int      r10  = round_16_to_10bit(d);
+                const int      from12 = std::min(1023,
+                                   static_cast<int>((static_cast<double>(d >> 4) / 4.0) + 0.5));
+                if (r10 != from12) ++disagreements;
+            }
+        CHECK(disagreements == 0,
+              "rounded 10-bit implies the same code as 12-bit, over the whole decode domain");
+        if (disagreements) std::printf("  disagreements: %d\n", disagreements);
+    }
+
+    // Anchor, derived by hand. src all zero -> both words qmode 0, decode
+    // [2048,2048,3072,3072,2048,2048,2048,2048] (test A above), which rounds to
+    // the 10-bit quad pair {32,32,48,48} and {32,32,32,32}. pack_group_10bit:
+    //   {32,32,48,48}: b0=32>>2=0x08, b1=(32<<6)|(32>>4)=0x00|0x02=0x02,
+    //                  b2=(32<<4)|(48>>6)=0x00|0x00=0x00,
+    //                  b3=(48<<2)|(48>>8)=0xC0, b4=48=0x30
+    //   {32,32,32,32}: b0=0x08, b1=0x02, b2=0x00, b3=(32<<2)=0x80, b4=0x20
+    {
+        const uint8_t src[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        const uint8_t exp[10] = { 0x08, 0x02, 0x00, 0xC0, 0x30,
+                                  0x08, 0x02, 0x00, 0x80, 0x20 };
+        uint8_t dst[10] = {0};
+        unpack_pisp_comp1_row_to_packed10(src, dst, 8);
+        CHECK(bytes_equal("zeros", dst, exp, 10), "comp1->packed10 all-zero block");
+    }
+
+    // A qmode-0 block that lands OFF the 64-grid, so the rounding is doing real
+    // work. word0 = 0x00060000 sets field1=64, field2=1 -> q={1,0,0,0}, and
+    // dequant0(1)=16, so lane 0 decodes to 2048+16 = 2064: a quarter of a code
+    // above 32, a level the sensor could never have sent.
+    {
+        const uint8_t src[8] = { 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        uint16_t dec[8] = {0};
+        unpack_pisp_comp1_row_to_16(src, dec, 8);
+        CHECK(dec[0] == 2064, "comp1 qmode-0 block decodes lane 0 off the 64-grid");
+        CHECK(dec[0] % 64 != 0, "  ...and that value really is off-grid");
+
+        uint8_t  packed[10] = {0};
+        uint16_t back[8]    = {0};
+        unpack_pisp_comp1_row_to_packed10(src, packed, 8);
+        unpack_row_10bit(packed, back, 8);
+        CHECK(back[0] == 32, "off-grid 2064 rounds to code 32, as the 12-bit file implies");
+    }
+
+    // The case where truncating and rounding actually diverge: field2=2 gives
+    // q[0]=2, dequant0(2)=32, so lane 0 decodes to 2080 — exactly half a code
+    // above 32. A bare >> 6 would write 32; rounding writes 33, which is what
+    // the 12-bit sample (130, i.e. 32.5) rounds to. 49.92% of reachable
+    // qmode-0 values sit on this wrong side of a truncating shift.
+    {
+        const uint8_t src[8] = { 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        uint16_t dec[8] = {0};
+        unpack_pisp_comp1_row_to_16(src, dec, 8);
+        CHECK(dec[0] == 2080, "comp1 qmode-0 half-step block decodes to 2080");
+        CHECK(static_cast<uint16_t>(dec[0] >> 6) == 32, "  a truncating >>6 would write 32");
+
+        uint8_t  packed[10] = {0};
+        uint16_t back[8]    = {0};
+        unpack_pisp_comp1_row_to_packed10(src, packed, 8);
+        unpack_row_10bit(packed, back, 8);
+        CHECK(back[0] == 33, "  the rounding packer writes 33 instead");
+    }
+
+    // Consistency with the staged form: the row function must equal
+    // pack_row_16_to_10bit_rounded() applied to the block's own 16-bit decode.
+    {
+        const uint8_t src[16] = { 0x01, 0, 0, 0, 0, 0, 0, 0,
+                                  0x00, 0x00, 0x06, 0x00, 0x03, 0, 0, 0 };
+        uint16_t dec[16] = {0};
+        unpack_pisp_comp1_row_to_16(src, dec, 16);
+        uint8_t viaPack[20] = {0};
+        pack_row_16_to_10bit_rounded(dec, viaPack, 16);
+        uint8_t direct[20] = {0};
+        unpack_pisp_comp1_row_to_packed10(src, direct, 16);
+        CHECK(bytes_equal("consistency", direct, viaPack, 20),
+              "comp1->packed10 == pack10_rounded(comp1->16) over two blocks");
+    }
+
+    // Tail: a width that is not a whole block must pack only those pixels and
+    // emit exactly (w*10+7)/8 bytes, with no read past the single source block.
+    {
+        const uint8_t src[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        const uint8_t exp[5] = { 0x08, 0x02, 0x00, 0xC0, 0x30 };   // first quad only
+        uint8_t dst[6];
+        std::memset(dst, 0xEE, sizeof dst);
+        unpack_pisp_comp1_row_to_packed10(src, dst, 4);
+        CHECK(bytes_equal("tail4", dst, exp, 5), "comp1->packed10 width=4 tail");
+        CHECK(dst[5] == 0xEE, "comp1->packed10 width=4 writes exactly 5 bytes");
+    }
+    // Byte-count sweep across every width through two blocks, guard bytes after.
+    {
+        bool clean = true;
+        size_t first_bad = 0;
+        std::vector<uint8_t> src(24, 0x5A);
+        for (uint32_t w = 1; w <= 24; ++w) {
+            const size_t exact = (static_cast<size_t>(w) * 10u + 7u) / 8u;
+            std::vector<uint8_t> dst(exact + 8, 0xEE);
+            unpack_pisp_comp1_row_to_packed10(src.data(), dst.data(), w);
+            for (size_t i = exact; i < dst.size(); ++i)
+                if (dst[i] != 0xEE) { clean = false; if (!first_bad) first_bad = w; break; }
+        }
+        CHECK(clean, "comp1->packed10 writes exactly (w*10+7)/8 bytes at every width 1..24");
+        if (!clean) std::printf("  first bad width: %zu\n", first_bad);
+    }
+    // The size claim that motivated the branch: 1.25 B/px against the 12-bit
+    // path's 1.5, i.e. one sixth off the raw plane.
+    {
+        const uint32_t w = 3840;
+        const uint32_t b10 = (w * 10 + 7) / 8, b12 = (w * 12 + 7) / 8;
+        CHECK(b10 * 6 == b12 * 5, "packed10 row is exactly 5/6 of the packed12 row");
+    }
+}
+
 int main() {
     std::printf("=== dng_pack unit tests ===\n");
     // Tier 1
@@ -682,6 +927,8 @@ int main() {
     test_pack_row_12bit();
     test_pack_row_10bit();
     test_pack_row_16_to_10bit();
+    test_round_16_to_10bit();
+    test_pack_row_16_to_10bit_rounded();
     // Tier 2
     test_unpack_csi2_raw12();
     test_unpack_csi2_raw10();
@@ -689,6 +936,7 @@ int main() {
     // Tier 3
     test_unpack_pisp_comp1_row_to_16();
     test_unpack_pisp_comp1_row_to_packed12();
+    test_unpack_pisp_comp1_row_to_packed10();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) std::printf("ALL TESTS PASSED\n");

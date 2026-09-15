@@ -8,14 +8,14 @@
 # -- and there is no subprojects/*.wrap to fetch it, so `meson setup` on a
 # plain ubuntu-latest runner aborts at configure time with "Dependency
 # libcamera not found", regardless of which target you actually want to
-# build. Building libcamera from source just to run eight pure-C++ unit
+# build. Building libcamera from source just to run eleven pure-C++ unit
 # tests is the multi-minute Pi-build this workflow exists to avoid.
 #
-# What runs instead: each of the eight cinepi/meson.build test() targets
+# What runs instead: each of the eleven cinepi/meson.build test() targets
 # (see lines 66-139) includes exactly one project header plus the C++
 # standard library -- no libcamera, no Redis, no rpicam-apps -- so they are
 # compiled and run directly with g++, bypassing meson setup entirely. This
-# was verified by hand before writing this workflow: all eight build and
+# was verified by hand before writing this workflow: all eleven build and
 # pass on plain x86-64 Linux with nothing but g++.
 #
 # If meson setup ever stops requiring libcamera unconditionally (or a wrap
@@ -49,7 +49,7 @@ jobs:
       # and ../resources/ccmp_log_luts from that directory -- the same
       # resources/ccmp_luts and resources/ccmp_log_luts used here from the
       # repo root.
-      - name: Build and run the ten cinepi unit tests
+      - name: Build and run the eleven cinepi unit tests
         run: |
           set -euo pipefail
           fail=0
@@ -72,6 +72,7 @@ jobs:
 
           build_and_run phase_lock_core
           build_and_run dng_pack
+          build_and_run dng_output_depth
           build_and_run ifd_builder
           build_and_run dng_thumbnail
           build_and_run log_lut

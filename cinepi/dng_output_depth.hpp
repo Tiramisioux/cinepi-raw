@@ -60,8 +60,9 @@ struct DngOutputDepth
  *                      dimensions match; see cinepi_raw.cpp and ccmp_gate.hpp).
  *   packed / compressed
  *                    - the row layout: CSI2-packed, or PiSP COMP1. Both are
- *                      dispatched on earlier in dng_save() and neither is
- *                      eligible for a narrowing repack here.
+ *                      dispatched on earlier in dng_save(). `packed` is not
+ *                      eligible for a narrowing repack; `compressed` is, and
+ *                      takes the 10-bit one -- see the note at that branch.
  *
  * Returns the container's own depth unchanged whenever no narrowing applies,
  * so the caller can assign unconditionally and never leave a stale flag set
@@ -85,11 +86,32 @@ inline DngOutputDepth resolve_dng_output_depth(unsigned container,
      * dng_save()'s compressed branch reads that same flag to choose between
      * unpack_pisp_comp1_row_to_packed12() and a 2 B/px verbatim write --
      * clearing it there would silently turn every COMP1 take into a 16-bit
-     * file. 10-bit is excluded instead: COMP1's dequantisation does not
-     * reconstruct multiples of 64 in three of its four quantisation modes, so
-     * a 10-bit repack would discard detail a 12-bit one keeps, and that trade
-     * has never been measured. */
-    if (sensor_bit_depth == 10 && !packed && !compressed)
+     * file.
+     *
+     * `compressed` USED TO gate the 10-bit case too, on the grounds that
+     * COMP1's dequantisation "does not reconstruct multiples of 64 in three of
+     * its four quantisation modes". That count was measured over LUT indices
+     * and, re-measured on 2026-09-15 over the decoder's actual output, does not
+     * survive: in qmodes 1, 2 and 3 EVERY off-grid value is the 65535
+     * saturation clamp -- white, which a 10-bit and a 12-bit file each record
+     * correctly as their own white level -- and not reconstruction detail at
+     * all. qmode 0 is the only mode with real sub-64 levels.
+     *
+     * And even qmode 0's cannot be signal. What enters the compressor on a
+     * 10-bit mode is the sensor code MSB-aligned, i.e. an exact multiple of 64
+     * (the frontend's BLA block is a no-op for every shipped tuning -- they all
+     * give a single scalar black_level, so it computes in - BL + BL), so a
+     * decoded value off the 64-grid is always codec error, never a level the
+     * sensor could have sent. Rounding to 10 bits recovers the same original
+     * code the 12-bit sample implies, for every value the decoder can emit,
+     * with zero disagreements. The full measurement is written out at
+     * unpack_pisp_comp1_row_to_packed10() in dng_pack.hpp and pinned by
+     * tests/dng_pack_test.cpp.
+     *
+     * So COMP1 is eligible, and a 10-bit imx519 mode stops paying 1.5 B/px for
+     * 1.25 B/px of information. `packed` still gates: a CSI2-packed 16-bit row
+     * is a shape dng_save() has no unpacker for. */
+    if (sensor_bit_depth == 10 && !packed)
         return { 10u, container - 10u, false, true };
 
     /* 12 is the fallback for every remaining depth -- 0 (unset), 8, 14, or

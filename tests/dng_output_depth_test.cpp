@@ -15,8 +15,10 @@
 //
 // Two properties here are regression guards rather than new behaviour, and
 // both were live bugs during development:
-//   * COMP1 rows must KEEP pack12 — dng_save()'s compressed branch reads that
-//     flag to choose packed-12 over a 2 B/px verbatim write.
+//   * A 12-bit COMP1 row must KEEP pack12 — dng_save()'s compressed branch
+//     reads that flag to choose packed-12 over a 2 B/px verbatim write. (A
+//     10-bit COMP1 row takes pack10 instead, and that branch reads it the same
+//     way; see test_comp1.)
 //   * The two flags must never both be set, at any input.
 
 #include "cinepi/dng_output_depth.hpp"
@@ -78,18 +80,26 @@ static void test_pi4_vc4() {
 }
 
 // REGRESSION GUARD. dng_save() dispatches on bayer_format.compressed BEFORE
-// either flag, and its compressed branch reads pack12 to choose between
-// unpack_pisp_comp1_row_to_packed12() and a 2 B/px verbatim write. Clearing
-// pack12 for COMP1 would turn every COMP1 take into a 16-bit file; excluding
-// COMP1 from pack10 is deliberate and separate.
+// either flag, and its compressed branch reads pack12/pack10 to choose among
+// unpack_pisp_comp1_row_to_packed12(), _packed10() and a 2 B/px verbatim
+// write. Clearing pack12 for a 12-bit COMP1 row would turn that take into a
+// 16-bit file.
+//
+// A 10-bit COMP1 row takes pack10 as of 2026-09-15, which is the one case here
+// that changed: the repack was measured rather than guessed at (the numbers are
+// in dng_output_depth.hpp and dng_pack.hpp, pinned by tests/dng_pack_test.cpp).
 static void test_comp1() {
     std::printf("test_comp1\n");
     CHECK(same(resolve_dng_output_depth(16, 12, true, false, true), 12, 4, true, false),
           "COMP1 12-bit KEEPS pack12 (else the take becomes 16-bit)");
-    CHECK(same(resolve_dng_output_depth(16, 10, true, false, true), 12, 4, true, false),
-          "COMP1 10-bit stays on the 12-bit path, unmeasured repack not guessed at");
+    CHECK(same(resolve_dng_output_depth(16, 10, true, false, true), 10, 6, false, true),
+          "COMP1 10-bit takes pack10 — the measured repack, not the padded 12");
     CHECK(same(resolve_dng_output_depth(16, 16, true, false, true), 16, 0, false, false),
           "COMP1 16-bit ClearHDR -> container verbatim");
+    // The 12-bit COMP1 case and the 10-bit one must not collapse into each
+    // other: they differ in every field, which is what makes the branch real.
+    CHECK(!same(resolve_dng_output_depth(16, 10, true, false, true), 12, 4, true, false),
+          "COMP1 10-bit is no longer the 12-bit answer");
 }
 
 // An untrusted snapshot describes the REQUEST, not this stream. Fail toward the

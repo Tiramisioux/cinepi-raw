@@ -154,6 +154,52 @@ static inline void pack_row_16_to_10bit(const uint16_t *src,
     }
 }
 
+/* Round an MSB-aligned 16-bit sample into a 10-bit code, rather than truncating
+ * it the way pack_row_16_to_10bit() does.
+ *
+ * For a row that is genuinely value << 6 the two are identical — the six low
+ * bits are zero, so +32 cannot carry. The difference only shows on a LOSSY
+ * reconstruction whose low six bits are codec noise rather than known padding,
+ * which is exactly the PiSP COMP1 case below, and there it is worth a full
+ * code. See unpack_pisp_comp1_row_to_packed10() for the measurement.
+ *
+ * The +32 is done in 32 bits and clamped: 65535 + 32 would wrap a uint16, and
+ * >> 6 of the un-wrapped sum is 1024, one past the 10-bit white level. */
+static inline uint16_t round_16_to_10bit(uint16_t v)
+{
+    return static_cast<uint16_t>(
+        std::min<uint32_t>(1023u, (static_cast<uint32_t>(v) + 32u) >> 6));
+}
+
+/* pack_row_16_to_10bit()'s rounding sibling: same contiguous 4-px-in-5-B DNG
+ * layout and the same zero-padded tail, but each sample goes through
+ * round_16_to_10bit() instead of a bare >> 6. Only the COMP1 path needs it. */
+static inline void pack_row_16_to_10bit_rounded(const uint16_t *src,
+                                                uint8_t       *dst,
+                                                uint32_t       width)
+{
+    uint32_t x = 0;
+    for (; x + 4u <= width; x += 4u, dst += 5)
+    {
+        const uint16_t g[4] { round_16_to_10bit(src[x]),
+                              round_16_to_10bit(src[x + 1]),
+                              round_16_to_10bit(src[x + 2]),
+                              round_16_to_10bit(src[x + 3]) };
+        pack_group_10bit(g, dst);
+    }
+
+    const uint32_t remaining = width - x;
+    if (remaining > 0)
+    {
+        uint16_t working[4] {};
+        uint8_t  packed[5] {};
+        for (uint32_t i = 0; i < remaining; ++i)
+            working[i] = round_16_to_10bit(src[x + i]);
+        pack_group_10bit(working, packed);
+        std::memcpy(dst, packed, (static_cast<size_t>(remaining) * 10u + 7u) / 8u);
+    }
+}
+
 /* Unpack MIPI CSI-2 RAW12 (2 px in 3 bytes) to right-justified 16-bit (0..4095).
  * VC4/Unicam delivers SBGGR12_CSI2P in this layout — verified against real Pi 4
  * IMX477 captures (decoding as contiguous-12 instead gives a checkerboard/
@@ -348,6 +394,69 @@ static inline void unpack_pisp_comp1_row_to_packed12(const uint8_t *src, uint8_t
         const uint32_t tail = std::min(remaining, 8u);
         pack_row_16_to_12bit(working, packed, tail);
         std::memcpy(dst + (static_cast<size_t>(x) / 2u) * 3u, packed, (tail * 12u + 7u) / 8u);
+    }
+}
+
+/* COMP1 -> packed 10-bit, the 10-bit sibling of the _packed12 row above.
+ *
+ * WHY THIS IS SAFE, and why it ROUNDS where every other 16->N packer in this
+ * header truncates. Measured 2026-09-15 by driving pisp_comp1_subblock() over
+ * its entire field space and enumerating the exact reachable decoded set:
+ *
+ *   qmode 1   639 of 639 decoded values are multiples of 64
+ *   qmode 2   496 of 497        "        (the 1 exception is the 65535 clamp)
+ *   qmode 3   171 of 172        "        (likewise)
+ *   qmode 0   240 of 639        "        — its dequant is 16 * q, a lattice
+ *                                          four times FINER than a 10-bit code
+ *
+ * So only qmode 0 carries any sub-64 detail at all, and that detail cannot be
+ * signal: what enters the compressor on a 10-bit mode is the sensor code
+ * MSB-aligned, i.e. an exact multiple of 64 (the frontend's BLA block is a
+ * no-op for every shipped tuning — they all give a single scalar black_level,
+ * so it computes in - BL + BL). A decoded value off the 64-grid is therefore
+ * always COMP1 reconstruction error, never a level the sensor could have sent.
+ *
+ * Which settles the >> 6 vs >> 4 question that kept this branch excluded. For
+ * a decoded D the best available estimate of the original code is round(D/64),
+ * and over the WHOLE reachable set:
+ *   - rounding to 10 bits reproduces that estimate exactly, every qmode, max
+ *     error 0 codes;
+ *   - truncating (a bare >> 6) mis-rounds 49.92% of qmode-0 values by one full
+ *     code — a systematic half-code shadow bias, since qmode 0 spans decoded
+ *     2064..17312, i.e. 3%..26% of full scale;
+ *   - the 12-bit sample this replaces never implies a DIFFERENT original code
+ *     than the rounded 10-bit sample: 0 disagreements across every reachable
+ *     value.
+ *
+ * That last line is the whole result. The two extra bits the 12-bit file was
+ * spending on a 10-bit COMP1 mode record the codec's own error, not the
+ * sensor's output, so dropping them costs no recoverable detail and saves
+ * 0.25 B/px. Rounding rather than truncating is what makes that true; do not
+ * "simplify" this to pack_row_16_to_10bit(). */
+static inline void unpack_pisp_comp1_row_to_packed10(const uint8_t *src,
+                                                     uint8_t       *dst,
+                                                     uint32_t       width)
+{
+    const uint32_t full_blocks = width / 8u;
+    uint32_t x = 0;
+    for (uint32_t block = 0; block < full_blocks; ++block, x += 8u, src += 8u)
+    {
+        uint16_t working[8];
+        decode_pisp_comp1_block(src, working);
+        /* x is a multiple of 8, so (x / 4) * 5 is exactly x * 10 / 8 with no
+         * rounding — the same trick _packed12 plays with (x / 2) * 3. */
+        pack_row_16_to_10bit_rounded(working, dst + (static_cast<size_t>(x) / 4u) * 5u, 8u);
+    }
+
+    const uint32_t remaining = width - x;
+    if (remaining > 0)
+    {
+        uint16_t working[8] {};
+        uint8_t  packed[10] {};
+        decode_pisp_comp1_block(src, working);
+        const uint32_t tail = std::min(remaining, 8u);
+        pack_row_16_to_10bit_rounded(working, packed, tail);
+        std::memcpy(dst + (static_cast<size_t>(x) / 4u) * 5u, packed, (tail * 10u + 7u) / 8u);
     }
 }
 

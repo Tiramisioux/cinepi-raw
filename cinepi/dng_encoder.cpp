@@ -575,27 +575,22 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      *                     justified or CSI2-packed; they belong to the
      *                     dng_info.bits == 10 branch in dng_save(), not here,
      *                     and a >> 6 applied to them would black the frame.
-     *   !bf.packed / !bf.compressed
-     *                   — a 10:P request reaches us as PiSP COMP1, which
-     *                     dng_save() dispatches on BEFORE either flag. COMP1
-     *                     decodes into the same MSB-aligned 16-bit domain so
-     *                     >> 6 would be arithmetically right, but the codec is
-     *                     LOSSY and its four quantisation modes do not agree
-     *                     on whether that matters: qmode 1 is exactly 64*q, so
-     *                     >> 6 is lossless there, but qmodes 0, 2 and 3 emit
-     *                     non-multiples of 64 for 592, 512 and 849 of their
-     *                     1024 codes respectively, and >> 6 would discard
-     *                     reconstruction detail that >> 4 keeps. Whether that
-     *                     loss is above the sensor's own noise has never been
-     *                     measured, so this keeps today's 12-bit behaviour
-     *                     rather than shipping an untested file — the same
-     *                     rule the CCMP and log gates follow. This leg is
-     *                     REACHABLE, not hypothetical: cinemate resolves
-     *                     packing 'U' on Pi 5 for imx477/imx296/imx283/imx585
-     *                     but 'P' for imx519 (sensors.json), so a 10-bit
-     *                     imx519 mode lands here and still pays 1.5 B/px.
-     *                     Measuring that repack is the follow-up this
-     *                     deliberately does not guess at.
+     *   !bf.packed      — a CSI2-packed 16-bit row is a shape dng_save() has
+     *                     no unpacker for. PiSP never produces one, so this is
+     *                     a tripwire rather than a live case.
+     *
+     *                     COMP1 is NOT excluded, as of 2026-09-15. A 10:P
+     *                     request reaches us as PiSP COMP1, which dng_save()
+     *                     dispatches on BEFORE either flag; its compressed
+     *                     branch now reads write10bit_ itself. The earlier
+     *                     exclusion rested on a count of COMP1 codes that do
+     *                     not reconstruct multiples of 64, re-measured and
+     *                     corrected in dng_output_depth.hpp: in three of the
+     *                     four quantisation modes every such code is the
+     *                     saturation clamp, and in the fourth the sub-64 bits
+     *                     are codec error rather than sensor signal. So the
+     *                     leg is taken, and a 10-bit imx519 mode stops paying
+     *                     1.5 B/px for 1.25 B/px of information.
      *   sensor_mode_trusted_
      *                   — kept for the same reason the 12-bit case keeps it,
      *                     and the stakes are higher here: every other way this
@@ -1198,6 +1193,25 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
             for (uint32_t y = 0; y < info.height; ++y)
             {
                 unpack_pisp_comp1_row_to_packed12(raw + y * info.stride, rowBuf.data(), info.width);
+                write_pod(buf, rowBuf.data(), rowPacked);
+            }
+        }
+        else if (write10bit_)
+        {
+            /* A native 10-bit mode requested as ':P' — libcamera's PiSP handler
+             * turns the CSI2 packing into COMP1 rather than honouring it, so
+             * this is where a 10-bit imx519 take lands on a Pi 5. The row
+             * function ROUNDS to 10 bits instead of truncating, which is what
+             * makes the repack cost nothing against the 12-bit file it
+             * replaces; the measurement behind that is written out in full at
+             * unpack_pisp_comp1_row_to_packed10() in dng_pack.hpp, and the rule
+             * that sends a COMP1 row here at all is in dng_output_depth.hpp. */
+            const uint32_t rowPacked = (info.width * 10 + 7) / 8;   /* 1.25 B / px */
+            rowBuf.resize(rowPacked);
+
+            for (uint32_t y = 0; y < info.height; ++y)
+            {
+                unpack_pisp_comp1_row_to_packed10(raw + y * info.stride, rowBuf.data(), info.width);
                 write_pod(buf, rowBuf.data(), rowPacked);
             }
         }
