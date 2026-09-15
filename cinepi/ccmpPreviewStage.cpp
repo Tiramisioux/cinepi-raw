@@ -224,6 +224,10 @@ private:
 	 * than leaving it to be inferred from drop counts again. */
 	unsigned long measure_us_ = 0;
 	unsigned long measure_frames_ = 0;
+	unsigned long render_us_ = 0;
+	unsigned long sync_us_ = 0;
+	unsigned long render_frames_ = 0;
+	std::chrono::steady_clock::time_point last_report_ = std::chrono::steady_clock::now();
 };
 
 void ccmpPreviewStage::Configure()
@@ -505,10 +509,17 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 	}
 	renderer_.setColour(colour_);
 
+	/* Timed separately from the render because they are different costs with
+	 * different cures: these two block on the DMA fence for buffers the ISP may
+	 * still be writing, and no amount of optimising the render touches that. */
+	const auto t_sync = std::chrono::steady_clock::now();
 	BufferReadSync rr(app_, raw_it->second);
 	BufferWriteSync lw(app_, lores_it->second);
 	libcamera::Span<uint8_t> raw = rr.Get()[0];
 	libcamera::Span<uint8_t> lores = lw.Get()[0];
+	sync_us_ += static_cast<unsigned long>(
+		std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - t_sync).count());
 
 	/* Short buffers would be read or written past the end, and this runs on the
 	 * post-processing thread where that is a silent heap corruption rather than
@@ -543,7 +554,18 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 		measureClamp(raw.data());
 	}
 
+	/* THE ONE THAT WAS NEVER MEASURED. For 12-bit this re-render earns its
+	 * keep: the ISP was fed companded codes and got the whole tone scale wrong,
+	 * so every pixel genuinely has to be redone. For 16-bit the ISP's render is
+	 * already correct everywhere EXCEPT the blown highlights — and this redoes
+	 * all of it in software anyway, at 4K, to fix the clipped pixels. If that
+	 * is the cost, the cure is not to make this faster but to stop doing it. */
+	const auto t_render = std::chrono::steady_clock::now();
 	renderer_.render(raw.data(), lores.data());
+	render_us_ += static_cast<unsigned long>(
+		std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - t_render).count());
+	++render_frames_;
 
 	/* The one number that says whether sensor_clip_code matches this sensor:
 	 * point the camera at a blown highlight and the peak should settle at (not
@@ -567,13 +589,31 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 						  renderer_.fullyDesaturated(), frames_since_report_,
 						  renderer_.clipCeiling(),
 						  renderer_.usingMeasuredCeiling() ? "measured" : "nominal, not yet measured");
-		if (measure_ && measure_frames_)
+		if (render_frames_)
 		{
-			console->info("ccmpPreview: measurement cost {:.2f} ms/frame over {} frames",
-						  static_cast<double>(measure_us_) / static_cast<double>(measure_frames_) / 1000.0,
-						  measure_frames_);
-			measure_us_ = 0;
-			measure_frames_ = 0;
+			/* Frames the stage actually SAW, over the wall time it took to see
+			 * them. This is the number that says whether the pipeline is
+			 * keeping up at all, and it is independent of the drop counter —
+			 * if it reads 22 against a requested 25, three frames a second are
+			 * going missing somewhere, and the per-stage costs beside it say
+			 * whether this stage can account for them. */
+			const auto now = std::chrono::steady_clock::now();
+			const double span_s = std::chrono::duration<double>(now - last_report_).count();
+			const double fps = span_s > 0.0 ? static_cast<double>(render_frames_) / span_s : 0.0;
+			last_report_ = now;
+			const double n = static_cast<double>(render_frames_);
+			const double meas = measure_frames_
+									? static_cast<double>(measure_us_) / static_cast<double>(measure_frames_) / 1000.0
+									: 0.0;
+			const double rend = static_cast<double>(render_us_) / n / 1000.0;
+			const double sync = static_cast<double>(sync_us_) / n / 1000.0;
+			console->info("ccmpPreview: cost/frame — render {:.2f} ms, buffer sync {:.2f} ms, "
+						  "measure {:.2f} ms, total {:.2f} ms; delivering {:.2f} fps "
+						  "({:.1f} ms/frame available) over {} frames",
+						  rend, sync, meas, rend + sync + meas, fps,
+						  fps > 0.0 ? 1000.0 / fps : 0.0, render_frames_);
+			measure_us_ = measure_frames_ = 0;
+			render_us_ = sync_us_ = render_frames_ = 0;
 		}
 		else
 			console->info("ccmpPreview: peak raw code {}, highest uncorrected {}, {} quads fully "
