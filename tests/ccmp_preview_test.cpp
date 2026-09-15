@@ -713,6 +713,69 @@ void run_sixteen_bit()
         check(mid.y < 235, "and is not blown", "Y=" + std::to_string(mid.y));
     }
 
+    /* ── the in-place path must land in the same place as the full render ────
+     *
+     * 16-bit no longer re-renders the frame; it corrects the ISP's own output
+     * where the sensor clipped and leaves the rest alone. That is only legal if
+     * it agrees with what render() would have produced — otherwise the monitor
+     * changes character with the bit depth, which is exactly the kind of drift
+     * this whole exercise has been unpicking.
+     *
+     * The stand-in for "the ISP's output" is this renderer with the rolloff
+     * OFF and referenced to nominal white: linear data, correct gains, correct
+     * matrix, correct gamma, and magenta highlights — which is precisely the
+     * ISP's situation. */
+    {
+        const unsigned clamp = 48600u;
+        const std::vector<uint8_t> raw = make_clamped_frame(geom, clamp);
+        const CcmpPreviewGeometry &g = r.geometry();
+        std::vector<uint8_t> isp(g.out_stride * g.out_height * 3 / 2, 0);
+
+        CcmpPreviewColour flat = colour;
+        flat.highlight_rolloff = 0.0;
+        r.setClipCeiling(0.0);
+        r.setColour(flat);
+        r.render(raw.data(), isp.data());
+
+        const uint8_t *yp = isp.data();
+        const uint8_t *up = yp + g.out_stride * g.out_height;
+        const uint8_t *vp = up + (g.out_stride / 2) * (g.out_height / 2);
+        const size_t ymid = (g.out_height / 2) * g.out_stride + g.out_width / 2;
+        const size_t cmid = (g.out_height / 4) * (g.out_stride / 2) + g.out_width / 4;
+        check(std::abs(static_cast<int>(up[cmid]) - 128) > 3 * kChromaTol,
+              "the stand-in ISP frame really is magenta to begin with",
+              "U=" + std::to_string(up[cmid]) + " V=" + std::to_string(vp[cmid]));
+
+        /* Now the real path: measured clamp, rolloff on, corrected in place. */
+        r.setClipCeiling(static_cast<double>(clamp));
+        r.setColour(colour);
+        r.resetMaxCode();
+        r.correctHighlightsInPlace(raw.data(), isp.data());
+
+        check(std::abs(static_cast<int>(up[cmid]) - 128) <= kChromaTol &&
+                  std::abs(static_cast<int>(vp[cmid]) - 128) <= kChromaTol,
+              "the in-place pass neutralises the clipped highlight",
+              "U=" + std::to_string(up[cmid]) + " V=" + std::to_string(vp[cmid]));
+        check(yp[ymid] >= 235, "and takes it to white",
+              "Y=" + std::to_string(yp[ymid]));
+        check(r.fullyDesaturated() > 0, "and reports the correction completing",
+              std::to_string(r.fullyDesaturated()) + " quads");
+
+        /* And the mirror: a frame BELOW the clamp must come back byte-identical,
+         * because the in-place pass is only allowed to touch clipped pixels. If
+         * it rewrites anything else it is a second render wearing a disguise. */
+        const std::vector<uint8_t> dim = make_clamped_frame(geom, 29000u);
+        std::vector<uint8_t> before(g.out_stride * g.out_height * 3 / 2, 0);
+        r.setClipCeiling(0.0);
+        r.setColour(flat);
+        r.render(dim.data(), before.data());
+        std::vector<uint8_t> after = before;
+        r.setClipCeiling(static_cast<double>(clamp));
+        r.setColour(colour);
+        r.correctHighlightsInPlace(dim.data(), after.data());
+        check(after == before, "an unclipped frame passes through untouched");
+    }
+
     /* The fallback has to be the OLD behaviour, not some other wrong number:
      * every take's first frames run before anything has been measured, and
      * they must render exactly as they do today. */

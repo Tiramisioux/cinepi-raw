@@ -554,14 +554,21 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 		measureClamp(raw.data());
 	}
 
-	/* THE ONE THAT WAS NEVER MEASURED. For 12-bit this re-render earns its
-	 * keep: the ISP was fed companded codes and got the whole tone scale wrong,
-	 * so every pixel genuinely has to be redone. For 16-bit the ISP's render is
-	 * already correct everywhere EXCEPT the blown highlights — and this redoes
-	 * all of it in software anyway, at 4K, to fix the clipped pixels. If that
-	 * is the cost, the cure is not to make this faster but to stop doing it. */
+	/* ONE RENDER PER FRAME.
+	 *
+	 * 12-bit has to be re-rendered: the ISP read companded codes as linear, so
+	 * its whole tone scale is wrong and there is nothing in its output worth
+	 * keeping. 16-bit is the opposite — the data is linear, the ISP's render is
+	 * correct, and the only thing wrong with it is that clamped highlights come
+	 * out magenta. Re-rendering the frame in software to fix that was buying
+	 * one correction at the price of a second full-frame render, and it dropped
+	 * frames at 4K. The in-place path fixes the clipped pixels and leaves the
+	 * other 99% of the frame exactly as the hardware rendered it. */
 	const auto t_render = std::chrono::steady_clock::now();
-	renderer_.render(raw.data(), lores.data());
+	if (measure_)
+		renderer_.correctHighlightsInPlace(raw.data(), lores.data());
+	else
+		renderer_.render(raw.data(), lores.data());
 	render_us_ += static_cast<unsigned long>(
 		std::chrono::duration_cast<std::chrono::microseconds>(
 			std::chrono::steady_clock::now() - t_render).count());
@@ -607,10 +614,11 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 									: 0.0;
 			const double rend = static_cast<double>(render_us_) / n / 1000.0;
 			const double sync = static_cast<double>(sync_us_) / n / 1000.0;
-			console->info("ccmpPreview: cost/frame — render {:.2f} ms, buffer sync {:.2f} ms, "
+			console->info("ccmpPreview: cost/frame — {} {:.2f} ms, buffer sync {:.2f} ms, "
 						  "measure {:.2f} ms, total {:.2f} ms; delivering {:.2f} fps "
 						  "({:.1f} ms/frame available) over {} frames",
-						  rend, sync, meas, rend + sync + meas, fps,
+						  measure_ ? "highlight pass" : "render", rend, sync, meas,
+						  rend + sync + meas, fps,
 						  fps > 0.0 ? 1000.0 / fps : 0.0, render_frames_);
 			measure_us_ = measure_frames_ = 0;
 			render_us_ = sync_us_ = render_frames_ = 0;

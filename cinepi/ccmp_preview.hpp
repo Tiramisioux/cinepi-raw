@@ -403,10 +403,124 @@ public:
             hl_scale_ = 0.f;
         }
 
+        /* The raw code at which desaturation starts, found once here instead of
+         * per pixel. lin_ is monotonic, so the comparison the render makes in
+         * the NORMALISED domain (peak > hl_lo_) is the same comparison in the
+         * CODE domain against this — which lets correctHighlightsInPlace()
+         * reject an unblown pixel with one integer compare and no table
+         * lookup, no matrix and no float at all. */
+        blown_lo_code_ = static_cast<unsigned>(
+            std::lower_bound(lin_.begin(), lin_.end(), hl_lo_) - lin_.begin());
+
         if (colour.rec709)
             setYuvCoeffs(0.2126, 0.7152, 0.0722);
         else
             setYuvCoeffs(0.299, 0.587, 0.114);
+    }
+
+    /* WHY THIS EXISTS: TWO RENDERS PER FRAME IS ONE TOO MANY.
+     *
+     * render() re-renders the whole lores frame from raw Bayer. For 12-bit that
+     * is the only option — the ISP was handed companded codes and read them as
+     * linear, so its entire tone scale is wrong and every pixel has to be
+     * redone. For 16-bit none of that applies: the data is linear, the ISP's
+     * render is already correct, and the ONLY thing wrong with it is that
+     * digitally-clamped highlights come out magenta.
+     *
+     * Calling render() there bought that one fix at the price of a second
+     * full-frame software render — 3.6M scattered raw reads, 8.1M multiplies
+     * and a rewrite of every luma and chroma byte, per frame, at 4K. It
+     * dropped frames on the rig (2026-09-15) and it deserved to.
+     *
+     * So this corrects the ISP's own output IN PLACE and touches nothing else.
+     * Per output pixel it reads the same Bayer quad, takes the peak, and
+     * compares it to blown_lo_code_ as an INTEGER. Below it — which is nearly
+     * the whole frame — that is the entire cost: no lin_ lookup, no matrix, no
+     * gamma, no YUV conversion and no write. Only genuinely clipped pixels get
+     * touched, and they get the same treatment desaturateHighlight() gives
+     * them: blended to neutral, which is white.
+     *
+     * The result is the same picture. What changes is that the frame is
+     * rendered once, by the hardware that was going to render it anyway. */
+    void correctHighlightsInPlace(const uint8_t *raw, uint8_t *yuv) const
+    {
+        if (!ready_ || !raw || !yuv || hl_scale_ <= 0.f)
+            return;
+
+        const unsigned ow = geom_.out_width, oh = geom_.out_height;
+        const size_t ys = geom_.out_stride;
+        const size_t cs = ys / 2;
+
+        uint8_t *yp = yuv;
+        uint8_t *up = yuv + ys * oh;
+        uint8_t *vp = up + cs * (oh / 2);
+
+        for (unsigned oy = 0; oy + 1 < oh; oy += 2)
+        {
+            const unsigned sy0 = srcRow(oy);
+            const unsigned sy1 = srcRow(oy + 1);
+            uint8_t *y0 = yp + static_cast<size_t>(oy) * ys;
+            uint8_t *y1 = yp + static_cast<size_t>(oy + 1) * ys;
+            uint8_t *u = up + static_cast<size_t>(oy / 2) * cs;
+            uint8_t *v = vp + static_cast<size_t>(oy / 2) * cs;
+
+            for (unsigned ox = 0; ox + 1 < ow; ox += 2)
+            {
+                const unsigned sx0 = srcCol(ox);
+                const unsigned sx1 = srcCol(ox + 1);
+
+                const unsigned pk[4] = { quadPeakCode(raw, sx0, sy0), quadPeakCode(raw, sx1, sy0),
+                                         quadPeakCode(raw, sx0, sy1), quadPeakCode(raw, sx1, sy1) };
+                const unsigned hi = std::max(std::max(pk[0], pk[1]), std::max(pk[2], pk[3]));
+                if (hi > max_code_)
+                    max_code_ = hi;
+
+                /* The whole frame, minus the blown part, leaves here. */
+                if (hi < blown_lo_code_)
+                {
+                    if (hi > max_undesat_)
+                        max_undesat_ = hi;
+                    continue;
+                }
+
+                uint8_t *const yrow[4] = { y0 + ox, y0 + ox + 1, y1 + ox, y1 + ox + 1 };
+                float blend_max = 0.f;
+                for (int i = 0; i < 4; ++i)
+                {
+                    const float b = blendFor(pk[i]);
+                    if (b > blend_max)
+                        blend_max = b;
+                    /* 0.99, not 1.0, and for the same reason render() uses it:
+                     * a pixel exactly AT the clamp produces a blend of
+                     * 0.9999990 in float, not 1.0, so testing for unity counts
+                     * nothing at all on precisely the pixels the correction
+                     * exists for. The two paths must agree on this or the same
+                     * frame reports differently depending on bit depth. */
+                    if (b >= 0.99f)
+                        ++full_desat_;
+                    else if (pk[i] > max_undesat_)
+                        max_undesat_ = pk[i];
+                    if (b <= 0.f)
+                        continue;
+                    /* Toward limited-range white, which is where a clipped
+                     * pixel lands coming out of render()'s own path. */
+                    const float cur = static_cast<float>(*yrow[i]);
+                    *yrow[i] = static_cast<uint8_t>(cur + b * (kWhiteY - cur) + 0.5f);
+                }
+
+                if (blend_max > 0.f)
+                {
+                    /* One chroma sample covers the 2x2 block, so it takes the
+                     * block's strongest blend — a half-blown block must not
+                     * keep full magenta chroma over its clipped half. */
+                    const float keep = 1.f - blend_max;
+                    uint8_t *const uc = u + ox / 2;
+                    uint8_t *const vc = v + ox / 2;
+                    *uc = static_cast<uint8_t>(128.f + keep * (static_cast<float>(*uc) - 128.f) + 0.5f);
+                    *vc = static_cast<uint8_t>(128.f + keep * (static_cast<float>(*vc) - 128.f) + 0.5f);
+                }
+            }
+        }
     }
 
     bool ready() const { return ready_; }
@@ -502,6 +616,29 @@ private:
     }
 
     /* One Bayer quad -> gamma-encoded R'G'B' in 0..1. */
+    /* The quad's largest raw code — the same `hi` quadRgb() computes, without
+     * any of the work that follows it. */
+    unsigned quadPeakCode(const uint8_t *raw, unsigned sx, unsigned sy) const
+    {
+        const uint16_t *r0 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy) * geom_.raw_stride);
+        const uint16_t *r1 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy + 1) * geom_.raw_stride);
+        const unsigned c0 = r0[sx] >> geom_.raw_shift;
+        const unsigned c1 = r0[sx + 1] >> geom_.raw_shift;
+        const unsigned c2 = r1[sx] >> geom_.raw_shift;
+        const unsigned c3 = r1[sx + 1] >> geom_.raw_shift;
+        return std::max(std::max(c0, c1), std::max(c2, c3));
+    }
+
+    /* Identical ramp to desaturateHighlight(), expressed from a code. */
+    float blendFor(unsigned code) const
+    {
+        const float peak = code < lin_.size() ? lin_[code] : 1.f;
+        if (peak <= hl_lo_)
+            return 0.f;
+        const float b = (peak - hl_lo_) * hl_scale_;
+        return b > 1.f ? 1.f : b;
+    }
+
     void quadRgb(const uint8_t *raw, unsigned sx, unsigned sy, float out[3]) const
     {
         const uint16_t *r0 = reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(sy) * geom_.raw_stride);
@@ -705,6 +842,8 @@ private:
     float gamma_[kGammaSize] = {};
     double gamma_built_ = 0.0;   /* 0 = never built, and no valid gamma is 0 */
     float hl_ref_ = 1.f;         /* normalised level of sensor_clip_code      */
+    static constexpr float kWhiteY = 235.f;   /* limited-range white           */
+    unsigned blown_lo_code_ = 0; /* first code at or above hl_lo_             */
     float hl_lo_ = 0.98f;        /* raw level where desaturation starts       */
     float hl_scale_ = 50.f;      /* 1/highlight_rolloff; 0 = correction off   */
     /* Observability only, never read by the render itself. mutable so render()
