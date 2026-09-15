@@ -1,5 +1,5 @@
 # CINEPI_26-09-15_181624_F03_C00001_cam0_000000000.dng
-# 3840x2200 16-bit stored codes, CFA RGGB
+# 3840x2200 16-bit stored codes, CFA RGGB, contiguous big-endian DNG packing
 code_max 65535
 white_level 65535
 black_level 3200

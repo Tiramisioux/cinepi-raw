@@ -13,10 +13,22 @@
  * the highlight stays magenta (the bug), invent one and every highlight above
  * the invented level is clipped to white (a worse bug, on footage that was
  * fine). So the fixtures are not synthetic frames — they are the per-channel
- * code histograms of seven DNGs this camera actually recorded, dumped straight
+ * code histograms of ELEVEN DNGs this camera actually recorded, dumped straight
  * out of the files, carrying each take's own LinearizationTable where it had
- * one: three 12-bit ClearHDR-with-log takes, two 16-bit ClearHDR takes with log
- * off, and two 10-bit SDR takes that are NOT clamped and must be left alone.
+ * one. Nine are ClearHDR and clamped, spanning every mode the camera offers: 4K
+ * and binned HD, stored at 10, 12 and 16 bits, log on and log off. Two are
+ * native 10-bit SDR that genuinely reach their white and must be left alone —
+ * the control group, and the one that catches a detector which has started
+ * inventing clamps on healthy footage.
+ *
+ * A NOTE ON READING THESE FILES, because it cost an afternoon. The strips are
+ * DNG's own CONTIGUOUS big-endian bit packing (pixel pairs across 3 bytes at 12
+ * bits, quads across 5 at 10), NOT the MIPI CSI-2 layout the sensor delivers.
+ * Decoding a 10-bit strip as MIPI produces a plausible-looking histogram that
+ * clips exactly at full scale — because an all-ones clipped region reads as
+ * all-ones under either interpretation — so the error hides precisely where it
+ * matters most. The giveaway is same-colour neighbour distance: 0.5 under the
+ * right unpacking, 271 under the wrong one.
  *
  * BOTH ENCODINGS ARE HERE ON PURPOSE. The first version of the detector counted
  * stored codes with code-space thresholds, passed every 12-bit fixture, and
@@ -168,13 +180,27 @@ void real_takes()
      * exactly why this is measured per take rather than tabulated per mode. */
     struct Case { const char *name; bool clamped; unsigned ceiling; const char *note; };
     const Case cases[] = {
-        { "clearhdr4k_log_f06", true,  58352, "12-bit ClearHDR + log, clamp at 89.0% of declared white" },
-        { "clearhdr4k_log_f13", true,  58352, "same operating point as f06, minutes later" },
-        { "clearhdr4k_log_f07", true,  48172, "another session: 73.5%, same detector, no retune" },
-        { "clearhdr4k_lin_f03", true,  57443, "16-bit ClearHDR, log OFF — the encoding v1 refused" },
-        { "clearhdr4k_lin_f07", true,  58505, "16-bit ClearHDR, log OFF, second take" },
-        { "sdr4k_10bit_f02",    false, 0,     "native 10-bit SDR: reaches 1023, must stay untouched" },
-        { "sdr4k_10bit_f14",    false, 0,     "native 10-bit SDR, second take" },
+        /* Nine ClearHDR takes spanning every mode the camera offers — 4K and
+         * binned HD, stored at 10, 12 and 16 bits, log on and log off. All nine
+         * are clamped and all nine render magenta as recorded. One set of
+         * constants has to accept all of them, because the clamp's width in
+         * CODE space differs by 50x across these encodings while the physical
+         * clamp does not. */
+        { "clearhdr_4k_log12_a", true,  58352, "4K, 16-bit ClearHDR log-encoded to 12: clamp at 89.0%" },
+        { "clearhdr_4k_log12_b", true,  58352, "same operating point, minutes later — agrees to the value" },
+        { "clearhdr_4k_log12_c", true,  48172, "another session: 73.5%, same detector, no retune" },
+        { "clearhdr_4k_log12_d", true,  54261, "later session again: 82.8%" },
+        { "clearhdr_hd_log12",   true,  35941, "BINNED HD: 54.8%, the lowest clamp on record" },
+        { "clearhdr_4k_log10",   true,  58440, "log-encoded to 10 bits instead of 12" },
+        { "clearhdr_hd_log10",   true,  54960, "binned HD, log to 10 bits" },
+        { "clearhdr_4k_lin16_a", true,  57443, "16-bit linear, log OFF — the encoding v1 refused" },
+        { "clearhdr_4k_lin16_b", true,  58505, "16-bit linear, second take" },
+        /* The control group: native 10-bit SDR genuinely reaches its white, so
+         * there is nothing to declare and the detector must stay out of the
+         * way. If these ever start reporting a ceiling, the detector has begun
+         * inventing clamps on healthy footage, which is the worse failure. */
+        { "sdr_4k_10bit_a",      false, 0,     "native 10-bit SDR: reaches 1023, must stay untouched" },
+        { "sdr_4k_10bit_b",      false, 0,     "native 10-bit SDR, second take" },
     };
 
     for (const Case &c : cases)
