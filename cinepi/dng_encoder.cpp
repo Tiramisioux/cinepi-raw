@@ -1161,7 +1161,36 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         const uint8_t cfa[4] = {
             static_cast<uint8_t>(dng_info.bayer_order[0]), static_cast<uint8_t>(dng_info.bayer_order[1]),
             static_cast<uint8_t>(dng_info.bayer_order[2]), static_cast<uint8_t>(dng_info.bayer_order[3]) };
-        ceiling_det.reset((1u << dng_info.bits) - 1u, cfa);
+
+        /* THE LIVE CURVE GOES IN. The detector counts LINEARISED values, not
+         * stored codes — clip_ceiling.hpp's central design point, and the
+         * reason its first version worked on 12-bit ClearHDR and refused on
+         * 16-bit. So it gets the same table that is about to be written into
+         * tag 0xC618, resolved in the SAME order as the BlackLevel and 0xC618
+         * blocks below (log first, then CCMP, then neither), because all three
+         * must agree about which curve is live. Its answer then comes back
+         * already in the tag's own domain and is written straight to 0xC61D.
+         *
+         * The black level here is only the "implausibly low" floor, so the
+         * curve's own pedestal is enough — the per-channel values section 3
+         * computes from metadata are not needed, and 0 (no curve) merely makes
+         * that floor marginally more permissive. */
+        const uint16_t *lut = nullptr;
+        size_t lut_n = 0;
+        unsigned level_black = 0;
+        if (log_lut_)
+        {
+            lut = log_lut_->inverse();
+            lut_n = log_lut_->inverse_size();
+            level_black = static_cast<unsigned>(log_lut_->params().black_level);
+        }
+        else if (ccmp_lut_)
+        {
+            lut = ccmp_lut_->table();
+            lut_n = ccmp_lut_->size();
+            level_black = static_cast<unsigned>(ccmp_lut_->black_level());
+        }
+        ceiling_det.reset(dng_info.white, level_black, cfa, lut, lut_n);
     }
 
     /* ── 1. Raw image copy (packing if 12-bit) ─────────────────── */
@@ -1415,37 +1444,18 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
         if (measuring)
         {
             const ClipCeilingDetector::Result cr = ceiling_det.detect();
-            if (cr.found)
-            {
-                /* Into the TAG's domain. Under a LinearizationTable a reader
-                 * applies the curve before reading the level tags, so
-                 * WhiteLevel describes the table's OUTPUT and the ceiling code
-                 * has to go through the same table to get there. Same chain in
-                 * the same order as the BlackLevel and 0xC618 blocks below —
-                 * log first, then CCMP, then neither — because the three must
-                 * agree about which curve is live.
-                 *
-                 * No black-level floor is checked here: the detector already
-                 * refuses a ceiling below a third of full scale, and every
-                 * pedestal this encoder writes sits near 5% of it. */
-                uint32_t w = cr.ceiling;
-                if (log_lut_ && cr.ceiling < log_lut_->inverse_size())
-                    w = log_lut_->inverse()[cr.ceiling];
-                else if (ccmp_lut_ && cr.ceiling < ccmp_lut_->size())
-                    w = ccmp_lut_->table()[cr.ceiling];
-
-                /* Only ever LOWER it. Raising WhiteLevel above the curve's own
-                 * output range would claim headroom the table cannot produce. */
-                if (w < dng_info.white)
-                    measured = w;
-            }
+            /* Already in the tag's domain — the detector counted through the
+             * live curve, so no conversion here. Only ever LOWER it: raising
+             * WhiteLevel above the curve's own output range would claim
+             * headroom the table cannot produce. */
+            if (cr.found && cr.ceiling < dng_info.white)
+                measured = cr.ceiling;
 
             if (measured)
                 console->info("ClearHDR clamp: WhiteLevel {} -> {} ({:.1f}% of nominal), "
-                              "stored code {} of {}, body {} samples of {}",
+                              "body {} samples, tail {}, of {} sampled",
                               dng_info.white, measured, 100.0 * measured / dng_info.white,
-                              cr.ceiling, (1u << dng_info.bits) - 1u,
-                              cr.band_samples, cr.sampled);
+                              cr.body_samples, cr.tail_samples, cr.sampled);
             else
                 console->info("ClearHDR clamp: none adopted, WhiteLevel stays {} ({})",
                               dng_info.white,
