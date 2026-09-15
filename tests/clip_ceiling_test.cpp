@@ -534,12 +534,95 @@ void out_of_range_values_are_dropped()
 
 } // namespace
 
+/* ── the verdict must not depend on how densely the frame was sampled ────────
+ *
+ * Neither caller reads every pixel. dng_encoder.cpp takes every 3rd row;
+ * ccmpPreviewStage.cpp takes a fixed sample BUDGET per frame, which at
+ * 3840x2200 works out near 1/36 of the frame and accumulates over 16 frames.
+ * That second one exists because the first version of it budgeted a row stride
+ * instead of a sample count, and dropped frames in 4K 16-bit on 2026-09-15 —
+ * the same rule costing 4x as much on a frame with 4x the pixels.
+ *
+ * Changing sampling density must not change what the detector says, or the
+ * preview and the file would disagree about the same scene. This was checked
+ * by hand when the stride was chosen and the result written into a plan
+ * document, which is not a place a regression can be caught. Here it is as a
+ * test: every fixture, re-run at 1/8 and 1/16 of its recorded counts, verdict
+ * and ceiling required to be bit-identical.
+ *
+ * Counts are divided with truncation, so thinly-populated bins vanish
+ * entirely — which is exactly what sparse sampling does to a real frame, and
+ * is the part that could plausibly move a band's mode if the rules were
+ * absolute rather than relative. */
+void load_scaled(ClipCeilingDetector &d, const Fixture &fx, uint32_t divisor,
+                 unsigned long &sampled)
+{
+    sampled = 0;
+    d.reset(fx.white, fx.black, kRGGB, fx.lut.empty() ? nullptr : fx.lut.data(), fx.lut.size());
+    for (int c = 0; c < kClipChanCount; ++c)
+        for (size_t i = 0; i < fx.ch[c].size(); ++i)
+        {
+            const uint32_t n = fx.ch[c][i].second / divisor;
+            for (uint32_t k = 0; k < n; ++k)
+                d.add(fx.ch[c][i].first, static_cast<uint8_t>(c));
+            sampled += n;
+        }
+}
+
+void sparse_sampling_does_not_change_the_verdict()
+{
+    const char *names[] = {
+        "clearhdr_4k_log12_a", "clearhdr_4k_log12_b", "clearhdr_4k_log12_c",
+        "clearhdr_4k_log12_d", "clearhdr_hd_log12",   "clearhdr_4k_log10",
+        "clearhdr_hd_log10",   "clearhdr_4k_lin16_a", "clearhdr_4k_lin16_b",
+        "sdr_4k_10bit_a",      "sdr_4k_10bit_b",
+    };
+    const uint32_t divisors[] = { 8u, 16u };
+
+    for (const char *name : names)
+    {
+        std::string err;
+        Fixture fx = read_fixture(name, err);
+        if (!fx.ok) { check(false, std::string("fixture ") + name, err); continue; }
+
+        ClipCeilingDetector full;
+        load(full, fx);
+        const ClipCeilingDetector::Result ref = full.detect();
+
+        for (uint32_t div : divisors)
+        {
+            unsigned long sampled = 0;
+            ClipCeilingDetector d;
+            load_scaled(d, fx, div, sampled);
+            const ClipCeilingDetector::Result r = d.detect();
+            const std::string tag =
+                std::string(name) + " at 1/" + std::to_string(div) + ": ";
+
+            /* NON-VACUITY FIRST. Below kMinSamples the detector refuses on
+             * sample count alone and every comparison below would be 0 == 0 —
+             * the exact way two earlier tests in this file passed while
+             * asserting nothing. */
+            check(sampled > 4096ul, tag + "still has enough samples to mean something",
+                  std::to_string(sampled) + " samples");
+
+            check(r.found == ref.found, tag + "same verdict as the full histogram",
+                  std::string(ref.found ? "clamped" : "clean") + " -> " +
+                      (r.found ? "clamped" : "clean") +
+                      (r.found ? "" : std::string("  [why: ") + (r.why ? r.why : "?") + "]"));
+            if (ref.found && r.found)
+                check(r.ceiling == ref.ceiling, tag + "same ceiling, to the code",
+                      std::to_string(r.ceiling) + " vs " + std::to_string(ref.ceiling));
+        }
+    }
+}
+
 int main()
 {
     std::cout << "clip_ceiling_test\n";
 
     std::cout << " recorded takes\n";
     real_takes();
+    sparse_sampling_does_not_change_the_verdict();
 
     std::cout << " synthetic cases\n";
     domain_transfer_is_invariant();

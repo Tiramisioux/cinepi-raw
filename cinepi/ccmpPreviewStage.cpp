@@ -39,6 +39,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -174,17 +175,35 @@ private:
 
 	/* ── the live clamp measurement (16-bit ClearHDR only) ─────────────────
 	 *
-	 * COST. The renderer already reads every raw sample, so this is the second
-	 * pass over the frame and the only new per-frame work in the stage. It is
-	 * kept off the critical path by measuring 1 frame in 8 and every 4th row of
-	 * that frame — about 1/32 of the samples the render itself touches — which
-	 * at 25 fps still puts a fresh answer in front of the operator roughly
-	 * every 1.3 s. kRowStride 4 is inside the range the encoder's own stride of
-	 * 3 was validated over (all eleven fixtures re-run at 1/3, 1/6 and 1/12
-	 * gave bit-identical verdicts). */
-	static constexpr unsigned kMeasureEveryNth = 8;
-	static constexpr unsigned kAccumulations = 4;
-	static constexpr unsigned kRowStride = 4;
+	 * COST, AND THE SHAPE OF IT. This is a second pass over the raw frame, and
+	 * the first version of it dropped frames in 4K 16-bit — confirmed on the
+	 * rig 2026-09-15, 208 drop events, clean in every other mode.
+	 *
+	 * The mistake was budgeting a row STRIDE instead of a sample COUNT. Every
+	 * 4th row of one frame in 8 is 528k samples at 1920x1100 and 2.11M at
+	 * 3840x2200: the same rule, four times the work, in the same frame period.
+	 * Worse, it arrived as a spike on one frame in eight rather than as a
+	 * background load, and each sample is a random increment into a 768 KB
+	 * histogram (65536 codes x 3 channels x 4 B) that does not fit in L2 — so
+	 * nearly every one of those 2.11M writes missed cache. HD survived it and
+	 * 4K did not, which is exactly the 4x.
+	 *
+	 * So the budget is now a fixed number of SAMPLES per frame, spread over
+	 * every frame instead of spiked onto one in eight. kSamplesPerFrame holds
+	 * regardless of resolution; only the row step changes. Rows are taken in
+	 * PAIRS so that all four CFA positions are present in every frame — a
+	 * single-parity sample would see R and G but never B — and the starting
+	 * offset rotates so the window sweeps the frame over time rather than
+	 * re-reading the same rows.
+	 *
+	 * The result converges FASTER than the version it replaces (16 frames
+	 * against 32) while costing about an eighth of its peak, because the work
+	 * is spread rather than reduced. Sample counts remain far above the
+	 * detector's kMinSamples of 4096, and the sparse-row approach is the one
+	 * the encoder's stride of 3 was validated over — all eleven fixtures re-run
+	 * at 1/3, 1/6 and 1/12 gave bit-identical verdicts. */
+	static constexpr unsigned kSamplesPerFrame = 65536;
+	static constexpr unsigned kAccumulations = 16;
 	/* Below this the answer is noise, not a clamp: a frame with no blown
 	 * highlight in it has nothing to measure and must leave the reference where
 	 * it is rather than invent one. The detector refuses those itself; this is
@@ -199,7 +218,12 @@ private:
 	bool measure_ = false;
 	ClipCeilingDetector ceiling_det_;
 	unsigned accumulations_ = 0;
-	unsigned measure_phase_ = 0;
+	unsigned row_step_ = 2;      /* even, so a pair spans both CFA parities */
+	unsigned row_offset_ = 0;
+	/* Observability, so the next journal says what this actually costs rather
+	 * than leaving it to be inferred from drop counts again. */
+	unsigned long measure_us_ = 0;
+	unsigned long measure_frames_ = 0;
 };
 
 void ccmpPreviewStage::Configure()
@@ -345,7 +369,18 @@ void ccmpPreviewStage::Configure()
 		ceiling_det_.reset(static_cast<unsigned>((1u << requested_mode.bit_depth) - 1u),
 						   static_cast<unsigned>(kLinearBlackLevel), cfa8);
 		accumulations_ = 0;
-		measure_phase_ = 0;
+		row_offset_ = 0;
+		measure_us_ = 0;
+		measure_frames_ = 0;
+
+		/* Pairs per frame from the sample budget, then the step that spreads
+		 * them over the full height. Both clamped so a small or odd-shaped
+		 * mode cannot produce a zero step and spin. */
+		const unsigned pairs = std::max(1u, kSamplesPerFrame / std::max(1u, 2u * geom.raw_width));
+		row_step_ = std::max(2u, (geom.raw_height / std::max(1u, pairs)) & ~1u);
+		console->info("ccmpPreview: sampling {} row pairs every frame, step {} "
+					  "({} samples/frame, verdict every {} frames)",
+					  pairs, row_step_, pairs * 2u * geom.raw_width, kAccumulations);
 	}
 
 	/* The display's matrix, read off the stream rather than assumed. */
@@ -393,13 +428,22 @@ void ccmpPreviewStage::Configure()
  * place the renderer is touched. */
 void ccmpPreviewStage::measureClamp(const uint8_t *raw)
 {
-	if (++measure_phase_ % kMeasureEveryNth)
-		return;
+	const auto t0 = std::chrono::steady_clock::now();
 
 	const CcmpPreviewGeometry &g = renderer_.geometry();
-	for (unsigned y = 0; y < g.raw_height; y += kRowStride)
-		ceiling_det_.add_row(reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(y) * g.raw_stride),
-							 g.raw_width, y, g.raw_shift);
+	for (unsigned y = row_offset_; y + 1u < g.raw_height; y += row_step_)
+	{
+		const uint8_t *r0 = raw + static_cast<size_t>(y) * g.raw_stride;
+		ceiling_det_.add_row(reinterpret_cast<const uint16_t *>(r0), g.raw_width, y, g.raw_shift);
+		ceiling_det_.add_row(reinterpret_cast<const uint16_t *>(r0 + g.raw_stride),
+							 g.raw_width, y + 1u, g.raw_shift);
+	}
+	row_offset_ = (row_offset_ + 2u) % row_step_;
+
+	measure_us_ += static_cast<unsigned long>(
+		std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - t0).count());
+	++measure_frames_;
 
 	if (++accumulations_ < kAccumulations)
 		return;
@@ -523,6 +567,14 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 						  renderer_.fullyDesaturated(), frames_since_report_,
 						  renderer_.clipCeiling(),
 						  renderer_.usingMeasuredCeiling() ? "measured" : "nominal, not yet measured");
+		if (measure_ && measure_frames_)
+		{
+			console->info("ccmpPreview: measurement cost {:.2f} ms/frame over {} frames",
+						  static_cast<double>(measure_us_) / static_cast<double>(measure_frames_) / 1000.0,
+						  measure_frames_);
+			measure_us_ = 0;
+			measure_frames_ = 0;
+		}
 		else
 			console->info("ccmpPreview: peak raw code {}, highest uncorrected {}, {} quads fully "
 						  "desaturated, over the last {} frames (clip anchor {})",
