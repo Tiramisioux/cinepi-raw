@@ -202,7 +202,17 @@ private:
     bool raw_packed_in_ = false;   /* true if DMA already delivers packed rows */
     bool raw_compressed_in_ = false;
 
+    /* Output-depth overrides for the PiSP 16-bit container, resolved together
+     * in setup_encoder() and mutually exclusive by construction — at most one
+     * is ever true. See the comment at their assignment for why each conjunct
+     * is there. Both false covers three different things, so don't read it as
+     * one: a genuine 16-bit ClearHDR mode (container written verbatim); a row
+     * depth that already matches the sensor's, i.e. Pi 4 / VC4; and any log
+     * take, where the log block clears both because log_lut_ owns the row
+     * conversion outright. dng_save()'s branch chain tests log_lut_ first for
+     * exactly that reason. */
     bool write12bit_{false};
+    bool write10bit_{false};
 
     /* ──  CineMate Log  ───────────────────────────────────────
      * Resolved once per configure in setup_encoder(), where the SOURCE depth

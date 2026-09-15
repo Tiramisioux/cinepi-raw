@@ -213,6 +213,12 @@ void pack_14bit_data(const uint16_t* src, uint8_t* dst, size_t num_pixels) {
  * they can be unit-tested without libcamera. See tests/dng_pack_test.cpp. */
 #include "cinepi/dng_pack.hpp"
 
+/* The linear output-depth rule, extracted so the truth table over
+ * (container, sensor depth, trusted, packed, compressed) can be tested without
+ * a live Camera — see tests/dng_output_depth_test.cpp. Same split, and same
+ * reasoning, as cinepi/ccmp_gate.hpp. */
+#include "cinepi/dng_output_depth.hpp"
+
 
 struct Matrix
 {
@@ -269,6 +275,7 @@ Matrix(float m0, float m1, float m2,
 DngEncoder::DngEncoder(RawOptions const *options)
     : Encoder(options), // Assuming you're calling the base class constructor
       write12bit_(false),
+      write10bit_(false),
       encoder_initialized_(false),
       encodeCheck_(false),
       resetCount_(false),
@@ -511,8 +518,9 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
     const BayerFormat &bf          = it->second;
     raw_packed_in_                 = bf.packed;
     raw_compressed_in_             = bf.compressed;
-    dng_info.bits                  = bf.bits;
-    dng_info.white                 = (1u << bf.bits) - 1u;
+    /* bits/white are NOT set from bf here any more — resolve_dng_output_depth()
+     * below owns both, and returns the container's own depth unchanged when no
+     * narrowing applies. Two writers for one pair is how this drifted before. */
     dng_info.photometric           = PHOTOMETRIC_CFA;
     dng_info.samples_per_pixel     = 1;
     std::memcpy(dng_info.bayer_order, bf.order, 4);
@@ -542,13 +550,101 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      * really a 12-in-16 SDR stream just stores four already-known-zero
      * padding bits, which is what the untrusted branch below already accepts
      * doing on every ordinary reconfigure. Fail toward the non-destructive
-     * side, same reasoning as the CCMP gate just below. */
-    write12bit_ = sensor_mode_trusted_ && (bf.bits == 16) && sensor_mode_bit_depth_ != 16;
+     * side, same reasoning as the CCMP gate just below.
+     *
+     * A NATIVE 10-BIT SENSOR MODE gets its own case, because "anything that
+     * isn't 16 packs to 12" silently charged it 1.5 B/px for 1.25 B/px of
+     * information — a byte-for-byte 4K-12-bit file carrying two fewer stops,
+     * which is the whole reason this branch exists. The container is the same
+     * SRGGB16 (libcamera's PiSP handler cannot emit anything else: "We cannot
+     * output CSI2 packed or non 16-bit output from the frontend"), so the only
+     * difference from the 12-bit case is how far down the significant bits
+     * have to be shifted: 16 - 10 rather than 16 - 12. See
+     * pack_row_16_to_10bit()'s own comment for that contract, and
+     * ccmpPreviewStage.cpp's raw_shift for the same (container - sensor)
+     * derivation applied to the preview.
+     *
+     * Both flags are assigned HERE, unconditionally, in one statement each:
+     * setup_encoder() re-runs per take but reset_encoder() clears neither, so
+     * a flag only set inside an `if` would survive a mode change and pack the
+     * NEXT take at the previous take's depth.
+     *
+     * Three conjuncts carry the 10-bit case, and each one is load-bearing:
+     *   bf.bits == 16   — on Pi 4 / VC4 the rows arrive at their native depth
+     *                     (SBGGR10 / SBGGR10_CSI2P) and are already right-
+     *                     justified or CSI2-packed; they belong to the
+     *                     dng_info.bits == 10 branch in dng_save(), not here,
+     *                     and a >> 6 applied to them would black the frame.
+     *   !bf.packed / !bf.compressed
+     *                   — a 10:P request reaches us as PiSP COMP1, which
+     *                     dng_save() dispatches on BEFORE either flag. COMP1
+     *                     decodes into the same MSB-aligned 16-bit domain so
+     *                     >> 6 would be arithmetically right, but the codec is
+     *                     LOSSY and its four quantisation modes do not agree
+     *                     on whether that matters: qmode 1 is exactly 64*q, so
+     *                     >> 6 is lossless there, but qmodes 0, 2 and 3 emit
+     *                     non-multiples of 64 for 592, 512 and 849 of their
+     *                     1024 codes respectively, and >> 6 would discard
+     *                     reconstruction detail that >> 4 keeps. Whether that
+     *                     loss is above the sensor's own noise has never been
+     *                     measured, so this keeps today's 12-bit behaviour
+     *                     rather than shipping an untested file — the same
+     *                     rule the CCMP and log gates follow. This leg is
+     *                     REACHABLE, not hypothetical: cinemate resolves
+     *                     packing 'U' on Pi 5 for imx477/imx296/imx283/imx585
+     *                     but 'P' for imx519 (sensors.json), so a 10-bit
+     *                     imx519 mode lands here and still pays 1.5 B/px.
+     *                     Measuring that repack is the follow-up this
+     *                     deliberately does not guess at.
+     *   sensor_mode_trusted_
+     *                   — kept for the same reason the 12-bit case keeps it,
+     *                     and the stakes are higher here: every other way this
+     *                     decision can be wrong costs padding bits, but
+     *                     believing a "10" against a stream that is really 12-
+     *                     or 16-bit destroys real ones.
+     *                     Be precise about what it does and does not cover.
+     *                     It is a DIMENSIONS check (cinepi_raw.cpp compares
+     *                     the requested w/h against the configured stream), so
+     *                     it cannot by itself separate imx585's 10-bit and
+     *                     12-bit 4K modes, which share dimensions exactly.
+     *                     What rules that case out is upstream of here: the
+     *                     requested depth goes into
+     *                     configuration_->sensorConfig->bitDepth, libcamera
+     *                     returns Invalid when the sensor cannot serve it
+     *                     (pipeline_base.cpp), and setupCapture() throws on
+     *                     Invalid — a depth that was not actually applied
+     *                     never reaches this function. The trust flag covers
+     *                     the other half: a mode that came back at different
+     *                     dimensions than asked for, where nothing about the
+     *                     snapshot can be believed.
+     *                     The one residual hole is a redis `set bit_depth`
+     *                     landing between ConfigureVideo() and
+     *                     cinepi_raw.cpp's freeze of options_->mode. That
+     *                     window is why the decision's inputs are logged below
+     *                     by value: a suspect take should be diagnosable after
+     *                     the fact rather than only reproducible. Closing it
+     *                     properly means reading the applied sensorConfig (or
+     *                     the subdev's media-bus code) instead of
+     *                     options_->mode — the same fix ccmp_gate.hpp already
+     *                     names as a later, separate pass. */
+    const DngOutputDepth depth =
+        resolve_dng_output_depth(static_cast<unsigned>(bf.bits), sensor_mode_bit_depth_,
+                                 sensor_mode_trusted_, bf.packed, bf.compressed);
+    write12bit_    = depth.pack12;
+    write10bit_    = depth.pack10;
+    dng_info.bits  = static_cast<uint8_t>(depth.bits);
+    dng_info.white = depth.white();
 
-    if (write12bit_) {
-        dng_info.bits  = 12;
-        dng_info.white = (1u << 12) - 1u;
-    }
+    /* The DECISION and its inputs, not the final output depth — the CCMP and
+     * log blocks below can still override dng_info.bits, and the "Encoder
+     * configured – WxH N-bit" line at the end of this function is the one that
+     * reports what the file actually gets. Saying "linear pack" rather than a
+     * bare depth keeps the two from being read as the same claim. */
+    console->info("DNG depth decision: container {}-bit{}{}, sensor mode {}-bit{} "
+                  "-> linear pack {}-bit",
+                  bf.bits, bf.packed ? " packed" : "", bf.compressed ? " COMP1" : "",
+                  sensor_mode_bit_depth_, sensor_mode_trusted_ ? "" : " (UNTRUSTED)",
+                  dng_info.bits);
 
     /* ──  CCMP12 decompand  ───────────────────────────────────────
      * In 12-bit ClearHDR the imx585 companands on-sensor: the 16-bit ClearHDR
@@ -791,6 +887,7 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
             log_lut_       = lut;
             log_src_shift_ = shift;
             write12bit_    = false;       /* the log path owns the row conversion */
+            write10bit_    = false;       /* ditto — one row owner, never two */
             dng_info.bits  = lut->params().target_bits;
             dng_info.white = lut->params().white_level;
             /* Named explicitly so a hardware session can grep for composition the
@@ -818,10 +915,20 @@ void DngEncoder::setup_encoder(const libcamera::StreamConfiguration &cfg,
      * black-level and tag-emission chains later in this file are ordered LOG
      * first for exactly this reason. Nothing to resolve here; the check below
      * is a tripwire in case that invariant is ever broken by a future edit. */
-    if (ccmp_lut_ && log_lut_ && write12bit_)
+    if (ccmp_lut_ && log_lut_ && (write12bit_ || write10bit_))
         console->error("both a CCMP decompand and a non-composed CineMate Log "
-                       "table resolved for one file with write12bit_ still set — "
+                       "table resolved for one file with write{}bit_ still set — "
                        "the composed path always clears it. This should be "
+                       "unreachable; investigate before trusting this recording.",
+                       write12bit_ ? 12 : 10);
+
+    /* Second tripwire, same spirit: the two depth overrides are mutually
+     * exclusive by construction (write12bit_ carries !write10bit_ in its own
+     * conjunction), and dng_save()'s branch chain tests write12bit_ first, so
+     * both being set would silently pack a 10-bit mode's rows at 12 bits. */
+    if (write12bit_ && write10bit_)
+        console->error("both write12bit_ and write10bit_ resolved for one file — "
+                       "they are constructed to be exclusive. This should be "
                        "unreachable; investigate before trusting this recording.");
 
     /* ──  White-balance gains & CCM  ──────────────────────────── */
@@ -1118,6 +1225,25 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
             write_pod(buf, rowBuf.data(), rowPacked);
         }
     }
+    else if (write10bit_)          /* source 16-bit container, we emit packed 10-bit */
+    {
+        /* Deliberately keyed on the FLAG, not on dng_info.bits == 10, and
+         * placed above that branch: the bits == 10 branch below serves Pi 4 /
+         * VC4, where the rows arrive right-justified at their native depth.
+         * These rows are MSB-aligned in a 16-bit container instead, and
+         * pack_group_10bit() does not mask its inputs — feeding it unshifted
+         * 16-bit samples corrupts neighbouring pixels' bits rather than merely
+         * mis-scaling them, so the two cases cannot share a branch. */
+        const uint32_t rowPacked = (info.width * 10 + 7) / 8;   /* 1.25 B / px */
+        rowBuf.resize(rowPacked);
+
+        for (uint32_t y = 0; y < info.height; ++y) {
+            const uint16_t *src = reinterpret_cast<const uint16_t *>(
+                                    raw + y * info.stride);
+            pack_row_16_to_10bit(src, rowBuf.data(), info.width);
+            write_pod(buf, rowBuf.data(), rowPacked);
+        }
+    }
     else if (dng_info.bits == 12)
     {
         const uint32_t rowPacked = (info.width * 12 + 7) / 8;   /* 1.5 B / px */
@@ -1150,7 +1276,14 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     }
     else if (dng_info.bits == 10)
     {
-        /* pack_row_10bit() writes exactly this many bytes: Pass 2 gave it a
+        /* Pi 4 / VC4 ONLY — reached when bf.bits is genuinely 10, i.e. the
+         * receiver handed over SBGGR10 or SBGGR10_CSI2P. A Pi 5 never gets
+         * here: its frontend cannot emit a non-16-bit raw stream, so a native
+         * 10-bit mode arrives MSB-aligned in an SRGGB16 container and is
+         * claimed by the write10bit_ branch above. Both sub-branches below
+         * therefore assume rows that are already right-justified at 10 bits.
+         *
+         * pack_row_10bit() writes exactly this many bytes: Pass 2 gave it a
          * zero-padded final group that emits only the (n*10+7)/8 bytes those n
          * pixels occupy, replacing the old flat 5 B/group (which also over-READ
          * the source row). So the scratch row needs no rounding-up — same sizing
@@ -1174,8 +1307,10 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
             }
             else
             {
-                /* Unpacked SBGGR10 (Pi 5 / PiSP 'U'): 16-bit samples, right-
-                 * justified in the low 10 bits. */
+                /* Unpacked SBGGR10 (the VC4 'U' path): 16-bit samples, right-
+                 * justified in the low 10 bits, so they feed pack_row_10bit()
+                 * with no shift. This used to say "Pi 5 / PiSP 'U'", which was
+                 * never reachable — see the branch comment above. */
                 src = reinterpret_cast<const uint16_t *>(raw + y * info.stride);
             }
             pack_row_10bit(src, rowBuf.data(), info.width);

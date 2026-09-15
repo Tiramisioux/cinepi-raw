@@ -112,6 +112,48 @@ static inline void pack_row_10bit(const uint16_t *src,
     }
 }
 
+/* Pack a 16-bit source row to packed 10-bit output while dropping 6 LSBs.
+ *
+ * The 10-bit sibling of pack_row_16_to_12bit, for the same reason: PiSP cannot
+ * emit anything but an unpacked 16-bit container, so a native 10-bit sensor
+ * mode arrives as SRGGB16 holding value << 6 and the six padding LSBs are
+ * already known to be zero. Dropping them is lossless and saves 0.25 B/px.
+ *
+ * The shift is (container depth - sensor depth) = 16 - 10; setup_encoder()
+ * only sets write10bit_ when bf.bits is 16 and the sensor mode is 10, so this
+ * function's hardcoded 6 and that gate are two halves of one contract. On a
+ * Pi 4 / VC4 the rows arrive at their native depth instead and the caller must
+ * use pack_row_10bit() directly — shifting an already right-justified row down
+ * by six blacks the frame.
+ *
+ * Emits (width*10+7)/8 bytes, with the same zero-padded final group as
+ * pack_row_10bit() for a width that is not a multiple of 4. */
+static inline void pack_row_16_to_10bit(const uint16_t *src,
+                                        uint8_t       *dst,
+                                        uint32_t       width)
+{
+    uint32_t x = 0;
+    for (; x + 4u <= width; x += 4u, dst += 5)
+    {
+        const uint16_t g[4] { static_cast<uint16_t>(src[x]     >> 6),
+                              static_cast<uint16_t>(src[x + 1] >> 6),
+                              static_cast<uint16_t>(src[x + 2] >> 6),
+                              static_cast<uint16_t>(src[x + 3] >> 6) };
+        pack_group_10bit(g, dst);
+    }
+
+    const uint32_t remaining = width - x;
+    if (remaining > 0)
+    {
+        uint16_t working[4] {};
+        uint8_t  packed[5] {};
+        for (uint32_t i = 0; i < remaining; ++i)
+            working[i] = static_cast<uint16_t>(src[x + i] >> 6);
+        pack_group_10bit(working, packed);
+        std::memcpy(dst, packed, (static_cast<size_t>(remaining) * 10u + 7u) / 8u);
+    }
+}
+
 /* Unpack MIPI CSI-2 RAW12 (2 px in 3 bytes) to right-justified 16-bit (0..4095).
  * VC4/Unicam delivers SBGGR12_CSI2P in this layout — verified against real Pi 4
  * IMX477 captures (decoding as contiguous-12 instead gives a checkerboard/

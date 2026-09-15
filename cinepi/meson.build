@@ -84,6 +84,15 @@ dng_pack_test = executable('dng_pack_test',
            install : false)
 test('dng_pack', dng_pack_test)
 
+# Unit tests for the linear DNG output-depth rule (which code depth the raw
+# strip is packed at, and the shift that gets there). No libcamera deps — it
+# includes only cinepi/dng_output_depth.hpp. Run with `meson test`.
+dng_output_depth_test = executable('dng_output_depth_test',
+           '../tests/dng_output_depth_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('dng_output_depth', dng_output_depth_test)
+
 # Unit tests for IFDBuilder's multi-IFD chaining contract (C9 Phase 0's
 # embedded DNG thumbnail). No libcamera deps — it includes only
 # cinepi/ifd_builder.hpp. Run with `meson test`.

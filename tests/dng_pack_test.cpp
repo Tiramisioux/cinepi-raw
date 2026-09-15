@@ -10,7 +10,7 @@
 // vector below was derived BY HAND from the function bodies (not by running the
 // code) so the test is an independent check of the byte math, tier by tier:
 //   Tier 1 — contiguous packers  (pack_row_16_to_12bit, pack_row_12bit,
-//                                 pack_row_10bit)
+//                                 pack_row_10bit, pack_row_16_to_10bit)
 //   Tier 2 — MIPI CSI-2 unpackers      (unpack_csi2_raw12, unpack_csi2_raw10)
 //   Tier 3 — PiSP COMP1 decode         (unpack_pisp_comp1_row_to_16 / _packed12)
 
@@ -349,6 +349,122 @@ static void test_pack_row_10bit() {
     }
 }
 
+// pack_row_16_to_10bit: src>>6 (drop low 6 bits) -> contiguous 10-bit, 4px/5B.
+// The 10-bit sibling of pack_row_16_to_12bit, for a native 10-bit sensor mode
+// arriving MSB-aligned in PiSP's 16-bit container.
+static void test_pack_row_16_to_10bit() {
+    std::printf("test_pack_row_16_to_10bit\n");
+    // Anchor, derived by hand: {0xABCD,0x1234,0xFFFF,0x0000} >>6 gives the
+    // right-justified 10-bit quad {0x2AF, 0x048, 0x3FF, 0x000}. Then
+    // pack_group_10bit's five bytes are
+    //   b0 = 2AF>>2                    = 0xAB
+    //   b1 = (2AF<<6)|(048>>4)  = C0|04 = 0xC4
+    //   b2 = (048<<4)|(3FF>>6)  = 80|0F = 0x8F
+    //   b3 = (3FF<<2)|(000>>8)  = FC|00 = 0xFC
+    //   b4 =  000                      = 0x00
+    {
+        const uint16_t src[4] = { 0xABCD, 0x1234, 0xFFFF, 0x0000 };
+        const uint8_t  exp[5] = { 0xAB, 0xC4, 0x8F, 0xFC, 0x00 };
+        uint8_t dst[5] = {0};
+        pack_row_16_to_10bit(src, dst, 4);
+        CHECK(bytes_equal("anchor", dst, exp, 5), "pack16to10 anchor quad");
+    }
+    // Alternating full-scale / zero: {3FF,000,3FF,000}.
+    //   b0 = FF, b1 = C0|0 = C0, b2 = 0|0F = 0F, b3 = FC|0 = FC, b4 = 00
+    {
+        const uint16_t src[4] = { 0xFFFF, 0x0000, 0xFFFF, 0x0000 };
+        const uint8_t  exp[5] = { 0xFF, 0xC0, 0x0F, 0xFC, 0x00 };
+        uint8_t dst[5] = {0};
+        pack_row_16_to_10bit(src, dst, 4);
+        CHECK(bytes_equal("alternating", dst, exp, 5), "pack16to10 3FF,0,3FF,0");
+    }
+    // The six dropped bits really are dropped: samples differing only below
+    // bit 6 must pack identically. This is the whole lossless-padding claim.
+    {
+        const uint16_t a[4] = { 0x2AF << 6, 0x048 << 6, 0x3FF << 6, 0x000 << 6 };
+        const uint16_t b[4] = { static_cast<uint16_t>((0x2AF << 6) | 0x3F),
+                                static_cast<uint16_t>((0x048 << 6) | 0x01),
+                                static_cast<uint16_t>((0x3FF << 6) | 0x2A),
+                                static_cast<uint16_t>((0x000 << 6) | 0x3F) };
+        uint8_t da[5] = {0}, db[5] = {0};
+        pack_row_16_to_10bit(a, da, 4);
+        pack_row_16_to_10bit(b, db, 4);
+        CHECK(bytes_equal("low-6 ignored", db, da, 5),
+              "pack16to10 ignores the six padding LSBs");
+    }
+    // Cross-check against the composition it replaces: for any 10-bit v,
+    // pack_row_16_to_10bit(v<<6) == pack_row_10bit(v). Mirrors the existing
+    // pack_row_12bit / pack_row_16_to_12bit cross-check above.
+    {
+        std::vector<uint16_t> v10(1024), v16(1024);
+        for (uint32_t i = 0; i < 1024; ++i) {
+            v10[i] = static_cast<uint16_t>(i);
+            v16[i] = static_cast<uint16_t>(i << 6);
+        }
+        const size_t n = (1024u * 10u + 7u) / 8u;
+        std::vector<uint8_t> viaShift(n, 0), viaPack(n, 0);
+        pack_row_16_to_10bit(v16.data(), viaShift.data(), 1024);
+        pack_row_10bit(v10.data(), viaPack.data(), 1024);
+        CHECK(bytes_equal("cross-check", viaShift.data(), viaPack.data(), n),
+              "pack16to10(v<<6) == pack10(v) across all 1024 codes");
+    }
+    // Cross-check the other seam: right_justify_row(...,6) then pack_row_10bit
+    // is the un-fused form of the same operation.
+    {
+        const uint16_t src[8] = { 0xFFFF, 0x0000, 0xABCD, 0x1234,
+                                  0x8000, 0x7FFF, 0x0040, 0x003F };
+        uint8_t fused[10] = {0}, staged[10] = {0};
+        uint16_t mid[8] = {0};
+        pack_row_16_to_10bit(src, fused, 8);
+        right_justify_row(src, mid, 8, 6);
+        pack_row_10bit(mid, staged, 8);
+        CHECK(bytes_equal("fused==staged", fused, staged, 10),
+              "pack16to10 == right_justify_row(6) + pack10");
+    }
+    // Tail: width not a multiple of 4 must zero-pad the final group and emit
+    // exactly (w*10+7)/8 bytes, never reading the word past the row. Same
+    // contract pack_row_10bit has, and dng_save() sizes the scratch row on
+    // that expression with no slack.
+    {
+        const uint16_t buf[8] = { 0x3FF << 6, 0x155 << 6, 0x2AA << 6, 0x3FF << 6,
+                                  0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
+        const uint8_t  exp[4] = { 0xFF, 0xD5, 0x5A, 0xA8 };   // same as pack10's tail3
+        uint8_t d[5];
+        std::memset(d, 0xEE, sizeof d);
+        pack_row_16_to_10bit(buf, d, 3);
+        CHECK(bytes_equal("tail3", d, exp, 4), "pack16to10 width=3 tail");
+        CHECK(d[4] == 0xEE, "pack16to10 width=3 writes exactly 4 bytes");
+    }
+    // Byte-count sweep with guard bytes, every width through two full groups
+    // past the largest remainder case.
+    {
+        bool clean = true;
+        size_t first_bad = 0;
+        for (uint32_t w = 1; w <= 64; ++w) {
+            const size_t exact = (static_cast<size_t>(w) * 10u + 7u) / 8u;
+            std::vector<uint16_t> src(w);
+            for (uint32_t x = 0; x < w; ++x)
+                src[x] = static_cast<uint16_t>(((x * 37u) & 0x3FF) << 6);
+            std::vector<uint8_t> dst(exact + 8, 0xEE);
+            pack_row_16_to_10bit(src.data(), dst.data(), w);
+            for (size_t i = exact; i < dst.size(); ++i)
+                if (dst[i] != 0xEE) { clean = false; if (!first_bad) first_bad = w; break; }
+        }
+        CHECK(clean, "pack16to10 writes exactly (w*10+7)/8 bytes at every width 1..64");
+        if (!clean)
+            std::printf("  first bad width: %zu\n", first_bad);
+    }
+    // Every live 10-bit mode width is a multiple of 4, so the tail is a
+    // robustness path rather than a hot one: imx477 1332, imx296 1456,
+    // imx283 3936 / 5568, imx585 3840.
+    {
+        bool ok = true;
+        for (uint32_t w : {1332u, 1456u, 3840u, 3936u, 5568u})
+            if (w % 4u != 0u) ok = false;
+        CHECK(ok, "every shipped 10-bit mode width is a multiple of 4");
+    }
+}
+
 // ── TIER 2: MIPI CSI-2 unpackers ─────────────────────────────────────────────
 
 // Build the CSI2 RAW12 byte triple for two right-justified 12-bit values, per
@@ -565,6 +681,7 @@ int main() {
     test_right_justify_row();
     test_pack_row_12bit();
     test_pack_row_10bit();
+    test_pack_row_16_to_10bit();
     // Tier 2
     test_unpack_csi2_raw12();
     test_unpack_csi2_raw10();
