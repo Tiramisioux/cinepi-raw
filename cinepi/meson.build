@@ -172,3 +172,15 @@ ccmp_gate_test = executable('ccmp_gate_test',
            include_directories : [include_directories('..')],
            install : false)
 test('ccmp_gate', ccmp_gate_test)
+
+# Unit tests for the ClearHDR clamp detector (cinepi/clip_ceiling.hpp) -- the
+# measurement dng_save() writes into WhiteLevel so a blown ClearHDR highlight
+# renders white instead of magenta. No libcamera deps. The fixtures are the
+# per-channel code histograms of four recorded DNGs, so it needs their path at
+# compile time. Run with `meson test`.
+clip_ceiling_test = executable('clip_ceiling_test',
+           '../tests/clip_ceiling_test.cpp',
+           include_directories : [include_directories('..')],
+           cpp_args : ['-DCLIP_CEILING_DATA_DIR="' + meson.current_source_dir() / '../tests/data' + '"'],
+           install : false)
+test('clip_ceiling', clip_ceiling_test)
