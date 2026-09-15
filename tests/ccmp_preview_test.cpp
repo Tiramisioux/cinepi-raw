@@ -602,6 +602,133 @@ void run_anchor_table()
     check(p1.clip_code < 4095 && p4.clip_code < 4095, "and both sit below the table's top code");
 }
 
+/* ── 16-bit ClearHDR: linear, and magenta for exactly one reason ─────────────
+ *
+ * There is no compander in this mode, which is why ccmpPreviewStage used to
+ * refuse it outright and log "16-bit samples; preview stays magenta" — the
+ * stage was built to undo a compander, found none, and stood down. Correct
+ * about the compander, wrong about the magenta: take the compander away and
+ * what is left is the DIVISION, and the division was the whole defect.
+ *
+ * A ClearHDR merge clamps DIGITALLY and downstream of the CFA, so all four
+ * quad samples pin on one code. That is not a neutral subject — a neutral one
+ * presents raw channels BELOW green by the gains that later neutralise them —
+ * so the AWB gains take the clamped quad to (2.5, 1.0, 2.2) and the CCM, doing
+ * its job, pushes that further to (3.7, -0.15, 2.9). Magenta, and no amount of
+ * rescaling changes it: normalisation moves the LEVEL, and the hue is a RATIO.
+ *
+ * Whitening a clipped pixel is a separate act, and the renderer already has
+ * it: desaturateHighlight() blends toward the quad's own maximum once the raw
+ * peak crosses hl_lo_. The defect is that the peak never crosses it. hl_lo_
+ * sits just under the normalisation reference, so referencing 65535 while the
+ * sensor clamps at 48600 puts the trigger ~17000 codes above anything the
+ * hardware can produce — the correction is armed and unreachable.
+ *
+ * Which is the SAME defect the 12-bit path was already fixed for, quoted in
+ * the block above: "referencing the rolloff to the table's top code put the
+ * trigger ~950 codes above anything the sensor can produce and every blown
+ * highlight stayed magenta". 12-bit got a per-binning anchor. 16-bit got no
+ * anchor and no stage at all — it was refused at the gate, on the reasoning
+ * that with no compander there was nothing to undo. True about the compander;
+ * the magenta was never the compander.
+ *
+ * The two clamps below are real: 48600 and 54100 are the ceilings measured off
+ * the rig at analogue gain codes 80 and 71. (More gain gives a LOWER ceiling,
+ * which is the counter-intuitive part and the reason a fixed anchor could
+ * never have worked here.) */
+void run_sixteen_bit()
+{
+    std::cout << "\n16-bit ClearHDR (linear, no compander)\n";
+
+    const int kChromaTol = 4;
+
+    CcmpPreviewGeometry geom = geometry_for(1928, 1090, 640, 360);
+    geom.raw_shift = 0; /* 16 significant bits in a 16-bit word */
+
+    const double kBlack = 256.0;
+    const double kNominalWhite = 65535.0;
+
+    CcmpPreviewRenderer r;
+    std::string err;
+    if (!r.configureLinear(geom, kBlack, kNominalWhite, &err))
+    {
+        check(false, "configureLinear", err);
+        return;
+    }
+    check(r.ready(), "configures with no decompand table at all");
+
+    CcmpPreviewColour colour;
+    colour.r_gain = kRGain;
+    colour.b_gain = kBGain;
+    /* The shipping default, deliberately: the desaturation IS the mechanism
+     * under test. What moves between the two renders below is only what it is
+     * referenced to. */
+    check(colour.highlight_rolloff > 1e-6, "the rolloff is on by default",
+          fmt(colour.highlight_rolloff));
+
+    for (unsigned clamp : { 48600u, 54100u })
+    {
+        const std::vector<uint8_t> raw = make_clamped_frame(geom, clamp);
+        const std::string at = " (clamp " + std::to_string(clamp) + ")";
+        bool flat = false;
+
+        r.setClipCeiling(0.0);
+        r.setColour(colour);
+        r.resetMaxCode();
+        const Yuv bad = render_flat(r, raw, flat);
+        check(std::abs(bad.u - 128) > 3 * kChromaTol && std::abs(bad.v - 128) > 3 * kChromaTol,
+              "referenced to nominal white, a clamped frame is magenta" + at,
+              "U=" + std::to_string(bad.u) + " V=" + std::to_string(bad.v));
+        check(r.fullyDesaturated() == 0, "because the correction never fires" + at,
+              std::to_string(r.fullyDesaturated()) + " quads desaturated");
+
+        r.setClipCeiling(static_cast<double>(clamp));
+        r.setColour(colour);
+        r.resetMaxCode();
+        const Yuv on = render_flat(r, raw, flat);
+        check(flat, "a clamped frame renders flat" + at);
+        check(std::abs(on.u - 128) <= kChromaTol && std::abs(on.v - 128) <= kChromaTol,
+              "referenced to the measured clamp it is neutral" + at,
+              "U=" + std::to_string(on.u) + " V=" + std::to_string(on.v));
+        check(on.y >= 235, "and reads as white" + at, "Y=" + std::to_string(on.y));
+        check(r.fullyDesaturated() > 0, "because the correction ran to completion" + at,
+              std::to_string(r.fullyDesaturated()) + " quads desaturated");
+    }
+
+    /* THE OTHER HALF OF CORRECT, and the one that gets lost: a pixel well below
+     * the clamp must NOT be whitened. The failure mode of a too-LOW anchor is
+     * the mirror of a too-high one — every bright colour in the frame turns
+     * white and the monitor stops being able to show a saturated practical or
+     * a red LED. So this drives a quad to 60% of the measured ceiling and
+     * requires the correction to leave it alone entirely. */
+    {
+        const std::vector<uint8_t> raw = make_clamped_frame(geom, 29000u);
+        bool flat = false;
+        r.setClipCeiling(48600.0);
+        r.setColour(colour);
+        r.resetMaxCode();
+        const Yuv mid = render_flat(r, raw, flat);
+        check(r.fullyDesaturated() == 0, "a quad well below the clamp is not whitened",
+              std::to_string(r.fullyDesaturated()) + " quads desaturated");
+        check(mid.y < 235, "and is not blown", "Y=" + std::to_string(mid.y));
+    }
+
+    /* The fallback has to be the OLD behaviour, not some other wrong number:
+     * every take's first frames run before anything has been measured, and
+     * they must render exactly as they do today. */
+    r.setClipCeiling(0.0);
+    check(r.clipCeiling() == kNominalWhite && !r.usingMeasuredCeiling(),
+          "an unmeasured ceiling falls back to nominal white", fmt(r.clipCeiling()));
+
+    /* A ceiling at or under black is not a measurement but a bug upstream;
+     * dividing by that span inverts the image rather than merely mis-exposing
+     * it, so it is refused here as well as at the point of measurement. */
+    r.setClipCeiling(kBlack);
+    check(r.clipCeiling() == kNominalWhite, "and so does a ceiling at black", fmt(r.clipCeiling()));
+    r.setClipCeiling(-1.0);
+    check(r.clipCeiling() == kNominalWhite, "and a negative one", fmt(r.clipCeiling()));
+}
+
 int main()
 {
     std::cout << "ccmp_preview_test\n";
@@ -611,6 +738,7 @@ int main()
     run_common();
     run_mono();
     run_anchor_table();
+    run_sixteen_bit();
 
     std::cout << "\n" << (g_failures ? "FAILED " : "PASSED ") << g_failures << " failure(s)\n";
     return g_failures ? 1 : 0;

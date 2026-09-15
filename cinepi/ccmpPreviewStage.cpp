@@ -38,6 +38,8 @@
  * unmeasured falls through and leaves the ISP's preview alone.
  */
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -56,6 +58,7 @@
 
 #include "ccmp_lut.hpp"
 #include "ccmp_preview.hpp"
+#include "clip_ceiling.hpp"
 #include "cinepi_recorder.hpp"
 
 using Stream = libcamera::Stream;
@@ -143,6 +146,7 @@ public:
 
 	void Configure() override;
 	bool Process(CompletedRequestPtr &completed_request) override;
+	void measureClamp(const uint8_t *raw);
 	void Teardown() override { enabled_ = false; }
 
 private:
@@ -167,6 +171,35 @@ private:
 
 	static constexpr unsigned kMaxCodeReportFrames = 120;
 	unsigned frames_since_report_ = 0;
+
+	/* ── the live clamp measurement (16-bit ClearHDR only) ─────────────────
+	 *
+	 * COST. The renderer already reads every raw sample, so this is the second
+	 * pass over the frame and the only new per-frame work in the stage. It is
+	 * kept off the critical path by measuring 1 frame in 8 and every 4th row of
+	 * that frame — about 1/32 of the samples the render itself touches — which
+	 * at 25 fps still puts a fresh answer in front of the operator roughly
+	 * every 1.3 s. kRowStride 4 is inside the range the encoder's own stride of
+	 * 3 was validated over (all eleven fixtures re-run at 1/3, 1/6 and 1/12
+	 * gave bit-identical verdicts). */
+	static constexpr unsigned kMeasureEveryNth = 8;
+	static constexpr unsigned kAccumulations = 4;
+	static constexpr unsigned kRowStride = 4;
+	/* Below this the answer is noise, not a clamp: a frame with no blown
+	 * highlight in it has nothing to measure and must leave the reference where
+	 * it is rather than invent one. The detector refuses those itself; this is
+	 * only the hysteresis that stops a converged answer jittering the whole
+	 * picture's exposure by a fraction of a stop every second. */
+	static constexpr double kAdoptFraction = 0.005;
+	/* imx585 16-bit linear pedestal, the value SensorBlackLevels reports and
+	 * dng_encoder.cpp writes into the file's own BlackLevel tag. Refined per
+	 * frame from metadata below; this is only what the first frame uses. */
+	static constexpr double kLinearBlackLevel = 256.0;
+
+	bool measure_ = false;
+	ClipCeilingDetector ceiling_det_;
+	unsigned accumulations_ = 0;
+	unsigned measure_phase_ = 0;
 };
 
 void ccmpPreviewStage::Configure()
@@ -187,9 +220,19 @@ void ccmpPreviewStage::Configure()
 	 * snapshot exists to avoid — see its comment for the full reasoning. */
 	const Mode requested_mode = options->mode;
 
-	/* Gate 1 — the scope. Silent, because every SDR and 16-bit mode lands here
-	 * on every reconfigure and none of them is a problem. */
-	if (!(options->hdr == "sensor" || options->hdr == "auto") || requested_mode.bit_depth != 12)
+	/* Gate 1 — the scope. Silent, because every SDR mode lands here on every
+	 * reconfigure and none of them is a problem.
+	 *
+	 * 16-BIT USED TO BE TURNED AWAY HERE, on the reasoning that it is linear
+	 * with no compander in the path, so there was nothing to decompand. That
+	 * reasoning was right and the conclusion was wrong: the magenta was never
+	 * the compander. It is the highlight desaturation being referenced to a
+	 * white level the sensor cannot reach — see setClipCeiling() in
+	 * ccmp_preview.hpp. 12-bit had that fixed with a per-binning anchor; this
+	 * mode was simply never in scope to be fixed. */
+	const bool linear = requested_mode.bit_depth == 16;
+	if (!(options->hdr == "sensor" || options->hdr == "auto") ||
+		(requested_mode.bit_depth != 12 && !linear))
 		return;
 
 	StreamInfo raw_info, lores_info;
@@ -197,8 +240,8 @@ void ccmpPreviewStage::Configure()
 	lores_stream_ = app_->LoresStream(&lores_info);
 	if (!raw_stream_ || !lores_stream_)
 	{
-		console->warn("ccmpPreview: 12-bit ClearHDR but no {} stream; preview stays magenta",
-					  raw_stream_ ? "lores" : "raw");
+		console->warn("ccmpPreview: {}-bit ClearHDR but no {} stream; preview stays magenta",
+					  requested_mode.bit_depth, raw_stream_ ? "lores" : "raw");
 		return;
 	}
 
@@ -206,11 +249,13 @@ void ccmpPreviewStage::Configure()
 	{
 		/* Refuse rather than decompand data the requested mode doesn't
 		 * actually describe — same reasoning as ccmp_gate.hpp on the encoder
-		 * side: requested_mode.bit_depth (already checked == 12 above) is a
+		 * side: requested_mode.bit_depth (12 or 16, checked above) is a
 		 * snapshot of the REQUEST, and on a mismatch it cannot be trusted to
-		 * describe what raw_info actually is. Decompanding a stream that may
-		 * be genuinely linear 16-bit would render worse than the plain ISP
-		 * preview it's replacing, not just fail to fix it. */
+		 * describe what raw_info actually is. Both branches have something to
+		 * lose by it — decompanding a stream that is genuinely linear renders
+		 * worse than the ISP preview it replaces, and taking a 12-bit stream
+		 * for a 16-bit one puts the measurement three orders of magnitude off
+		 * and normalises the picture into black. */
 		console->warn("ccmpPreview: requested mode {}x{} does not match the configured raw "
 					   "stream {}x{}; refusing to decompand — preview stays magenta.",
 					   requested_mode.width, requested_mode.height, raw_info.width, raw_info.height);
@@ -237,14 +282,22 @@ void ccmpPreviewStage::Configure()
 	 * and same refusal as the encoder: a binning factor with no measured anchor
 	 * is an unvalidated mode, and the register-only curve is wrong by 21 L
 	 * through the mid-tones. Keyed on the actual configured raw stream
-	 * (raw_info), not the requested mode — see SensorBinning()'s comment. */
+	 * (raw_info), not the requested mode — see SensorBinning()'s comment.
+	 *
+	 * Skipped entirely when linear: 16-bit ClearHDR never went through the
+	 * compander, so there is no table to be missing and nothing for a binning
+	 * factor to key. */
 	const double binning = static_cast<CinePIRecorder *>(app_)->SensorBinning(raw_info.width, raw_info.height);
 	std::string err;
-	const CcmpLut *lut = get_ccmp_lut(binning, err);
-	if (!lut)
+	const CcmpLut *lut = nullptr;
+	if (!linear)
 	{
-		console->warn("ccmpPreview: no CCMP decompand table: {}. Preview stays magenta.", err);
-		return;
+		lut = get_ccmp_lut(binning, err);
+		if (!lut)
+		{
+			console->warn("ccmpPreview: no CCMP decompand table: {}. Preview stays magenta.", err);
+			return;
+		}
 	}
 
 	CcmpPreviewGeometry geom;
@@ -261,10 +314,38 @@ void ccmpPreviewStage::Configure()
 	geom.out_height = lores_info.height;
 	geom.out_stride = lores_info.stride;
 
-	if (!renderer_.configure(geom, *lut, &err))
+	const bool configured = linear
+								? renderer_.configureLinear(geom, kLinearBlackLevel,
+															static_cast<double>((1u << requested_mode.bit_depth) - 1u),
+															&err)
+								: renderer_.configure(geom, *lut, &err);
+	if (!configured)
 	{
 		console->warn("ccmpPreview: {}. Preview stays magenta.", err);
 		return;
+	}
+
+	/* The measurement that replaces the anchor. clip_ceiling.hpp is the same
+	 * header dng_encoder.cpp measures WhiteLevel with, unmodified — it is pure,
+	 * it takes raw Bayer, and the preview has raw Bayer. Running it here rather
+	 * than sharing the encoder's answer is deliberate: the encoder only has one
+	 * while a take is rolling, and the monitor has to be right BEFORE the
+	 * operator presses record, which is the whole point of a monitor.
+	 *
+	 * No curve goes in for the linear path, because there is none — the raw
+	 * code IS the linearised value, so the detector's answer comes back in the
+	 * domain the renderer normalises in, exactly as it comes back in the tag's
+	 * domain on the encoder side. */
+	measure_ = linear;
+	if (measure_)
+	{
+		uint8_t cfa8[4];
+		for (int i = 0; i < 4; ++i)
+			cfa8[i] = static_cast<uint8_t>(raw_format.cfa[i]);
+		ceiling_det_.reset(static_cast<unsigned>((1u << requested_mode.bit_depth) - 1u),
+						   static_cast<unsigned>(kLinearBlackLevel), cfa8);
+		accumulations_ = 0;
+		measure_phase_ = 0;
 	}
 
 	/* The display's matrix, read off the stream rather than assumed. */
@@ -285,11 +366,73 @@ void ccmpPreviewStage::Configure()
 	console->info("ccmpPreview: {} -> {}x{} preview, b={}, exposure {:.2f} gamma {:.2f} "
 				  "highlightRolloff {:.3f} clip anchor {} (desaturation from {:.4f} of "
 				  "full scale) {}",
-				  lut->params().describe(), geom.out_width, geom.out_height,
+				  linear ? "16-bit ClearHDR linear (no decompand)" : lut->params().describe(),
+				  geom.out_width, geom.out_height,
 				  static_cast<long long>(binning), colour_.exposure, colour_.gamma,
 				  colour_.highlight_rolloff, renderer_.resolvedClipCode(),
 				  renderer_.highlightReference() * (1.0 - colour_.highlight_rolloff),
 				  colour_.rec709 ? "Rec709" : "Rec601");
+	if (measure_)
+		console->info("ccmpPreview: measuring the clamp live; until it converges the "
+					  "reference is nominal white {} and blown highlights stay magenta",
+					  renderer_.nominalWhite());
+}
+
+/* Accumulates a strided sample of one frame, and every kAccumulations frames
+ * asks the detector for a verdict.
+ *
+ * WHAT IS ADOPTED AND WHAT IS NOT. The detector refuses far more often than it
+ * answers, and every refusal is correct: a frame with no blown highlight has no
+ * clamp in it, and a frame that runs to full scale is an SDR-shaped histogram
+ * where a "ceiling" would be invented rather than found. A refusal therefore
+ * leaves the reference exactly where it was — which for a fresh configure means
+ * nominal white, i.e. today's behaviour, magenta and all. The stage never
+ * guesses; it either has the number or it renders the way it always did.
+ *
+ * Called with the stage mutex held, from Process(), which is also the only
+ * place the renderer is touched. */
+void ccmpPreviewStage::measureClamp(const uint8_t *raw)
+{
+	if (++measure_phase_ % kMeasureEveryNth)
+		return;
+
+	const CcmpPreviewGeometry &g = renderer_.geometry();
+	for (unsigned y = 0; y < g.raw_height; y += kRowStride)
+		ceiling_det_.add_row(reinterpret_cast<const uint16_t *>(raw + static_cast<size_t>(y) * g.raw_stride),
+							 g.raw_width, y, g.raw_shift);
+
+	if (++accumulations_ < kAccumulations)
+		return;
+	accumulations_ = 0;
+
+	const ClipCeilingDetector::Result r = ceiling_det_.detect();
+	if (r.found)
+	{
+		const double now = renderer_.clipCeiling();
+		const double want = static_cast<double>(r.ceiling);
+		if (std::fabs(want - now) > now * kAdoptFraction)
+		{
+			renderer_.setClipCeiling(want);
+			console->info("ccmpPreview: clamp measured at {} (was referencing {:.0f}); "
+						  "blown highlights now desaturate from {:.4f} of it",
+						  r.ceiling, now, 1.0 - colour_.highlight_rolloff);
+		}
+	}
+	/* A refusal deliberately does nothing. The last good answer is kept rather
+	 * than snapping back to nominal white the moment the lamp leaves frame: the
+	 * clamp is a property of the sensor at this gain, not of what happens to be
+	 * in shot, and a monitor that jumps a third of a stop every time you pan off
+	 * the highlight is worse than one that is slightly stale. Configure() is
+	 * what clears it, which is right — that is where the gain and the mode can
+	 * actually have changed. */
+
+	/* Same window discipline as the peak-code report below: a fresh histogram
+	 * each time, so one old frame's highlight cannot hold the answer up. */
+	uint8_t cfa8[4];
+	for (int i = 0; i < 4; ++i)
+		cfa8[i] = static_cast<uint8_t>(g.cfa[i]);
+	ceiling_det_.reset(static_cast<unsigned>(renderer_.nominalWhite()),
+					   static_cast<unsigned>(renderer_.blackLevel()), cfa8);
 }
 
 bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
@@ -336,6 +479,26 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 		return false;
 	}
 
+	/* SensorBlackLevels is per-channel in the 16-bit linear domain, which is
+	 * the domain this path normalises in — so it goes straight in. The four
+	 * values are within a code of each other on this sensor and the renderer
+	 * carries one black, so the smallest is used: erring low lifts the shadows
+	 * a hair, erring high crushes them, and only one of those is recoverable by
+	 * looking harder at the monitor. */
+	if (measure_)
+	{
+		auto bl = completed_request->metadata.get(libcamera::controls::SensorBlackLevels);
+		if (bl && bl->size() >= 4)
+		{
+			auto lo = (*bl)[0];
+			for (size_t i = 1; i < 4; ++i)
+				lo = std::min(lo, (*bl)[i]);
+			if (lo >= 0 && static_cast<double>(lo) < renderer_.clipCeiling())
+				renderer_.setBlackLevel(static_cast<double>(lo));
+		}
+		measureClamp(raw.data());
+	}
+
 	renderer_.render(raw.data(), lores.data());
 
 	/* The one number that says whether sensor_clip_code matches this sensor:
@@ -348,11 +511,24 @@ bool ccmpPreviewStage::Process(CompletedRequestPtr &completed_request)
 		/* highestUncorrected is the number to read: with the anchor in the right
 		 * place it sits just under it, and when it tracks the peak instead the
 		 * anchor is too high and the blown area is still magenta. */
-		console->info("ccmpPreview: peak raw code {}, highest uncorrected {}, {} quads fully "
-					  "desaturated, over the last {} frames (clip anchor {})",
-					  renderer_.maxCodeSeen(), renderer_.maxUndesaturatedCode(),
-					  renderer_.fullyDesaturated(), frames_since_report_,
-					  renderer_.resolvedClipCode());
+		/* For the linear path resolvedClipCode() is 0 by construction — there
+		 * is no per-binning anchor and no table to carry one — so what has to
+		 * be reported is the measured ceiling, which IS the reference. Read it
+		 * the same way either way: with a blown highlight in frame the peak
+		 * should settle at it, not above it. */
+		if (measure_)
+			console->info("ccmpPreview: peak raw code {}, highest uncorrected {}, {} quads fully "
+						  "desaturated, over the last {} frames (clamp {:.0f}, {})",
+						  renderer_.maxCodeSeen(), renderer_.maxUndesaturatedCode(),
+						  renderer_.fullyDesaturated(), frames_since_report_,
+						  renderer_.clipCeiling(),
+						  renderer_.usingMeasuredCeiling() ? "measured" : "nominal, not yet measured");
+		else
+			console->info("ccmpPreview: peak raw code {}, highest uncorrected {}, {} quads fully "
+						  "desaturated, over the last {} frames (clip anchor {})",
+						  renderer_.maxCodeSeen(), renderer_.maxUndesaturatedCode(),
+						  renderer_.fullyDesaturated(), frames_since_report_,
+						  renderer_.resolvedClipCode());
 		renderer_.resetMaxCode();
 		frames_since_report_ = 0;
 	}

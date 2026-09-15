@@ -229,16 +229,109 @@ public:
             return false;
         }
 
-        /* Detail 3: black off first, then normalise. */
-        lin_.resize(lut.size());
+        /* Detail 3: black off first, then normalise. The DECOMPANDED levels are
+         * what is kept; the black subtraction and the normalisation are folded
+         * in by setLevels(), because neither endpoint is a constant of the
+         * sensor -- see setClipCeiling(). */
+        lin_src_.resize(lut.size());
         for (size_t c = 0; c < lut.size(); ++c)
-            lin_[c] = static_cast<float>((static_cast<double>(lut.table()[c]) - black) / span);
+            lin_src_[c] = static_cast<float>(lut.table()[c]);
 
+        nominal_black_ = black;
+        nominal_white_ = black + span;
         lut_clip_code_ = lut.clip_code();
         geom_ = geom;
+        setLevels(nominal_black_, nominal_white_);
         ready_ = true;
         return true;
     }
+
+    /* The 16-bit ClearHDR path. Linear off the sensor with no compander in it,
+     * so there is no table to fold in and nothing to decompand -- but the
+     * normalisation, which is the part that was actually wrong, is identical.
+     * Everything downstream of here (setLevels, setColour, render) is shared
+     * with the 12-bit path verbatim: the two ClearHDR families differ in their
+     * transfer curve and in nothing else this renderer cares about.
+     *
+     * Before this existed the stage refused 16-bit outright and logged
+     * "preview stays magenta", on the reasoning that there was no compander to
+     * undo. True, and beside the point: the magenta was never the compander. */
+    bool configureLinear(const CcmpPreviewGeometry &geom, double black, double white,
+                         std::string *err = nullptr)
+    {
+        ready_ = false;
+
+        if (!geom.valid())
+        {
+            if (err)
+                *err = "invalid preview geometry";
+            return false;
+        }
+
+        const size_t max_code = static_cast<size_t>(0xFFFFu >> geom.raw_shift);
+        if (!(white > black) || !(black >= 0.0) || white > static_cast<double>(max_code))
+        {
+            if (err)
+                *err = "linear preview needs 0 <= black < white <= " + std::to_string(max_code) +
+                       "; got black " + std::to_string(black) + ", white " + std::to_string(white);
+            return false;
+        }
+
+        lin_src_.resize(max_code + 1);
+        for (size_t c = 0; c <= max_code; ++c)
+            lin_src_[c] = static_cast<float>(c);
+
+        nominal_black_ = black;
+        nominal_white_ = white;
+        lut_clip_code_ = 0;
+        geom_ = geom;
+        setLevels(nominal_black_, nominal_white_);
+        ready_ = true;
+        return true;
+    }
+
+    /* THE DENOMINATOR IS NOT A CONSTANT OF THE SENSOR. This is the preview half
+     * of the same one-number fix dng_encoder.cpp applies to DNG tag 0xC61D.
+     *
+     * `ceiling` is the level the sensor's data actually clamps at, in the same
+     * domain lin_src_ holds -- which is to say exactly the number the encoder
+     * measures per take and declares as WhiteLevel. 0 means "no measurement",
+     * and falls back to the table's nominal white, i.e. the old behaviour.
+     *
+     * WHY THIS IS THE WHOLE FIX. A ClearHDR clamp sits BELOW nominal white, and
+     * AWB scales R and B by about 1.7 with green fixed at 1.0. Normalise a
+     * clamped pixel by nominal white and it reaches the matrix at ~0.59: R and
+     * B hit 1.0 and clip, green stays at 0.59, and the highlight is magenta by
+     * construction. Not a rolloff problem, not a gamma problem, not a
+     * saturation problem -- a division by the wrong number. Normalise by the
+     * clamp instead and the same pixel arrives at 1.0, all three channels clip
+     * together, and it is white.
+     *
+     * Note what this deliberately does NOT do: it does not try to repair the
+     * highlight. Every previous attempt at this did, cosmetically, and every
+     * one was reverted. This only makes the monitor divide by the number the
+     * file already declares, so the two agree. */
+    void setClipCeiling(double ceiling)
+    {
+        /* Guarded against black_ and not nominal_black_: SensorBlackLevels
+         * moves the live black, and a ceiling under it would make the span
+         * negative and render the picture inverted rather than merely
+         * mis-exposed. */
+        setLevels(black_, (ceiling > black_) ? ceiling : nominal_white_);
+    }
+
+    /* Per-frame SensorBlackLevels. Rebuilds nothing when it has not moved,
+     * which is almost always. */
+    void setBlackLevel(double black)
+    {
+        if (black >= 0.0 && black < white_ && black != black_)
+            setLevels(black, white_);
+    }
+
+    double clipCeiling() const { return white_; }
+    double blackLevel() const { return black_; }
+    double nominalWhite() const { return nominal_white_; }
+    bool usingMeasuredCeiling() const { return white_ != nominal_white_; }
 
     /* Bakes the white balance, the CCM and the exposure into one matrix, and
      * the gamma into a table. Detail 1 lives here: the gains are part of the
@@ -578,6 +671,35 @@ private:
 
     bool ready_ = false;
     CcmpPreviewGeometry geom_;
+    /* One pass, and the only place the normalisation lives. Clamping at the
+     * top matters now in a way it did not before: with a measured ceiling,
+     * codes ABOVE it exist (they are the clamp's own noise) and without the
+     * clamp they would come out over 1.0 and wrap through the matrix. */
+    void setLevels(double black, double white)
+    {
+        if (!(white > black))
+        {
+            black = nominal_black_;
+            white = nominal_white_;
+        }
+        black_ = black;
+        white_ = white;
+        const double span = white - black;
+        lin_.resize(lin_src_.size());
+        for (size_t c = 0; c < lin_src_.size(); ++c)
+        {
+            const double v = (static_cast<double>(lin_src_[c]) - black) / span;
+            lin_[c] = static_cast<float>(v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v));
+        }
+    }
+
+    /* The decompanded level of every code the container can deliver, before
+     * black and before normalisation — the invariant part. */
+    std::vector<float> lin_src_;
+    double nominal_black_ = 0.0;
+    double nominal_white_ = 0.0;
+    double black_ = 0.0;
+    double white_ = 0.0;
     std::vector<float> lin_;
     float m_[9] = { 1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f };
     float gamma_[kGammaSize] = {};
