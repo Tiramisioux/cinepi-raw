@@ -47,39 +47,106 @@ struct DriverModeMetadata
 	bool valid = false;
 };
 
+static bool read_v4l2_control(int fd, __u32 id, int &value)
+{
+	v4l2_ext_control ctrl {};
+	ctrl.id = id;
+
+	v4l2_ext_controls ctrls {};
+	ctrls.ctrl_class = V4L2_CTRL_ID2CLASS(id);
+	ctrls.count = 1;
+	ctrls.controls = &ctrl;
+
+	if (xioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) == 0)
+	{
+		value = ctrl.value;
+		return true;
+	}
+
+	// Keep compatibility with drivers exposing the custom controls through the
+	// legacy user-control ioctl path.
+	v4l2_control legacy { id, 0 };
+	if (xioctl(fd, VIDIOC_G_CTRL, &legacy) == 0)
+	{
+		value = legacy.value;
+		return true;
+	}
+
+	return false;
+}
+
+static bool query_v4l2_control(int fd, __u32 id, const char *expected_name)
+{
+	v4l2_queryctrl query {};
+	query.id = id;
+	if (xioctl(fd, VIDIOC_QUERYCTRL, &query) != 0)
+		return false;
+
+	if (query.flags & V4L2_CTRL_FLAG_DISABLED)
+		return false;
+
+	return expected_name == nullptr ||
+		strncmp(reinterpret_cast<const char *>(query.name), expected_name,
+				sizeof(query.name)) == 0;
+}
+
 static bool read_driver_mode_metadata(DriverModeMetadata &m)
 {
-	for (int i = 0; i < 8; ++i)
+	/*
+	 * The IMX585 mode metadata is attached to the sensor sub-device, not to
+	 * the libcamera Camera controls. Do not infer it from the stream size:
+	 *
+	 *   RAW16 3840x2200 -> active 3840x2160
+	 *   RAW16 1920x1100 -> active 1920x1080
+	 *
+	 * The driver updates these controls when the active sensor mode changes.
+	 *
+	 * Query the control itself before accepting a subdev. This is important
+	 * on Pi 5 systems with multiple sensor sub-devices: /dev/v4l-subdevN is
+	 * not a stable sensor identity and the first subdev is not necessarily
+	 * the IMX585.
+	 */
+	for (int i = 0; i < 32; ++i)
 	{
 		std::string dev = "/dev/v4l-subdev" + std::to_string(i);
-		int fd = open(dev.c_str(), O_RDONLY);
+		int fd = open(dev.c_str(), O_RDWR);
 		if (fd < 0)
 			continue;
 
-		v4l2_control c { V4L2_CID_IMX585_BINNING, 0 };
-		if (xioctl(fd, VIDIOC_G_CTRL, &c) == 0 && c.value >= 1 && c.value <= 2)
+		if (!query_v4l2_control(fd, V4L2_CID_IMX585_BINNING, "Mode Binning"))
 		{
-			m.binning = c.value;
-			v4l2_control q { V4L2_CID_IMX585_CROP_LEFT, 0 };
-			v4l2_control t { V4L2_CID_IMX585_CROP_TOP, 0 };
-			v4l2_control w { V4L2_CID_IMX585_CROP_WIDTH, 0 };
-			v4l2_control h { V4L2_CID_IMX585_CROP_HEIGHT, 0 };
-			if (!xioctl(fd, VIDIOC_G_CTRL, &q) &&
-			    !xioctl(fd, VIDIOC_G_CTRL, &t) &&
-			    !xioctl(fd, VIDIOC_G_CTRL, &w) &&
-			    !xioctl(fd, VIDIOC_G_CTRL, &h))
-			{
-				m.crop_left = q.value;
-				m.crop_top = t.value;
-				m.crop_width = w.value;
-				m.crop_height = h.value;
-				m.valid = true;
-				close(fd);
-				return true;
-			}
+			close(fd);
+			continue;
 		}
+
+		int binning = 0;
+		int left = 0;
+		int top = 0;
+		int width = 0;
+		int height = 0;
+
+		const bool ok =
+			read_v4l2_control(fd, V4L2_CID_IMX585_BINNING, binning) &&
+			read_v4l2_control(fd, V4L2_CID_IMX585_CROP_LEFT, left) &&
+			read_v4l2_control(fd, V4L2_CID_IMX585_CROP_TOP, top) &&
+			read_v4l2_control(fd, V4L2_CID_IMX585_CROP_WIDTH, width) &&
+			read_v4l2_control(fd, V4L2_CID_IMX585_CROP_HEIGHT, height);
+
 		close(fd);
+
+		if (!ok || binning < 1 || binning > 2 ||
+			left < 0 || top < 0 || width <= 0 || height <= 0)
+			continue;
+
+		m.binning = binning;
+		m.crop_left = left;
+		m.crop_top = top;
+		m.crop_width = width;
+		m.crop_height = height;
+		m.valid = true;
+		return true;
 	}
+
 	return false;
 }
 
