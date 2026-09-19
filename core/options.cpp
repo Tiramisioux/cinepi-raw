@@ -22,6 +22,64 @@
 
 #include "core/options.hpp"
 
+/* Optional sensor-driver mode metadata. The IMX585 driver exposes these
+ * as read-only V4L2 controls so applications can consume the driver's
+ * actual binning and native sensor crop instead of inferring them. */
+#ifndef V4L2_CID_USER_IMX585_BASE
+#define V4L2_CID_USER_IMX585_BASE (V4L2_CID_USER_BASE + 0x2000)
+#endif
+#define V4L2_CID_IMX585_BINNING     (V4L2_CID_USER_IMX585_BASE + 10)
+#define V4L2_CID_IMX585_CROP_LEFT   (V4L2_CID_USER_IMX585_BASE + 11)
+#define V4L2_CID_IMX585_CROP_TOP    (V4L2_CID_USER_IMX585_BASE + 12)
+#define V4L2_CID_IMX585_CROP_WIDTH  (V4L2_CID_USER_IMX585_BASE + 13)
+#define V4L2_CID_IMX585_CROP_HEIGHT (V4L2_CID_USER_IMX585_BASE + 14)
+
+struct DriverModeMetadata
+{
+	int binning = 0;
+	int crop_left = 0;
+	int crop_top = 0;
+	int crop_width = 0;
+	int crop_height = 0;
+	bool valid = false;
+};
+
+static bool read_driver_mode_metadata(DriverModeMetadata &m)
+{
+	for (int i = 0; i < 8; ++i)
+	{
+		std::string dev = "/dev/v4l-subdev" + std::to_string(i);
+		int fd = open(dev.c_str(), O_RDONLY);
+		if (fd < 0)
+			continue;
+
+		v4l2_control c { V4L2_CID_IMX585_BINNING, 0 };
+		if (xioctl(fd, VIDIOC_G_CTRL, &c) == 0 && c.value >= 1 && c.value <= 2)
+		{
+			m.binning = c.value;
+			v4l2_control q { V4L2_CID_IMX585_CROP_LEFT, 0 };
+			v4l2_control t { V4L2_CID_IMX585_CROP_TOP, 0 };
+			v4l2_control w { V4L2_CID_IMX585_CROP_WIDTH, 0 };
+			v4l2_control h { V4L2_CID_IMX585_CROP_HEIGHT, 0 };
+			if (!xioctl(fd, VIDIOC_G_CTRL, &q) &&
+			    !xioctl(fd, VIDIOC_G_CTRL, &t) &&
+			    !xioctl(fd, VIDIOC_G_CTRL, &w) &&
+			    !xioctl(fd, VIDIOC_G_CTRL, &h))
+			{
+				m.crop_left = q.value;
+				m.crop_top = t.value;
+				m.crop_width = w.value;
+				m.crop_height = h.value;
+				m.valid = true;
+				close(fd);
+				return true;
+			}
+		}
+		close(fd);
+	}
+	return false;
+}
+
 static const std::map<int, std::string> cfa_map =
 {
 	{ properties::draft::ColorFilterArrangementEnum::RGGB, "RGGB" },
@@ -375,8 +433,17 @@ bool Options::Parse(int argc, char *argv[])
 						auto fd_ctrl = cam->controls().find(&controls::FrameDurationLimits);
 						auto crop_ctrl = cam->properties().get(properties::ScalerCropMaximum);
 						double fps = fd_ctrl == cam->controls().end() ? NAN : (1e6 / fd_ctrl->second.min().get<int64_t>());
+						DriverModeMetadata driver_meta;
+						const bool have_driver_meta = read_driver_mode_metadata(driver_meta);
 						std::cout << std::fixed << std::setprecision(2) << "["
-								  << fps << " fps - " << crop_ctrl->toString() << " crop" << "]";
+								  << fps << " fps - " << crop_ctrl->toString() << " crop";
+						if (have_driver_meta)
+						{
+							std::cout << "; binning " << driver_meta.binning << "x" << driver_meta.binning
+									  << "; mode-crop (" << driver_meta.crop_left << "," << driver_meta.crop_top
+									  << ")/" << driver_meta.crop_width << "x" << driver_meta.crop_height;
+						}
+						std::cout << "]";
 						if (--num)
 						{
 							std::cout << std::endl;
