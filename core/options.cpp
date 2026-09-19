@@ -22,6 +22,8 @@
 
 #include "core/options.hpp"
 
+static int xioctl(int fd, unsigned long ctl, void *arg);
+
 /* Optional sensor-driver mode metadata. The IMX585 driver exposes these
  * as read-only V4L2 controls so applications can consume the driver's
  * actual binning and native sensor crop instead of inferring them. */
