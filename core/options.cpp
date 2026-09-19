@@ -310,7 +310,7 @@ bool Options::Parse(int argc, char *argv[])
 	libcamera::logSetLevel("*", "ERROR");
 
 	std::vector<std::shared_ptr<libcamera::Camera>> cameras = app_->GetCameras();
-	if (camera < cameras.size())
+	if (!list_cameras && camera < cameras.size())
 	{
 		const std::string cam_id = *cameras[camera]->properties().get(libcamera::properties::Model);
 		// imx708 = stock Pi HDR; imx585 = ClearHDR (driver-level merge, wide_dynamic_range=1
