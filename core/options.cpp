@@ -392,7 +392,7 @@ bool Options::Parse(int argc, char *argv[])
 				cam->acquire();
 
 				std::unique_ptr<CameraConfiguration> config =
-					cam->generateConfiguration({libcamera::StreamRole::Raw, libcamera::StreamRole::Viewfinder});
+					cam->generateConfiguration({libcamera::StreamRole::Raw});
 				if (!config)
 				{
 					cam->release();
