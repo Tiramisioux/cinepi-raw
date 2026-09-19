@@ -1,0 +1,768 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/*
+ * Copyright (C) 2020, Raspberry Pi (Trading) Ltd.
+ *
+ * options.cpp - common program options helpers
+ */
+#include <algorithm>
+#include <chrono>
+#include <fcntl.h>
+#include <iomanip>
+#include <iostream>
+#include <linux/v4l2-controls.h>
+#include <linux/videodev2.h>
+#include <map>
+#include <set>
+#include <string>
+#include <sys/ioctl.h>
+#include <thread>
+
+#include <libcamera/formats.h>
+#include <libcamera/logging.h>
+#include <libcamera/property_ids.h>
+
+#include "core/options.hpp"
+
+static int xioctl(int fd, unsigned long ctl, void *arg);
+
+/* Optional sensor-driver mode metadata. The IMX585 driver exposes these
+ * as read-only V4L2 controls so applications can consume the driver's
+ * actual binning and native sensor crop instead of inferring them. */
+#ifndef V4L2_CID_USER_IMX585_BASE
+#define V4L2_CID_USER_IMX585_BASE (V4L2_CID_USER_BASE + 0x2000)
+#endif
+#define V4L2_CID_IMX585_BINNING     (V4L2_CID_USER_IMX585_BASE + 10)
+#define V4L2_CID_IMX585_CROP_LEFT   (V4L2_CID_USER_IMX585_BASE + 11)
+#define V4L2_CID_IMX585_CROP_TOP    (V4L2_CID_USER_IMX585_BASE + 12)
+#define V4L2_CID_IMX585_CROP_WIDTH  (V4L2_CID_USER_IMX585_BASE + 13)
+#define V4L2_CID_IMX585_CROP_HEIGHT (V4L2_CID_USER_IMX585_BASE + 14)
+
+struct DriverModeMetadata
+{
+	int binning = 0;
+	int crop_left = 0;
+	int crop_top = 0;
+	int crop_width = 0;
+	int crop_height = 0;
+	bool valid = false;
+};
+
+static bool read_driver_mode_metadata(DriverModeMetadata &m)
+{
+	for (int i = 0; i < 8; ++i)
+	{
+		std::string dev = "/dev/v4l-subdev" + std::to_string(i);
+		int fd = open(dev.c_str(), O_RDONLY);
+		if (fd < 0)
+			continue;
+
+		v4l2_control c { V4L2_CID_IMX585_BINNING, 0 };
+		if (xioctl(fd, VIDIOC_G_CTRL, &c) == 0 && c.value >= 1 && c.value <= 2)
+		{
+			m.binning = c.value;
+			v4l2_control q { V4L2_CID_IMX585_CROP_LEFT, 0 };
+			v4l2_control t { V4L2_CID_IMX585_CROP_TOP, 0 };
+			v4l2_control w { V4L2_CID_IMX585_CROP_WIDTH, 0 };
+			v4l2_control h { V4L2_CID_IMX585_CROP_HEIGHT, 0 };
+			if (!xioctl(fd, VIDIOC_G_CTRL, &q) &&
+			    !xioctl(fd, VIDIOC_G_CTRL, &t) &&
+			    !xioctl(fd, VIDIOC_G_CTRL, &w) &&
+			    !xioctl(fd, VIDIOC_G_CTRL, &h))
+			{
+				m.crop_left = q.value;
+				m.crop_top = t.value;
+				m.crop_width = w.value;
+				m.crop_height = h.value;
+				m.valid = true;
+				close(fd);
+				return true;
+			}
+		}
+		close(fd);
+	}
+	return false;
+}
+
+static const std::map<int, std::string> cfa_map =
+{
+	{ properties::draft::ColorFilterArrangementEnum::RGGB, "RGGB" },
+	{ properties::draft::ColorFilterArrangementEnum::GRBG, "GRBG" },
+	{ properties::draft::ColorFilterArrangementEnum::GBRG, "GBRG" },
+	{ properties::draft::ColorFilterArrangementEnum::RGB, "RGB" },
+	{ properties::draft::ColorFilterArrangementEnum::MONO, "MONO" },
+};
+
+static const std::map<libcamera::PixelFormat, unsigned int> bayer_formats =
+{
+	{ libcamera::formats::SRGGB10_CSI2P, 10 },
+	{ libcamera::formats::SGRBG10_CSI2P, 10 },
+	{ libcamera::formats::SBGGR10_CSI2P, 10 },
+	{ libcamera::formats::R10_CSI2P,     10 },
+	{ libcamera::formats::SGBRG10_CSI2P, 10 },
+	{ libcamera::formats::SRGGB12_CSI2P, 12 },
+	{ libcamera::formats::SGRBG12_CSI2P, 12 },
+	{ libcamera::formats::SBGGR12_CSI2P, 12 },
+	{ libcamera::formats::SGBRG12_CSI2P, 12 },
+	{ libcamera::formats::SRGGB16,       16 },
+	{ libcamera::formats::SGRBG16,       16 },
+	{ libcamera::formats::SBGGR16,       16 },
+	{ libcamera::formats::SGBRG16,       16 },
+};
+
+
+Mode::Mode(std::string const &mode_string) : Mode()
+{
+	if (!mode_string.empty())
+	{
+		char p;
+		int n = sscanf(mode_string.c_str(), "%u:%u:%u:%c", &width, &height, &bit_depth, &p);
+		if (n < 2)
+			throw std::runtime_error("Invalid mode");
+		else if (n == 2)
+			bit_depth = 12, packed = true;
+		else if (n == 3)
+			packed = true;
+		else if (toupper(p) == 'P')
+			packed = true;
+		else if (toupper(p) == 'U')
+			packed = false;
+		else
+			throw std::runtime_error("Packing indicator should be P or U");
+	}
+}
+
+std::string Mode::ToString() const
+{
+	if (bit_depth == 0)
+		return "unspecified";
+	else
+	{
+		std::stringstream ss;
+		ss << width << ":" << height << ":" << bit_depth << ":" << (packed ? "P" : "U");
+		if (framerate)
+			ss << "(" << framerate << ")";
+		return ss.str();
+	}
+}
+
+void Mode::update(const libcamera::Size &size, const std::optional<float> &fps)
+{
+	if (!width)
+		width = size.width;
+	if (!height)
+		height = size.height;
+	if (!bit_depth)
+		bit_depth = 12;
+	if (fps)
+		framerate = fps.value();
+}
+
+static int xioctl(int fd, unsigned long ctl, void *arg)
+{
+	int ret, num_tries = 10;
+	do
+	{
+		ret = ioctl(fd, ctl, arg);
+	} while (ret == -1 && errno == EINTR && num_tries-- > 0);
+	return ret;
+}
+
+// Returns true once some subdev CONFIRMS the control reads back as `en` --
+// either it was already there, or the write just landed. `changed_out`, if
+// given, is set when a write was actually needed (the caller uses this to
+// decide whether the camera manager needs resetting).
+//
+// The two outcomes this deliberately does NOT conflate: "already at the
+// target, nothing to do" and "tried to write but the sensor didn't take it"
+// used to both return false from here, so a caller checking only the return
+// value could not tell a confirmed no-op from a silent failure. That
+// conflation is exactly how a wide_dynamic_range=1 request could fail with
+// nothing to show for it -- see Options::Parse()'s caller for the failure
+// mode this produces on the sensor (the driver's invalid-combo gate serving
+// a BLC pedestal fill while cinepi-raw believes ClearHDR is engaged).
+static bool set_subdev_hdr_ctrl(int en, bool *changed_out = nullptr)
+{
+	bool confirmed = false;
+	bool changed = false;
+	// Currently this does not exist in libcamera, so go directly to V4L2.
+	// Sensor-agnostic probe: only the camera sensor subdev exposes
+	// V4L2_CID_WIDE_DYNAMIC_RANGE (imx708 stock HDR, imx585 ClearHDR), so we walk
+	// every /dev/v4l-subdevN and set it wherever the control exists. This locates the
+	// imx585 subdev with no sensor-name filter (it is /dev/v4l-subdev2 on the
+	// single-sensor Pi) and covers imx708 identically.
+	for (int i = 0; i < 8; i++)
+	{
+		std::string dev("/dev/v4l-subdev");
+		dev += (char)('0' + i);
+		int fd = open(dev.c_str(), O_RDWR, 0);
+		if (fd < 0)
+			continue;
+
+		v4l2_control ctrl { V4L2_CID_WIDE_DYNAMIC_RANGE, en };
+		if (!xioctl(fd, VIDIOC_G_CTRL, &ctrl))
+		{
+			if (ctrl.value == en)
+				confirmed = true;
+			else
+			{
+				ctrl.value = en;
+				if (!xioctl(fd, VIDIOC_S_CTRL, &ctrl))
+				{
+					changed = true;
+					confirmed = true;
+				}
+			}
+		}
+		close(fd);
+	}
+	if (changed_out)
+		*changed_out = changed;
+	return confirmed;
+}
+
+bool Options::Parse(int argc, char *argv[])
+{
+	using namespace boost::program_options;
+	using namespace libcamera;
+	variables_map vm;
+	// Read options from the command line
+	store(parse_command_line(argc, argv, options_), vm);
+	notify(vm);
+	// Read options from a file if specified
+	std::ifstream ifs(config_file.c_str());
+	if (ifs)
+	{
+		store(parse_config_file(ifs, options_), vm);
+		notify(vm);
+	}
+
+	// This is to get round the fact that the boost option parser does not
+	// allow std::optional types.
+	if (framerate_ != -1.0)
+		framerate = framerate_;
+
+	// Check if --nopreview is set, and if no info-text string was provided
+	// null the defaulted string so nothing gets displayed to stderr.
+	if (nopreview && vm["info-text"].defaulted())
+		info_text = "";
+
+	// lens_position is even more awkward, because we have two "default"
+	// behaviours: Either no lens movement at all (if option is not given),
+	// or libcamera's default control value (typically the hyperfocal).
+	float f = 0.0;
+	if (std::istringstream(lens_position_) >> f)
+		lens_position = f;
+	else if (lens_position_ == "default")
+		set_default_lens_position = true;
+	else if (!lens_position_.empty())
+		throw std::runtime_error("Invalid lens position: " + lens_position_);
+
+	// Convert time strings to durations
+	timeout.set(timeout_);
+	shutter.set(shutter_);
+	flicker_period.set(flicker_period_);
+
+	if (help)
+	{
+		std::cout << options_;
+		return false;
+	}
+
+	if (version)
+	{
+		std::cout << "rpicam-apps build: " << RPiCamAppsVersion() << std::endl;
+		std::cout << "libcamera build: " << libcamera::CameraManager::version() << std::endl;
+		return false;
+	}
+
+	// We have to pass the tuning file name through an environment variable.
+	// Note that we only overwrite the variable if the option was given.
+	if (tuning_file != "-")
+		setenv("LIBCAMERA_RPI_TUNING_FILE", tuning_file.c_str(), 1);
+
+	// The PiSP pixel-rate ceiling travels the same way, and for the same
+	// reason: only the IPA consumes it, and the environment is the only
+	// channel into the IPA. It must be set before initCameraManager() below,
+	// because the controller resolves its hardware config on first use.
+	//
+	// Passed rather than probed. A CM5 on 6.12.93 has no rp1 node in
+	// /proc/device-tree to read the clock from, and the overlay that requests
+	// 300MHz actually yields 333.33MHz -- so both the obvious auto-detections
+	// fail, and they fail silently back to the stock rate. Cinemate sets this
+	// from the same switch that enables the overlay, so the advertised ceiling
+	// and the hardware regime cannot disagree.
+	if (max_pixel_rate > 0.0)
+		setenv("LIBCAMERA_RPI_MAX_PIXEL_RATE", std::to_string(max_pixel_rate).c_str(), 1);
+
+	if (hdr != "off" && hdr != "single-exp" && hdr != "sensor" && hdr != "auto")
+		throw std::runtime_error("Invalid HDR option provided: " + hdr);
+
+	if (!verbose || list_cameras)
+		libcamera::logSetTarget(libcamera::LoggingTargetNone);
+
+	// HDR control. Set the sensor control before opening or listing any cameras.
+	// Start by disabling HDR unconditionally. Reset the camera manager if we have
+	// actually switched the value of the control.
+	set_subdev_hdr_ctrl(0);
+	app_->initCameraManager();
+
+	// Unconditionally set the logging level to error for a bit.
+	libcamera::logSetLevel("*", "ERROR");
+
+	std::vector<std::shared_ptr<libcamera::Camera>> cameras = app_->GetCameras();
+	if (camera < cameras.size())
+	{
+		const std::string cam_id = *cameras[camera]->properties().get(libcamera::properties::Model);
+		// imx708 = stock Pi HDR; imx585 = ClearHDR (driver-level merge, wide_dynamic_range=1
+		// surfaces the SRGGB16 linear + SRGGB12_CSI2P CCMP modes). set_subdev_hdr_ctrl probes
+		// each subdev for the control, so listing the sensor here is the only gate needed.
+		if ((hdr == "sensor" || hdr == "auto") && (cam_id == "imx708" || cam_id == "imx585"))
+		{
+			// Turn on sensor HDR. set_subdev_hdr_ctrl(0) above and
+			// initCameraManager() just before it can leave the subdev
+			// briefly unable to accept a mode-list-changing control -- the
+			// write fails with nothing to show for it except a false
+			// return, and proceeding anyway used to leave the sensor's WDR
+			// combiner off while cinepi-raw requested a 12-bit ClearHDR
+			// pixel format regardless. That is the driver's invalid-combo
+			// case: it serves a BLC pedestal fill (~200), not real data,
+			// and every downstream ClearHDR knob (thresholds, blend, gain
+			// adder) is inert against it. Retry briefly for the transient
+			// case; refuse to launch as ClearHDR for the persistent one
+			// rather than silently recording pedestal fill.
+			bool changed = false;
+			bool confirmed = set_subdev_hdr_ctrl(1, &changed);
+			for (int attempt = 0; !confirmed && attempt < 4; ++attempt)
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				confirmed = set_subdev_hdr_ctrl(1, &changed);
+			}
+			if (!confirmed)
+				throw std::runtime_error(
+					"imx585/imx708 ClearHDR: sensor did not accept wide_dynamic_range=1 "
+					"after retrying -- refusing to launch with --hdr " + hdr +
+					" while the sensor's combiner is still off (this is the invalid-combo "
+					"BLC-fill defect, not a software problem; retry the launch)");
+			// Reset the camera manager only when the value actually changed --
+			// an already-true readback needs no reset, same as before.
+			if (changed)
+			{
+				cameras.clear();
+				app_->initCameraManager();
+				cameras = app_->GetCameras();
+			}
+			hdr = "sensor";
+		}
+	}
+
+	if (list_cameras)
+	{
+		RPiCamApp::verbosity = 1;
+
+		if (cameras.empty())
+		{
+			std::cout << "Available cameras" << std::endl
+					  << "-----------------" << std::endl
+					  << "No cameras available!" << std::endl;
+			verbose = 1;
+			return false;
+		}
+
+		std::cout << "Available cameras" << std::endl
+				  << "-----------------" << std::endl;
+
+		/*
+		 * The IMX585 exposes a different libcamera mode table when
+		 * wide_dynamic_range is enabled. Therefore --list-cameras probes
+		 * both sensor states explicitly; the initial CameraConfiguration
+		 * cannot show the ClearHDR modes.
+		 */
+		auto print_modes = [](const std::vector<std::shared_ptr<libcamera::Camera>> &cams,
+							 const std::string &section_label,
+							 bool only_hdr_sensors)
+		{
+			for (std::size_t cam_index = 0; cam_index < cams.size(); ++cam_index)
+			{
+				auto const &cam = cams[cam_index];
+				const std::string cam_id = *cam->properties().get(libcamera::properties::Model);
+				const bool hdr_sensor = (cam_id == "imx708" || cam_id == "imx585");
+				if (only_hdr_sensors && !hdr_sensor)
+					continue;
+
+				cam->acquire();
+
+				std::unique_ptr<CameraConfiguration> config =
+					cam->generateConfiguration({libcamera::StreamRole::Raw});
+				if (!config)
+				{
+					cam->release();
+					continue;
+				}
+
+				const StreamFormats &formats = config->at(0).formats();
+				if (formats.pixelformats().empty())
+				{
+					cam->release();
+					continue;
+				}
+
+				std::stringstream sensor_props;
+				sensor_props << cam_index << " : " << cam_id << " [";
+				auto area = cam->properties().get(properties::PixelArrayActiveAreas);
+				if (area)
+					sensor_props << (*area)[0].size().toString() << " ";
+
+				unsigned int bits = 0;
+				for (const auto &pix : formats.pixelformats())
+				{
+					auto b = bayer_formats.find(pix);
+					if (b != bayer_formats.end() && b->second > bits)
+						bits = b->second;
+				}
+				if (bits)
+					sensor_props << bits << "-bit ";
+
+				auto cfa = cam->properties().get(properties::draft::ColorFilterArrangement);
+				if (cfa && cfa_map.count(*cfa))
+					sensor_props << cfa_map.at(*cfa) << " ";
+
+				if (sensor_props.str().back() == ' ')
+					sensor_props.seekp(-1, sensor_props.cur);
+				sensor_props << "] (" << cam->id() << ")";
+
+				if (!section_label.empty())
+					std::cout << "    " << section_label << std::endl;
+				std::cout << sensor_props.str() << std::endl;
+
+				ControlInfoMap control_map;
+				Size max_size;
+				PixelFormat max_fmt;
+				std::cout << "    Modes: ";
+
+				unsigned int format_index = 0;
+				for (const auto &pix : formats.pixelformats())
+				{
+					if (format_index++)
+						std::cout << "           ";
+
+					std::string mode_prefix("'" + pix.toString() + "' : ");
+					std::cout << mode_prefix;
+
+					std::set<std::string> seen_modes;
+					const auto &sizes = formats.sizes(pix);
+					for (std::size_t size_index = 0; size_index < sizes.size(); ++size_index)
+					{
+						const auto &size = sizes[size_index];
+						RPiCamApp::SensorMode sensor_mode(size, pix, 0);
+
+						config->at(0).size = size;
+						config->at(0).pixelFormat = pix;
+						config->sensorConfig = libcamera::SensorConfiguration();
+						config->sensorConfig->outputSize = size;
+						config->sensorConfig->bitDepth = sensor_mode.depth();
+
+						if (config->validate() == libcamera::CameraConfiguration::Invalid)
+							continue;
+						if (cam->configure(config.get()) < 0)
+							continue;
+
+						auto fd_ctrl = cam->controls().find(&controls::FrameDurationLimits);
+						auto crop_ctrl = cam->properties().get(properties::ScalerCropMaximum);
+						double fps = fd_ctrl == cam->controls().end()
+							? NAN
+							: (1e6 / fd_ctrl->second.min().get<int64_t>());
+
+						DriverModeMetadata driver_meta;
+						const bool have_driver_meta = read_driver_mode_metadata(driver_meta);
+
+						std::ostringstream signature;
+						signature << size.width << "x" << size.height;
+						if (have_driver_meta)
+							signature << "/" << driver_meta.binning
+							  << "/" << driver_meta.crop_left
+							  << "/" << driver_meta.crop_top
+							  << "/" << driver_meta.crop_width
+							  << "/" << driver_meta.crop_height;
+						if (!seen_modes.insert(signature.str()).second)
+							continue;
+
+						std::cout << size.toString()
+							  << std::fixed << std::setprecision(2)
+							  << " [" << fps << " fps";
+						if (crop_ctrl)
+							std::cout << " - " << crop_ctrl->toString() << " crop";
+						if (have_driver_meta)
+						{
+							std::cout << "; binning " << driver_meta.binning << "x"
+								  << driver_meta.binning
+								  << "; mode-crop (" << driver_meta.crop_left << ","
+								  << driver_meta.crop_top << ")/"
+								  << driver_meta.crop_width << "x"
+								  << driver_meta.crop_height;
+						}
+						std::cout << "]";
+
+						if (size_index + 1 < sizes.size())
+							std::cout << std::endl
+								  << std::string(mode_prefix.length() + 11, ' ');
+					}
+					std::cout << std::endl;
+				}
+
+				if (verbose > 1)
+				{
+					std::stringstream ss;
+					ss << "\n    Available controls for " << max_size.toString() << " "
+					   << max_fmt.toString() << " mode:\n    ";
+					std::cout << ss.str();
+					for (std::size_t s = 0; s < ss.str().length() - 10; std::cout << "-", s++);
+					std::cout << std::endl;
+
+					std::vector<std::string> ctrls;
+					for (auto const &[id, info] : control_map)
+						ctrls.emplace_back(id->name() + " : " + info.toString());
+					std::sort(ctrls.begin(), ctrls.end(),
+							  [](auto const &l, auto const &r) { return l < r; });
+					for (auto const &ctrl : ctrls)
+						std::cout << "    " << ctrl << std::endl;
+				}
+
+				std::cout << std::endl;
+				cam->release();
+			}
+		};
+
+		print_modes(cameras, "", false);
+
+		bool have_hdr_sensor = false;
+		for (auto const &cam : cameras)
+		{
+			const std::string cam_id = *cam->properties().get(libcamera::properties::Model);
+			if (cam_id == "imx708" || cam_id == "imx585")
+			{
+				have_hdr_sensor = true;
+				break;
+			}
+		}
+
+		if (have_hdr_sensor)
+		{
+			bool changed = false;
+			bool confirmed = set_subdev_hdr_ctrl(1, &changed);
+			for (int attempt = 0; !confirmed && attempt < 4; ++attempt)
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				confirmed = set_subdev_hdr_ctrl(1, &changed);
+			}
+
+			if (confirmed)
+			{
+				cameras.clear();
+				app_->initCameraManager();
+				cameras = app_->GetCameras();
+				print_modes(cameras, "CLEAR HDR / SENSOR HDR", true);
+			}
+			else
+			{
+				std::cerr << "    HDR modes: sensor did not accept wide_dynamic_range=1"
+						  << std::endl;
+			}
+		}
+
+		set_subdev_hdr_ctrl(0);
+		verbose = 1;
+		return false;
+	}
+
+	// Reset log level to Info.
+	if (verbose)
+		libcamera::logSetLevel("*", "INFO");
+
+	// Set the verbosity
+	RPiCamApp::verbosity = verbose;
+
+	if (hdmi_port != -1 && hdmi_port != 0 && hdmi_port != 1)
+		throw std::runtime_error("hdmi-port must be -1, 0 or 1");
+
+	if (sscanf(preview.c_str(), "%u,%u,%u,%u", &preview_x, &preview_y, &preview_width, &preview_height) != 4)
+		preview_x = preview_y = preview_width = preview_height = 0; // use default window
+
+	transform = Transform::Identity;
+	if (hflip_)
+		transform = Transform::HFlip * transform;
+	if (vflip_)
+		transform = Transform::VFlip * transform;
+	bool ok;
+	Transform rot = transformFromRotation(rotation_, &ok);
+	if (!ok)
+		throw std::runtime_error("illegal rotation value");
+	transform = rot * transform;
+	if (!!(transform & Transform::Transpose))
+		throw std::runtime_error("transforms requiring transpose not supported");
+
+	if (sscanf(roi.c_str(), "%f,%f,%f,%f", &roi_x, &roi_y, &roi_width, &roi_height) != 4)
+		roi_x = roi_y = roi_width = roi_height = 0; // don't set digital zoom
+
+	if (sscanf(afWindow.c_str(), "%f,%f,%f,%f", &afWindow_x, &afWindow_y, &afWindow_width, &afWindow_height) != 4)
+		afWindow_x = afWindow_y = afWindow_width = afWindow_height = 0; // don't set auto focus windows
+
+	std::map<std::string, int> metering_table =
+		{ { "centre", libcamera::controls::MeteringCentreWeighted },
+			{ "spot", libcamera::controls::MeteringSpot },
+			{ "average", libcamera::controls::MeteringMatrix },
+			{ "matrix", libcamera::controls::MeteringMatrix },
+			{ "custom", libcamera::controls::MeteringCustom } };
+	if (metering_table.count(metering) == 0)
+		throw std::runtime_error("Invalid metering mode: " + metering);
+	metering_index = metering_table[metering];
+
+	std::map<std::string, int> exposure_table =
+		{ { "normal", libcamera::controls::ExposureNormal },
+			{ "sport", libcamera::controls::ExposureShort },
+			{ "short", libcamera::controls::ExposureShort },
+			{ "long", libcamera::controls::ExposureLong },
+			{ "custom", libcamera::controls::ExposureCustom } };
+	if (exposure_table.count(exposure) == 0)
+		throw std::runtime_error("Invalid exposure mode:" + exposure);
+	exposure_index = exposure_table[exposure];
+
+	std::map<std::string, int> afMode_table =
+		{ { "default", -1 },
+			{ "manual", libcamera::controls::AfModeManual },
+			{ "auto", libcamera::controls::AfModeAuto },
+			{ "continuous", libcamera::controls::AfModeContinuous } };
+	if (afMode_table.count(afMode) == 0)
+		throw std::runtime_error("Invalid AfMode:" + afMode);
+	afMode_index = afMode_table[afMode];
+
+	std::map<std::string, int> afRange_table =
+		{ { "normal", libcamera::controls::AfRangeNormal },
+			{ "macro", libcamera::controls::AfRangeMacro },
+			{ "full", libcamera::controls::AfRangeFull } };
+	if (afRange_table.count(afRange) == 0)
+		throw std::runtime_error("Invalid AfRange mode:" + exposure);
+	afRange_index = afRange_table[afRange];
+
+
+	std::map<std::string, int> afSpeed_table =
+		{ { "normal", libcamera::controls::AfSpeedNormal },
+		    { "fast", libcamera::controls::AfSpeedFast } };
+	if (afSpeed_table.count(afSpeed) == 0)
+		throw std::runtime_error("Invalid afSpeed mode:" + afSpeed);
+	afSpeed_index = afSpeed_table[afSpeed];
+
+	std::map<std::string, int> awb_table =
+		{ { "auto", libcamera::controls::AwbAuto },
+			{ "normal", libcamera::controls::AwbAuto },
+			{ "incandescent", libcamera::controls::AwbIncandescent },
+			{ "tungsten", libcamera::controls::AwbTungsten },
+			{ "fluorescent", libcamera::controls::AwbFluorescent },
+			{ "indoor", libcamera::controls::AwbIndoor },
+			{ "daylight", libcamera::controls::AwbDaylight },
+			{ "cloudy", libcamera::controls::AwbCloudy },
+			{ "custom", libcamera::controls::AwbCustom } };
+	if (awb_table.count(awb) == 0)
+		throw std::runtime_error("Invalid AWB mode: " + awb);
+	awb_index = awb_table[awb];
+
+	if (sscanf(awbgains.c_str(), "%f,%f", &awb_gain_r, &awb_gain_b) != 2)
+		throw std::runtime_error("Invalid AWB gains");
+
+	brightness = std::clamp(brightness, -1.0f, 1.0f);
+	contrast = std::clamp(contrast, 0.0f, 15.99f); // limits are arbitrary..
+	saturation = std::clamp(saturation, 0.0f, 15.99f); // limits are arbitrary..
+	sharpness = std::clamp(sharpness, 0.0f, 15.99f); // limits are arbitrary..
+
+	if (strcasecmp(metadata_format.c_str(), "json") == 0)
+		metadata_format = "json";
+	else if (strcasecmp(metadata_format.c_str(), "txt") == 0)
+		metadata_format = "txt";
+	else
+		throw std::runtime_error("unrecognised metadata format " + metadata_format);
+
+	mode = Mode(mode_string);
+	viewfinder_mode = Mode(viewfinder_mode_string);
+
+	return true;
+}
+
+void Options::Print() const
+{
+	std::cerr << "Options:" << std::endl;
+	std::cerr << "    verbose: " << verbose << std::endl;
+	if (!config_file.empty())
+		std::cerr << "    config file: " << config_file << std::endl;
+	std::cerr << "    info_text:" << info_text << std::endl;
+	std::cerr << "    timeout: " << timeout.get() << "ms" << std::endl;
+	std::cerr << "    width: " << width << std::endl;
+	std::cerr << "    height: " << height << std::endl;
+	std::cerr << "    output: " << output << std::endl;
+	std::cerr << "    post_process_file: " << post_process_file << std::endl;
+	if (nopreview)
+		std::cerr << "    preview: none" << std::endl;
+	else if (fullscreen)
+		std::cerr << "    preview: fullscreen" << std::endl;
+	else if (preview_width == 0 || preview_height == 0)
+		std::cerr << "    preview: default" << std::endl;
+	else
+		std::cerr << "    preview: " << preview_x << "," << preview_y << "," << preview_width << ","
+					<< preview_height << std::endl;
+	std::cerr << "    qt-preview: " << qt_preview << std::endl;
+	std::cerr << "    transform: " << transformToString(transform) << std::endl;
+	if (roi_width == 0 || roi_height == 0)
+		std::cerr << "    roi: all" << std::endl;
+	else
+		std::cerr << "    roi: " << roi_x << "," << roi_y << "," << roi_width << "," << roi_height << std::endl;
+	if (shutter)
+		std::cerr << "    shutter: " << shutter.get() << "us" << std::endl;
+	if (gain)
+		std::cerr << "    gain: " << gain << std::endl;
+	std::cerr << "    metering: " << metering << std::endl;
+	std::cerr << "    exposure: " << exposure << std::endl;
+	if (flicker_period)
+		std::cerr << "    flicker period: " << flicker_period.get() << "us" << std::endl;
+	std::cerr << "    ev: " << ev << std::endl;
+	std::cerr << "    awb: " << awb << std::endl;
+	if (awb_gain_r && awb_gain_b)
+		std::cerr << "    awb gains: red " << awb_gain_r << " blue " << awb_gain_b << std::endl;
+	std::cerr << "    flush: " << (flush ? "true" : "false") << std::endl;
+	std::cerr << "    wrap: " << wrap << std::endl;
+	std::cerr << "    brightness: " << brightness << std::endl;
+	std::cerr << "    contrast: " << contrast << std::endl;
+	std::cerr << "    saturation: " << saturation << std::endl;
+	std::cerr << "    sharpness: " << sharpness << std::endl;
+	std::cerr << "    framerate: " << framerate.value_or(DEFAULT_FRAMERATE) << std::endl;
+	std::cerr << "    denoise: " << denoise << std::endl;
+	std::cerr << "    viewfinder-width: " << viewfinder_width << std::endl;
+	std::cerr << "    viewfinder-height: " << viewfinder_height << std::endl;
+	std::cerr << "    tuning-file: " << (tuning_file == "-" ? "(libcamera)" : tuning_file) << std::endl;
+	std::cerr << "    max-pixel-rate: ";
+	if (max_pixel_rate > 0.0)
+		std::cerr << max_pixel_rate << " MPix/s" << std::endl;
+	else
+		std::cerr << "(libcamera default)" << std::endl;
+	std::cerr << "    lores-width: " << lores_width << std::endl;
+	std::cerr << "    lores-height: " << lores_height << std::endl;
+	if (afMode_index != -1)
+		std::cerr << "    autofocus-mode: " << afMode << std::endl;
+	if (afRange_index != -1)
+		std::cerr << "    autofocus-range: " << afRange << std::endl;
+	if (afSpeed_index != -1)
+		std::cerr << "    autofocus-speed: " << afSpeed << std::endl;
+	if (afWindow_width == 0 || afWindow_height == 0)
+		std::cerr << "    autofocus-window: all" << std::endl;
+	else
+		std::cerr << "    autofocus-window: " << afWindow_x << "," << afWindow_y << "," << afWindow_width << ","
+				  << afWindow_height << std::endl;
+	if (!lens_position_.empty())
+		std::cerr << "    lens-position: " << lens_position_ << std::endl;
+	std::cerr << "    hdr: " << hdr << std::endl;
+	std::cerr << "    mode: " << mode.ToString() << std::endl;
+	std::cerr << "    viewfinder-mode: " << viewfinder_mode.ToString() << std::endl;
+	if (buffer_count > 0)
+		std::cerr << "    buffer-count: " << buffer_count << std::endl;
+	if (viewfinder_buffer_count > 0)
+		std::cerr << "    viewfinder-buffer-count: " << viewfinder_buffer_count << std::endl;
+	std::cerr << "    metadata: " << metadata << std::endl;
+	std::cerr << "    metadata-format: " << metadata_format << std::endl;
+}
