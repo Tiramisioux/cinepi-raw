@@ -377,7 +377,7 @@ bool Options::Parse(int argc, char *argv[])
 		 * both sensor states explicitly; the initial CameraConfiguration
 		 * cannot show the ClearHDR modes.
 		 */
-		auto print_modes = [](const std::vector<std::shared_ptr<libcamera::Camera>> &cams,
+		auto print_modes = [this](const std::vector<std::shared_ptr<libcamera::Camera>> &cams,
 							 const std::string &section_label,
 							 bool only_hdr_sensors)
 		{
