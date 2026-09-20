@@ -109,6 +109,17 @@ sensor_binning_source_test = executable('sensor_binning_source_test',
            install : false)
 test('sensor_binning_source', sensor_binning_source_test)
 
+# Unit tests for the subdev-binding decision (WP-CPR-2 rework / cross-camera
+# regression finding): which candidate /dev/v4l-subdevN belongs to THIS camera
+# process when more than one exposes the Mode Binning/Mode Crop controls. No
+# libcamera deps — it includes only cinepi/subdev_binding.hpp. Run with
+# `meson test`.
+subdev_binding_test = executable('subdev_binding_test',
+           '../tests/subdev_binding_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('subdev_binding', subdev_binding_test)
+
 # Unit tests for IFDBuilder's multi-IFD chaining contract (C9 Phase 0's
 # embedded DNG thumbnail). No libcamera deps — it includes only
 # cinepi/ifd_builder.hpp. Run with `meson test`.

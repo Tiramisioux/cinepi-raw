@@ -178,8 +178,16 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			// the value is sane; a stock sensor (or a driver not yet carrying
 			// WP-585-1/WP-283-5) reports no such control, so this falls back
 			// to the ratio exactly as before — see sensor_binning_source.hpp.
+			//
+			// app.CameraId() is THIS process's own libcamera::Camera::id(),
+			// the same signal cinepi_options.cpp's portFromCameraId() reads.
+			// On a dual-sensor rig running two cinepi_raw processes it is
+			// what lets the probe bind to this process's own sensor
+			// sub-device instead of whichever one happens to sort first —
+			// see core/driver_mode_metadata.hpp and cinepi/subdev_binding.hpp.
+			// On a single-sensor rig this changes nothing.
 			DriverModeMetadata driver_meta;
-			const bool have_driver_meta = read_driver_mode_metadata(driver_meta);
+			const bool have_driver_meta = read_driver_mode_metadata(driver_meta, app.CameraId());
 			const SensorBinningDecision binning_decision = choose_sensor_binning(
 				have_driver_meta ? std::optional<int>(driver_meta.binning) : std::nullopt,
 				app.SensorBinning(cfg.size.width, cfg.size.height));

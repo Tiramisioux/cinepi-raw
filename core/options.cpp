@@ -424,8 +424,14 @@ bool Options::Parse(int argc, char *argv[])
 							? NAN
 							: (1e6 / fd_ctrl->second.min().get<int64_t>());
 
+						// cam->id() (not the `cam_id` local above, which holds the
+						// Model property) identifies THIS specific camera in the
+						// media graph — pass it so a multi-camera system's probe
+						// binds to this camera's own sub-device rather than
+						// whichever one happens to sort first. See
+						// core/driver_mode_metadata.hpp and cinepi/subdev_binding.hpp.
 						DriverModeMetadata driver_meta;
-						const bool have_driver_meta = read_driver_mode_metadata(driver_meta);
+						const bool have_driver_meta = read_driver_mode_metadata(driver_meta, cam->id());
 
 						std::ostringstream signature;
 						signature << size.width << "x" << size.height;

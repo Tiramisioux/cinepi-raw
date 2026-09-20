@@ -37,19 +37,39 @@
  * this file thin for exactly that reason, and put any decision logic that
  * CAN be tested (such as which of two candidate binning values to trust) in
  * its own pure header instead. See tests/sensor_binning_source_test.cpp.
+ *
+ * CROSS-CAMERA BINDING. On a dual-sensor rig (two cinepi_raw processes, e.g.
+ * two imx585 units per Dual HDMI preview) more than one /dev/v4l-subdevN can
+ * expose the five named controls at once, and without a camera-id hint this
+ * probe cannot tell which one belongs to THIS process. Pass the calling
+ * process's own libcamera::Camera::id() (RPiCamApp::CameraId(), the same
+ * signal cinepi_options.cpp's portFromCameraId()/detectCamPort() already
+ * uses) as `camera_id_hint` wherever it is available. The decision of which
+ * candidate to trust given that hint is pure and tested separately: see
+ * cinepi/subdev_binding.hpp and tests/subdev_binding_test.cpp. On a
+ * single-sensor rig, or when no hint is available at all (the
+ * --list-cameras probe against a not-yet-opened camera), behaviour is
+ * unchanged: there being only one candidate is what makes today's fast path
+ * safe, not the absence of a hint.
  */
 
 #ifndef CINEPI_DRIVER_MODE_METADATA_HPP
 #define CINEPI_DRIVER_MODE_METADATA_HPP
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <linux/v4l2-controls.h>
 #include <linux/videodev2.h>
 #include <string>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <utility>
+#include <vector>
+
+#include "cinepi/subdev_binding.hpp"
 
 /* The driver's answer for the currently active mode, in native sensor
  * coordinates. `valid` is false until a sub-device has been found that
@@ -158,26 +178,68 @@ inline bool find_control_by_name(int fd, const char *name, __u32 hint_id, __u32 
 	return false;
 }
 
+/* The kernel-registered name of /dev/v4l-subdevN, e.g. "imx585 6-001a", read
+ * from sysfs rather than an ioctl (no fd needed, works even if the caller's
+ * open of the device node itself is about to be closed). This is the same
+ * string libcamera exposes as Camera::id() for these i2c-registered sensor
+ * drivers (v4l2_i2c_subdev_init sets both from the i2c_client name), which
+ * is what makes it usable as a binding hint — see the file comment. Returns
+ * empty on any failure; an empty name never matches a non-empty hint. */
+inline std::string subdev_sysfs_name(int index)
+{
+	std::string path = "/sys/class/video4linux/v4l-subdev" + std::to_string(index) + "/name";
+	std::ifstream f(path);
+	if (!f.good())
+		return {};
+	std::string name;
+	std::getline(f, name);
+	while (!name.empty() && (name.back() == '\n' || name.back() == '\r'))
+		name.pop_back();
+	return name;
+}
+
 } // namespace driver_mode_metadata_detail
 
 /*
  * Probe /dev/v4l-subdev0..31 for the five geometry controls, by name, and
- * fill `m` from whichever sub-device has all five with sane values.
+ * fill `m` from the sub-device that belongs to THIS camera process.
  *
  * Query the controls themselves before accepting a subdev, rather than
  * assuming subdev 0: on a Pi 5 with multiple sensor sub-devices,
  * /dev/v4l-subdevN is not a stable sensor identity, and the first subdev is
  * not necessarily the sensor this app is talking to.
  *
+ * `camera_id_hint`, when non-empty, is expected to be this process's own
+ * libcamera::Camera::id() (RPiCamApp::CameraId()). It disambiguates between
+ * MULTIPLE sub-devices that all expose the controls (a dual-sensor rig): see
+ * the file comment and cinepi/subdev_binding.hpp. On a rig with only one
+ * such sub-device the hint changes nothing — that candidate is used either
+ * way, exactly as before this parameter existed.
+ *
  * A sane binning is 1 or 2 (imx585_program_window and its imx283 equivalent
  * only ever program 1x1 or 2x2). Anything else — 0 (never updated), a
  * negative stray, or something larger — is treated as "no metadata" so a
  * caller falls back to its own derivation rather than trusting a bogus
  * value.
+ *
+ * When more than one sub-device qualifies and the hint does not pick out
+ * exactly one of them (no hint given, or it matches zero or more than one),
+ * this returns false rather than guessing: a wrong guess here silently
+ * cross-applies one camera's geometry to another's stream, which is worse
+ * than the caller's own fallback. One line is logged to stderr so the
+ * situation is visible instead of a silent "no metadata".
  */
-inline bool read_driver_mode_metadata(DriverModeMetadata &m)
+inline bool read_driver_mode_metadata(DriverModeMetadata &m, const std::string &camera_id_hint = std::string())
 {
 	using namespace driver_mode_metadata_detail;
+
+	struct Candidate
+	{
+		int index;
+		DriverModeMetadata meta;
+	};
+	std::vector<Candidate> candidates;
+	std::vector<std::pair<int, std::string>> candidate_names;
 
 	for (int i = 0; i < 32; ++i)
 	{
@@ -214,15 +276,53 @@ inline bool read_driver_mode_metadata(DriverModeMetadata &m)
 			left < 0 || top < 0 || width <= 0 || height <= 0)
 			continue;
 
-		m.binning = binning;
-		m.crop_left = left;
-		m.crop_top = top;
-		m.crop_width = width;
-		m.crop_height = height;
-		m.valid = true;
-		return true;
+		DriverModeMetadata candidate_meta;
+		candidate_meta.binning = binning;
+		candidate_meta.crop_left = left;
+		candidate_meta.crop_top = top;
+		candidate_meta.crop_width = width;
+		candidate_meta.crop_height = height;
+		candidate_meta.valid = true;
+
+		candidates.push_back({ i, candidate_meta });
+		candidate_names.push_back({ i, subdev_sysfs_name(i) });
+
+		// Keep walking the whole range rather than stopping at the first (or
+		// second) match: the hint might identify a LATER candidate as this
+		// process's own camera, and reporting an accurate total candidate
+		// count is what makes the single-vs-ambiguous decision below
+		// correct. The spec's own item 2 already accepts this as a
+		// per-reconfigure cost, not a per-frame one.
 	}
 
+	const SubdevBindingDecision decision = choose_subdev_candidate(candidate_names, camera_id_hint);
+
+	if (decision.result == SubdevBindingResult::kAmbiguous)
+	{
+		std::fprintf(stderr,
+					 "cinepi-raw: %zu sensor sub-devices expose Mode Binning/Mode Crop "
+					 "controls and the camera id%s did not identify exactly one; "
+					 "ignoring driver mode metadata for this camera (falling back to "
+					 "the ratio-derived binning) rather than risking a cross-camera "
+					 "mismatch.\n",
+					 candidate_names.size(), camera_id_hint.empty() ? " hint was empty" : " matched none/more than one");
+		return false;
+	}
+
+	if (decision.result == SubdevBindingResult::kNoneFound)
+		return false;
+
+	for (const auto &c : candidates)
+	{
+		if (c.index == decision.index)
+		{
+			m = c.meta;
+			return true;
+		}
+	}
+
+	// Unreachable: choose_subdev_candidate() only ever returns an index that
+	// was present in candidate_names, which is built 1:1 with `candidates`.
 	return false;
 }
 
