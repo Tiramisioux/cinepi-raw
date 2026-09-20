@@ -45,8 +45,14 @@ cinepi_raw_dep = [tiff_dep, hiredis_lib, redis_plus_plus_lib, boost_dep, thread_
 
 alsa_dep = dependency('alsa')
 udev_dep = dependency('libudev')
-mhd_dep = dependency('nadjieb_mjpeg_streamer', required : true)
-cinepi_raw_dep += mhd_dep
+# nadjieb's cpp-mjpeg-streamer used to be an external dependency, built by
+# the installer's build_cpp_mjpeg_streamer step and found here as
+# dependency('nadjieb_mjpeg_streamer'). It is now vendored (and patched) at
+# cinepi/third_party/nadjieb/mjpeg_streamer.hpp -- see that file's own
+# "Vendored into cinepi-raw" header comment for the upstream commit and the
+# patch -- so no pkg-config dependency remains; mjpegPreviewStage.cpp finds
+# it via the include directory added below. thread_dep (already in
+# cinepi_raw_dep) covers the header's std::thread usage.
 cinepi_raw_dep += alsa_dep
 cinepi_raw_dep += udev_dep
 # The DNG thumbnail's JPEG mode (dng_encoder.cpp, thumbnail=3): jpeg_dep is
@@ -58,7 +64,7 @@ cinepi_raw_dep += udev_dep
 cinepi_raw_dep += jpeg_dep
 
 cinepi_raw = executable('cinepi-raw', sources,
-             include_directories : [include_directories('..')],
+             include_directories : [include_directories('..'), include_directories('third_party')],
              dependencies: cinepi_raw_dep,
              link_with : rpicam_app,
              install : true)
@@ -184,3 +190,14 @@ clip_ceiling_test = executable('clip_ceiling_test',
            cpp_args : ['-DCLIP_CEILING_DATA_DIR="' + meson.current_source_dir() / '../tests/data' + '"'],
            install : false)
 test('clip_ceiling', clip_ceiling_test)
+
+# Unit tests for the static-response branch patched into the vendored MJPEG
+# streamer (cinepi/third_party/nadjieb/mjpeg_streamer.hpp) -- the clean
+# preview's black index page at "/". No libcamera / Redis deps and no
+# sockets opened; it includes only the vendored header. Run with
+# `meson test`.
+mjpeg_static_response_test = executable('mjpeg_static_response_test',
+           '../tests/mjpeg_static_response_test.cpp',
+           include_directories : [include_directories('..'), include_directories('third_party')],
+           install : false)
+test('mjpeg_static_response', mjpeg_static_response_test)
