@@ -25,130 +25,15 @@
 
 static int xioctl(int fd, unsigned long ctl, void *arg);
 
-/* Optional sensor-driver mode metadata. The IMX585 driver exposes these
- * as read-only V4L2 controls so applications can consume the driver's
- * actual binning and native sensor crop instead of inferring them. */
-#ifndef V4L2_CID_USER_IMX585_BASE
-#define V4L2_CID_USER_IMX585_BASE (V4L2_CID_USER_BASE + 0x2000)
-#endif
-#define V4L2_CID_IMX585_BINNING     (V4L2_CID_USER_IMX585_BASE + 10)
-#define V4L2_CID_IMX585_CROP_LEFT   (V4L2_CID_USER_IMX585_BASE + 11)
-#define V4L2_CID_IMX585_CROP_TOP    (V4L2_CID_USER_IMX585_BASE + 12)
-#define V4L2_CID_IMX585_CROP_WIDTH  (V4L2_CID_USER_IMX585_BASE + 13)
-#define V4L2_CID_IMX585_CROP_HEIGHT (V4L2_CID_USER_IMX585_BASE + 14)
-
-struct DriverModeMetadata
-{
-	int binning = 0;
-	int crop_left = 0;
-	int crop_top = 0;
-	int crop_width = 0;
-	int crop_height = 0;
-	bool valid = false;
-};
-
-static bool read_v4l2_control(int fd, __u32 id, int &value)
-{
-	v4l2_ext_control ctrl {};
-	ctrl.id = id;
-
-	v4l2_ext_controls ctrls {};
-	ctrls.ctrl_class = V4L2_CTRL_ID2CLASS(id);
-	ctrls.count = 1;
-	ctrls.controls = &ctrl;
-
-	if (xioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) == 0)
-	{
-		value = ctrl.value;
-		return true;
-	}
-
-	// Keep compatibility with drivers exposing the custom controls through the
-	// legacy user-control ioctl path.
-	v4l2_control legacy { id, 0 };
-	if (xioctl(fd, VIDIOC_G_CTRL, &legacy) == 0)
-	{
-		value = legacy.value;
-		return true;
-	}
-
-	return false;
-}
-
-static bool query_v4l2_control(int fd, __u32 id, const char *expected_name)
-{
-	v4l2_queryctrl query {};
-	query.id = id;
-	if (xioctl(fd, VIDIOC_QUERYCTRL, &query) != 0)
-		return false;
-
-	if (query.flags & V4L2_CTRL_FLAG_DISABLED)
-		return false;
-
-	return expected_name == nullptr ||
-		strncmp(reinterpret_cast<const char *>(query.name), expected_name,
-				sizeof(query.name)) == 0;
-}
-
-static bool read_driver_mode_metadata(DriverModeMetadata &m)
-{
-	/*
-	 * The IMX585 mode metadata is attached to the sensor sub-device, not to
-	 * the libcamera Camera controls. Do not infer it from the stream size:
-	 *
-	 *   RAW16 3840x2200 -> active 3840x2160
-	 *   RAW16 1920x1100 -> active 1920x1080
-	 *
-	 * The driver updates these controls when the active sensor mode changes.
-	 *
-	 * Query the control itself before accepting a subdev. This is important
-	 * on Pi 5 systems with multiple sensor sub-devices: /dev/v4l-subdevN is
-	 * not a stable sensor identity and the first subdev is not necessarily
-	 * the IMX585.
-	 */
-	for (int i = 0; i < 32; ++i)
-	{
-		std::string dev = "/dev/v4l-subdev" + std::to_string(i);
-		int fd = open(dev.c_str(), O_RDWR);
-		if (fd < 0)
-			continue;
-
-		if (!query_v4l2_control(fd, V4L2_CID_IMX585_BINNING, "Mode Binning"))
-		{
-			close(fd);
-			continue;
-		}
-
-		int binning = 0;
-		int left = 0;
-		int top = 0;
-		int width = 0;
-		int height = 0;
-
-		const bool ok =
-			read_v4l2_control(fd, V4L2_CID_IMX585_BINNING, binning) &&
-			read_v4l2_control(fd, V4L2_CID_IMX585_CROP_LEFT, left) &&
-			read_v4l2_control(fd, V4L2_CID_IMX585_CROP_TOP, top) &&
-			read_v4l2_control(fd, V4L2_CID_IMX585_CROP_WIDTH, width) &&
-			read_v4l2_control(fd, V4L2_CID_IMX585_CROP_HEIGHT, height);
-
-		close(fd);
-
-		if (!ok || binning < 1 || binning > 2 ||
-			left < 0 || top < 0 || width <= 0 || height <= 0)
-			continue;
-
-		m.binning = binning;
-		m.crop_left = left;
-		m.crop_top = top;
-		m.crop_width = width;
-		m.crop_height = height;
-		m.valid = true;
-		return true;
-	}
-
-	return false;
-}
+/* Sensor-driver mode metadata (DriverModeMetadata, read_driver_mode_metadata)
+ * moved to core/driver_mode_metadata.hpp — WP-CPR-2 (finding C2). This makes
+ * it a SHARED probe: cinepi_raw.cpp's live binning decision needs the exact
+ * same answer this --list-cameras path already computed, and the two must
+ * not be free to disagree. It also switches from the imx585's own control
+ * ids to finding the five controls BY NAME (the stack's actual contract per
+ * WP-283-5), with the ids kept only as a fast-path hint, so the imx283 (or
+ * any future driver) participates without a model-specific branch here. */
+#include "core/driver_mode_metadata.hpp"
 
 static const std::map<int, std::string> cfa_map =
 {
