@@ -50,6 +50,15 @@ private:
     int port_;
     bool running_ = true;
 
+    // Client-count visibility for the worker-exhaustion fix (see the
+    // vendored streamer header's own patch comment): logged periodically
+    // rather than every frame, matching the style rule to keep a hot-path
+    // log at debug and infrequent. A count that only grows across many
+    // preview open/close cycles is the signature a leak would leave; this
+    // makes that visible without needing to be on the rig with `ss`.
+    uint64_t frame_count_ = 0;
+    static constexpr uint64_t kClientCountLogEveryNFrames = 150;
+
     std::unique_ptr<MJPEGStreamer> streamer_;
 
     void compressToJPEG(libcamera::Span<uint8_t> &inputBuffer, std::vector<uint8_t> &outputBuffer);
@@ -308,6 +317,12 @@ bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
     std::string const payload(jpegBuffer.begin(), jpegBuffer.end());
     streamer_->publish(STREAM_PATH, payload);
     auto endPublish = std::chrono::high_resolution_clock::now();
+
+    // See kClientCountLogEveryNFrames' comment: cheap visibility into
+    // whether the registered client count is growing without bound.
+    if (++frame_count_ % kClientCountLogEveryNFrames == 0) {
+        console->debug("NetworkPreview {} clients registered on {}", streamer_->clientCount(STREAM_PATH), STREAM_PATH);
+    }
 
     // Logging the durations
     console->trace("Duration of WriteSync: {} microseconds.", std::chrono::duration_cast<std::chrono::microseconds>(endWriteSync - startWriteSync).count());

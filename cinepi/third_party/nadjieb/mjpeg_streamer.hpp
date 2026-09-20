@@ -56,6 +56,36 @@ SOFTWARE.
 //     the connection -- the same shape as the existing 405/404 branches, so a
 //     static page can be served without ever touching the multipart
 //     publisher path.
+//
+// Second local patch (2026-09-20, fix/mjpeg-worker-exhaustion), closing two
+// gaps that let an accepted client's socket live forever without ever being
+// reaped -- see this branch's PR description for the full reasoning and for
+// which part is proven versus inferred:
+//   - net: added `shutdownSocket()` next to the existing `closeSocket()`.
+//   - Publisher::worker(): `sendViaSocket()`'s return value used to be
+//     discarded outright, so a client whose connection had gone bad in a way
+//     that never produces a read-side signal on its own socket (the peer
+//     stops draining the multipart response without sending FIN/RST -- nothing
+//     here can prove that is what a real browser does, but it is the one
+//     failure mode this codebase had literally no code path for) was
+//     retained as a "client" forever: every future publish() kept trying to
+//     send to it. A hard send failure (anything but EWOULDBLOCK/EAGAIN) now
+//     shutdown()s that socket, which turns it into an ordinary detectable
+//     close on the Listener's own thread instead of a silent no-op. The same
+//     fix also replaces a `revents != POLLWRNORM` `throw` that would call
+//     std::terminate() and crash the whole cinepi-raw process the first time
+//     a client's socket reports POLLHUP/POLLERR while a worker is mid-poll on
+//     it -- a live crash risk found while reading this function, not the
+//     symptom this branch was opened for.
+//   - Listener: an accepted socket that never sends a single byte (a
+//     speculative/preconnect connection, or a half-open one) used to sit in
+//     fds_ with no deadline at all. A new `pending_since_` map (Listener's
+//     own thread only, no locking needed) records each socket's accept time,
+//     clears it the moment any byte is read from that socket, and every loop
+//     iteration (already running at the existing 100 ms poll cadence) closes
+//     any socket still pending past `PENDING_ACCEPT_TIMEOUT_MS`. A registered
+//     streaming client (one that has sent at least its initial GET) is never
+//     in this map and so is never touched by it.
 // Everything else in this file is unmodified upstream 3.0.0.
 // ---------------------------------------------------------------------------
 
@@ -275,6 +305,21 @@ static void closeSocket(SocketFD sockfd) {
 #endif
 }
 
+// Local patch (fix/mjpeg-worker-exhaustion): half-close a socket from any
+// thread without touching fd bookkeeping. Unlike closeSocket(), this does not
+// free the fd number, so it is safe to call from a thread that does not own
+// Listener::fds_ (i.e. a Publisher worker) -- it just makes the fd's next
+// poll()/recv() on the Listener's own thread report the close, so the
+// existing on_before_close_cb_ / closeSocket() / fds_ removal path (which
+// only ever runs on the Listener's own thread) reaps it normally.
+static void shutdownSocket(SocketFD sockfd) {
+#ifdef NADJIEB_MJPEG_STREAMER_PLATFORM_WINDOWS
+    ::shutdown(sockfd, SD_BOTH);
+#else
+    ::shutdown(sockfd, SHUT_RDWR);
+#endif
+}
+
 static void panicIfUnexpected(
     bool condition,
     const std::string& message,
@@ -409,10 +454,12 @@ class Runnable {
 }  // namespace nadjieb
 
 
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace nadjieb {
@@ -470,6 +517,15 @@ class Listener : public nadjieb::utils::NonCopyable, public nadjieb::utils::Runn
         state_ = nadjieb::utils::State::RUNNING;
 
         while (!end_listener_) {
+            // Local patch: runs at the existing 100 ms poll cadence, on this
+            // same thread -- no locking needed. Reaps any accepted socket
+            // that has gone this long without sending a single byte (a
+            // speculative/preconnect connection, or one abandoned before its
+            // request completed). A registered streaming client is never in
+            // pending_since_ (see the accept site and the read-branch below),
+            // so this never touches an established stream.
+            reapStalePending();
+
             int socket_count = pollSockets(&fds_[0], fds_.size(), 100);
 
             panicIfUnexpected(socket_count == NADJIEB_MJPEG_STREAMER_SOCKET_ERROR, "pollSockets() failed");
@@ -488,6 +544,7 @@ class Listener : public nadjieb::utils::NonCopyable, public nadjieb::utils::Runn
                 if (fds_[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
                     on_before_close_cb_(fds_[i].fd);
                     closeSocket(fds_[i].fd);
+                    pending_since_.erase(fds_[i].fd);
                     fds_[i].fd = NADJIEB_MJPEG_STREAMER_INVALID_SOCKET;
                     compress_array = true;
                     continue;
@@ -507,8 +564,17 @@ class Listener : public nadjieb::utils::NonCopyable, public nadjieb::utils::Runn
                         setSocketNonblock(new_socket);
 
                         fds_.emplace_back(NADJIEB_MJPEG_STREAMER_POLLFD{new_socket, POLLRDNORM, 0});
+                        // Local patch: start this socket's accept-to-first-byte
+                        // clock; see reapStalePending().
+                        pending_since_.emplace(new_socket, std::chrono::steady_clock::now());
                     } while (true);
                 } else {
+                    // Local patch: whatever happens next on this fd (a real
+                    // request, a clean close with no bytes at all, or a
+                    // read error), it is no longer merely "accepted and
+                    // silent" -- take it out of the pending-timeout set.
+                    pending_since_.erase(fds_[i].fd);
+
                     std::string data;
                     bool close_conn = false;
 
@@ -544,6 +610,7 @@ class Listener : public nadjieb::utils::NonCopyable, public nadjieb::utils::Runn
                     if (close_conn) {
                         on_before_close_cb_(fds_[i].fd);
                         closeSocket(fds_[i].fd);
+                        pending_since_.erase(fds_[i].fd);
                         fds_[i].fd = NADJIEB_MJPEG_STREAMER_INVALID_SOCKET;
                         compress_array = true;
                     }
@@ -565,6 +632,69 @@ class Listener : public nadjieb::utils::NonCopyable, public nadjieb::utils::Runn
     OnMessageCallback on_message_cb_;
     OnBeforeCloseCallback on_before_close_cb_;
     std::thread thread_listener_;
+
+    // Local patch (fix/mjpeg-worker-exhaustion): accept time of every fd in
+    // fds_ that has not yet sent a byte. Read and written only on this
+    // thread (thread_listener_), so no lock. An fd is removed the moment it
+    // sends anything (see the read branch above) or is closed by any path
+    // (see each close site above and in reapStalePending() below) -- an fd
+    // number that gets reused by a later accept() therefore never finds a
+    // stale entry here.
+    std::unordered_map<SocketFD, std::chrono::steady_clock::time_point> pending_since_;
+
+    // 5000 ms: longer than the 4000 ms reconnect cadence both the cinemate
+    // web GUI's armStreamWatchdog/scheduleStreamReload and this repo's own
+    // INDEX_PAGE watchdog use (see mjpegPreviewStage.cpp), so one stale
+    // pending socket from a given reconnect cycle is reclaimed before that
+    // cycle's next attempt could add another; short enough that a genuine
+    // speculative/preconnect socket a browser opens and abandons does not
+    // sit around for long. This number is a judgement call, not a measured
+    // one -- nothing about the accept-to-first-byte gap was reproduced on
+    // the Pi or off it, only read from this file.
+    const static long PENDING_ACCEPT_TIMEOUT_MS = 5000;
+
+    // Local patch: close every fd in pending_since_ whose clock has run out.
+    // Iterates fds_ directly rather than pending_since_ so the existing
+    // index-based close/compress bookkeeping (compress_array, fds_[i].fd)
+    // stays exactly as it is everywhere else in run().
+    void reapStalePending() {
+        if (pending_since_.empty()) {
+            return;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        bool compress_array = false;
+
+        for (size_t i = 0; i < fds_.size(); ++i) {
+            if (fds_[i].fd == NADJIEB_MJPEG_STREAMER_INVALID_SOCKET || fds_[i].fd == listen_sd_) {
+                continue;
+            }
+
+            auto it = pending_since_.find(fds_[i].fd);
+            if (it == pending_since_.end()) {
+                continue;
+            }
+
+            auto age_ms
+                = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
+            if (age_ms < PENDING_ACCEPT_TIMEOUT_MS) {
+                continue;
+            }
+
+            std::cerr << "nadjieb: closing a connection that sent no bytes within "
+                      << PENDING_ACCEPT_TIMEOUT_MS << "ms of being accepted" << std::endl;
+
+            on_before_close_cb_(fds_[i].fd);
+            closeSocket(fds_[i].fd);
+            pending_since_.erase(it);
+            fds_[i].fd = NADJIEB_MJPEG_STREAMER_INVALID_SOCKET;
+            compress_array = true;
+        }
+
+        if (compress_array) {
+            compress();
+        }
+    }
 
     void compress() {
         for (auto it = fds_.begin(); it != fds_.end();) {
@@ -649,6 +779,13 @@ class Topic {
     bool hasClient() {
         std::shared_lock lock(client_by_sockfd_mtx_);
         return !client_by_sockfd_.empty();
+    }
+
+    // Local patch (fix/mjpeg-worker-exhaustion): a count without copying the
+    // client list, for periodic logging -- see MJPEGStreamer::clientCount().
+    size_t clientCount() {
+        std::shared_lock lock(client_by_sockfd_mtx_);
+        return client_by_sockfd_.size();
     }
 
     std::vector<NADJIEB_MJPEG_STREAMER_POLLFD> getClients() {
@@ -787,6 +924,18 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
 
     bool hasClient(const std::string& path) { return topics_[path].hasClient(); }
 
+    // Local patch (fix/mjpeg-worker-exhaustion): read-only, so unlike the
+    // rest of this class's topics_ accesses it uses find() rather than
+    // operator[] to avoid inserting an empty Topic for an unknown path. This
+    // shares the same not-fully-synchronized access to topics_ (no lock
+    // around the map itself, only inside each Topic) as every other method
+    // here -- an existing property of this file, not something this patch
+    // changes. See MJPEGStreamer::clientCount().
+    size_t clientCount(const std::string& path) {
+        auto it = topics_.find(path);
+        return it == topics_.end() ? 0 : it->second.clientCount();
+    }
+
    private:
     typedef std::pair<std::string, NADJIEB_MJPEG_STREAMER_POLLFD> Payload;
 
@@ -837,11 +986,41 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
                 continue;
             }
 
+            // Local patch (fix/mjpeg-worker-exhaustion): this used to
+            // `throw` whenever revents was anything but exactly POLLWRNORM,
+            // which meant a client whose socket reported POLLHUP/POLLERR
+            // here -- the peer having gone away between the last successful
+            // send and this one -- crashed the whole process: an uncaught
+            // exception escaping a std::thread's entry function calls
+            // std::terminate(). Treat "the peer is gone" as exactly that,
+            // not as a logic error: shutdown() the socket (this thread does
+            // not own Listener::fds_, so it must not close()/erase it
+            // itself -- see shutdownSocket()'s own comment) so the Listener
+            // reaps it on its own thread, and drop this one frame for it.
             if (payload.second.revents != POLLWRNORM) {
-                throw std::runtime_error("revents != POLLWRNORM\n");
+                std::cerr << "nadjieb: client fd=" << payload.second.fd
+                          << " reported revents=" << payload.second.revents
+                          << " instead of POLLWRNORM; treating as gone" << std::endl;
+                shutdownSocket(payload.second.fd);
+                continue;
             }
 
-            sendViaSocket(payload.second.fd, res_str.c_str(), res_str.size(), 0);
+            // Local patch: sendViaSocket()'s return value used to be
+            // discarded outright. A hard failure here (anything other than
+            // EWOULDBLOCK/EAGAIN -- e.g. EPIPE once the peer's side is fully
+            // gone, ECONNRESET, ENOTCONN) means this client is dead in a way
+            // that produced no signal on ITS read side either, which is
+            // exactly the case nothing in this file used to detect at all.
+            // shutdown() it for the same reason as the POLLHUP/POLLERR case
+            // above: this thread does not own fds_, the Listener does.
+            auto sent = sendViaSocket(payload.second.fd, res_str.c_str(), res_str.size(), 0);
+            if (sent == NADJIEB_MJPEG_STREAMER_SOCKET_ERROR
+                && NADJIEB_MJPEG_STREAMER_ERRNO != NADJIEB_MJPEG_STREAMER_EWOULDBLOCK) {
+                std::cerr << "nadjieb: send() to client fd=" << payload.second.fd
+                          << " failed (errno " << NADJIEB_MJPEG_STREAMER_ERRNO
+                          << "); shutting it down" << std::endl;
+                shutdownSocket(payload.second.fd);
+            }
         }
     }
 };
@@ -893,6 +1072,12 @@ class MJPEGStreamer : public nadjieb::utils::NonCopyable {
     bool isRunning() { return (publisher_.isRunning() && listener_.isRunning()); }
 
     bool hasClient(const std::string& path) { return publisher_.hasClient(path); }
+
+    // Local patch (fix/mjpeg-worker-exhaustion): lets the caller log the
+    // registered-client count periodically, so a client count that only
+    // grows is visible in the service's own log instead of the process
+    // looking healthy while serving nobody. See mjpegPreviewStage.cpp.
+    size_t clientCount(const std::string& path) { return publisher_.clientCount(path); }
 
    private:
     nadjieb::net::Listener listener_;
