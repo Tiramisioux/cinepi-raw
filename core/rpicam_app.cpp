@@ -7,6 +7,8 @@
 
 #include "preview/preview.hpp"
 
+#include "cinepi/lores_fit.hpp"
+
 #include "core/frame_info.hpp"
 #include "core/rpicam_app.hpp"
 #include "core/options.hpp"
@@ -657,11 +659,17 @@ void RPiCamApp::ConfigureVideo(unsigned int flags, uint8_t thumbnailFactor)
 
 	if (alias_lores_to_video)
 	{
-		Size lores_size(options_->lores_width, options_->lores_height);
-		lores_size.alignDownTo(2, 2);
-		if (lores_size.width > configuration_->at(1).size.width ||
-			lores_size.height > configuration_->at(1).size.height)
-			throw std::runtime_error("Low res image larger than raw image");
+		/* Fit the request inside the raw stream instead of refusing it --
+		 * see cinepi/lores_fit.hpp (WP-CPR-1 / finding C1). This throws only
+		 * for the one case that remains genuinely impossible: a zero-sized
+		 * raw stream. */
+		LoresFit fit = fit_lores_to_raw(options_->lores_width, options_->lores_height,
+										 configuration_->at(1).size.width, configuration_->at(1).size.height);
+		Size lores_size(fit.width, fit.height);
+		if (fit.clamped)
+			LOG(1, "Requested lores " << options_->lores_width << "x" << options_->lores_height
+									   << " does not fit raw stream " << configuration_->at(1).size.toString()
+									   << "; using " << lores_size.toString() << " instead");
 		configuration_->at(0).size = lores_size;
 		LOG(2, "Using stream(0) video as CinePi lores stream: " << lores_size.toString());
 	}
