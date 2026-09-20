@@ -1598,8 +1598,7 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
      * more than this frame actually holds — see ifd_builder.hpp for why
      * each of those refuses rather than guesses. */
     const DngCropRect crop_rect = computeDngCropRect(info.width, info.height,
-                                                      active_picture_width_, active_picture_height_,
-                                                      active_picture_is_sensor_window_crop_);
+                                                      active_picture_width_, active_picture_height_);
     if (crop_rect.present)
     {
         uint32_t cropOrigin[2] = { crop_rect.origin_x, crop_rect.origin_y };

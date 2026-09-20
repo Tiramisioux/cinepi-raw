@@ -209,20 +209,24 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			// here either — same std::nullopt behaviour as before this
 			// package, so no crop tags are written.
 			//
-			// WP-CPR-3 rework (finding C4-followup): also pass whether the
-			// driver reports a non-zero crop_left/crop_top -- i.e. a
-			// windowed sensor readout (WP-585-1), not the full field.
-			// ifd_builder.hpp's computeDngCropRect() uses this only as a
-			// refuse-or-not gate, never as an origin: crop_left/crop_top
-			// are native-SENSOR coordinates for FOV/zoom bookkeeping, not
-			// the active picture's position inside THIS frame's own
-			// delivered buffer, and using them as that origin would be
-			// wrong (see ifd_builder.hpp's file comment).
+			// WP-CPR-3 review round 3 (finding C4-followup-2): a prior
+			// rework also passed whether the driver reports a non-zero
+			// crop_left/crop_top (a windowed sensor readout, WP-585-1)
+			// so computeDngCropRect() could refuse the crop tags for
+			// every windowed mode. That refusal overshot the finding it
+			// was meant to fix -- crop_left/crop_top are native-SENSOR
+			// coordinates for FOV/zoom bookkeeping and were never usable
+			// as the DNG origin (that part stands, see ifd_builder.hpp's
+			// file comment), but the RAW16 OB padding this crop
+			// rectangle describes is a uniform, vertical-only,
+			// buffer-internal convention (ASPECT-RATIOS.md) independent
+			// of where the readout window sits on the sensor, so the
+			// windowed case does not need refusing. crop_left/crop_top
+			// are no longer passed here at all.
 			if (have_driver_meta)
 				app.GetEncoder()->setActivePictureSize(
 					static_cast<unsigned int>(driver_meta.crop_width / driver_meta.binning),
-					static_cast<unsigned int>(driver_meta.crop_height / driver_meta.binning),
-					driver_meta.crop_left != 0 || driver_meta.crop_top != 0);
+					static_cast<unsigned int>(driver_meta.crop_height / driver_meta.binning));
 			else
 				app.GetEncoder()->setActivePictureSize(std::nullopt, std::nullopt);
 			// Tell the encoder whether the two snapshots above can be

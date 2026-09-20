@@ -29,7 +29,8 @@
  * written at all.
  *
  * WHY CENTRING, AND NOT THE DRIVER'S crop_left/crop_top (rework note,
- * WP-CPR-3 review round 2, finding C4-followup):
+ * WP-CPR-3 review round 2, finding C4-followup; narrowed in round 3,
+ * finding C4-followup-2 -- see below):
  *
  * DriverModeMetadata.crop_left/crop_top (core/driver_mode_metadata.hpp)
  * look like the obvious "real" origin to thread through here instead of
@@ -52,37 +53,34 @@
  * regression against the tested, Pi-gated behaviour (test_padded_raw16_
  * crop_tags below expects 20). The two origins are unrelated: crop_left/
  * crop_top locate the readout window ON THE SENSOR; DefaultCropOrigin
- * locates the active picture WITHIN THIS FRAME'S OWN DELIVERED BUFFER,
- * whose optical-black padding (ASPECT-RATIOS.md: "RAW16 ClearHDR adds the
- * sensor's optical-black rows... split evenly") is a vertical-only
- * property of the RAW16 packing, independent of where that window sits on
- * the sensor.
+ * locates the active picture WITHIN THIS FRAME'S OWN DELIVERED BUFFER.
  *
- * What IS safe to take from crop_left/crop_top -- and what this function
- * now does -- is use them as a GATE, not a value: the transport-vs-active
- * centring formula below is verified only for a full-field mode
- * (crop_left == crop_top == 0). A genuine windowed readout's buffer-local
- * padding geometry is not established by this campaign -- WP-283-7
- * (WORK-PACKAGES.md) independently records that a centred SENSOR crop can
- * still land on an odd, non-obviously-symmetric origin once register
- * base offsets are involved, which is exactly the kind of case that would
- * make blind centring wrong here too. So `sensor_window_crop == true`
- * (the caller's crop_left/crop_top were non-zero) makes this function
- * refuse outright, same as an oversized crop below, rather than guess.
- * This must be revisited -- with real per-mode geometry, not a formula --
- * before a Pi gate (G7 or later) exercises a windowed/cropped RAW16 mode
- * (the imx585 experimental crop family, or imx283 via WP-283-5) and
- * expects crop tags on it; until then such a mode simply gets no crop
- * tags, exactly like a stock sensor with no metadata at all.
+ * round 2's rework stopped there and drew the wrong conclusion: it made
+ * crop_left/crop_top != 0 (a WINDOWED readout) refuse the crop tags
+ * outright, on the theory that a windowed mode's buffer-local padding
+ * geometry was unestablished. It is established, and round 3 removes the
+ * refusal: per ASPECT-RATIOS.md, the RAW16 OB-padding convention -- the
+ * delivered buffer is `active + 40` rows, split 20/20 top and bottom --
+ * is VERTICAL-ONLY and applies IDENTICALLY to every ratio row in every
+ * table, windowed or not (imx585 1x1 table: "RAW16 advertised" is
+ * `active + 40`; the 2x2-binned WINDOWED table: exactly the same
+ * `output + 40` column, entry for entry). The padding is a property of
+ * how RAW16 packs a frame into its own buffer, not of where that frame's
+ * readout window sits on the physical sensor array -- so the
+ * transport-vs-active centring formula below, which only ever reasons
+ * about this frame's OWN buffer, is exactly as valid for a windowed mode
+ * as for the full-field one. crop_left/crop_top remain unusable as the
+ * DNG origin itself (that diagnosis stands) -- they are simply not
+ * consulted here at all any more, for either purpose.
  *
- * The active picture IS assumed CENTRED in the delivered buffer for the
- * full-field case this guards for: true for every full-field padded mode
- * in this campaign (imx585.c's own mode table crops the OB rows evenly,
- * see WP-585-* and ASPECT-RATIOS.md), and the only geometry the
- * transport-vs-active SIZE difference alone can imply without a separate
- * per-axis offset from the driver. No pixel data is ever touched by this
- * -- only which sub-rectangle of the buffer already written is the real
- * picture.
+ * The active picture IS assumed CENTRED in the delivered buffer: true for
+ * every padded mode in this campaign, windowed or full-field alike
+ * (imx585.c's own mode table crops the OB rows evenly regardless of
+ * window position, see WP-585-* and ASPECT-RATIOS.md), and the only
+ * geometry the transport-vs-active SIZE difference alone can imply
+ * without a separate per-axis offset from the driver. No pixel data is
+ * ever touched by this -- only which sub-rectangle of the buffer already
+ * written is the real picture.
  *
  * `active_width`/`active_height` are std::nullopt for a stock sensor
  * (every one of them today: none expose the five named geometry
@@ -109,8 +107,7 @@ struct DngCropRect
 
 inline DngCropRect computeDngCropRect(uint32_t transport_width, uint32_t transport_height,
                                        std::optional<uint32_t> active_width,
-                                       std::optional<uint32_t> active_height,
-                                       bool sensor_window_crop = false)
+                                       std::optional<uint32_t> active_height)
 {
     DngCropRect r;
 
@@ -122,11 +119,6 @@ inline DngCropRect computeDngCropRect(uint32_t transport_width, uint32_t transpo
 
     if (*active_width == transport_width && *active_height == transport_height)
         return r;   /* no padding: crop == full frame, same bytes as today */
-
-    if (sensor_window_crop)
-        return r;   /* refused: centring is unverified for a windowed sensor
-                       readout (driver-reported crop_left/crop_top != 0) --
-                       see the file comment above. */
 
     r.width    = *active_width;
     r.height   = *active_height;
