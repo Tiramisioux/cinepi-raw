@@ -99,6 +99,16 @@ dng_output_depth_test = executable('dng_output_depth_test',
            install : false)
 test('dng_output_depth', dng_output_depth_test)
 
+# Unit tests for the binning-source decision (WP-CPR-2 / finding C2): whether
+# the sensor driver's own "Mode Binning" control or the active-area/delivered
+# -size ratio is trusted. No libcamera deps — it includes only
+# cinepi/sensor_binning_source.hpp. Run with `meson test`.
+sensor_binning_source_test = executable('sensor_binning_source_test',
+           '../tests/sensor_binning_source_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('sensor_binning_source', sensor_binning_source_test)
+
 # Unit tests for IFDBuilder's multi-IFD chaining contract (C9 Phase 0's
 # embedded DNG thumbnail). No libcamera deps — it includes only
 # cinepi/ifd_builder.hpp. Run with `meson test`.
