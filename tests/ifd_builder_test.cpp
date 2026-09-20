@@ -246,8 +246,10 @@ static void test_padded_raw16_crop_tags()
 {
     // The WORK-PACKAGES.md headline case: a 3840x2200 RAW16 ClearHDR
     // transport carrying a 3840x2160 active picture (40 OB rows split
-    // evenly top/bottom).
-    DngCropRect crop = computeDngCropRect(3840, 2200, 3840u, 2160u);
+    // evenly top/bottom). Round 4: the origin is no longer computed by
+    // centring inside computeDngCropRect() -- the call site (here, the
+    // test standing in for cinepi_raw.cpp) supplies it explicitly.
+    DngCropRect crop = computeDngCropRect(3840, 2200, 3840u, 2160u, 0u, 20u);
     CHECK(crop.present, "padded RAW16 frame produces crop tags");
     CHECK(crop.origin_x == 0, "padded RAW16 frame: origin_x is 0 (no horizontal padding)");
     CHECK(crop.origin_y == 20, "padded RAW16 frame: origin_y is 20 (40 OB rows split evenly)");
@@ -333,9 +335,12 @@ static void test_padded_raw16_crop_tags()
 static void test_unpadded_frame_no_crop_tags()
 {
     // A 12-bit (or any non-padded) mode: the driver's active size equals
-    // the transport size exactly. No crop tags -- byte-identical to every
-    // DNG this stack wrote before WP-CPR-3.
-    DngCropRect crop = computeDngCropRect(1440, 1080, 1440u, 1080u);
+    // the transport size exactly, origin (0,0). No crop tags -- byte-
+    // identical to every DNG this stack wrote before WP-CPR-3. Passing an
+    // explicit (0,0) origin here (rather than nullopt) exercises the "no
+    // padding at all" refusal specifically, not just the "no origin given"
+    // one below.
+    DngCropRect crop = computeDngCropRect(1440, 1080, 1440u, 1080u, 0u, 0u);
     CHECK(!crop.present, "unpadded frame: no crop tags (matches today's DNGs)");
 
     std::vector<uint8_t> mem(4096, 0xCC);
@@ -360,15 +365,21 @@ static void test_oversized_crop_refused()
     // A crop rectangle must never claim more picture than the delivered
     // buffer actually holds -- pixel data is never touched, so this would
     // otherwise describe pixels that were never written.
-    DngCropRect crop = computeDngCropRect(1280, 720, 1920u, 1080u);
+    DngCropRect crop = computeDngCropRect(1280, 720, 1920u, 1080u, 0u, 0u);
     CHECK(!crop.present, "a crop rectangle larger than the delivered frame on both axes is refused");
     CHECK(crop.width == 0 && crop.height == 0, "a refused crop carries no geometry");
 
-    DngCropRect crop2 = computeDngCropRect(1920, 1080, 1920u, 1200u);
+    DngCropRect crop2 = computeDngCropRect(1920, 1080, 1920u, 1200u, 0u, 0u);
     CHECK(!crop2.present, "a crop taller than the frame on one axis alone is still refused");
 
-    DngCropRect crop3 = computeDngCropRect(1920, 1080, 2000u, 1080u);
+    DngCropRect crop3 = computeDngCropRect(1920, 1080, 2000u, 1080u, 0u, 0u);
     CHECK(!crop3.present, "a crop wider than the frame on one axis alone is still refused");
+
+    // Round 4: the origin is now part of the claim too -- a size that would
+    // fit on its own can still walk off the frame once its origin is added
+    // in, and that must be refused exactly the same way.
+    DngCropRect crop4 = computeDngCropRect(1440, 1100, 1440u, 1080u, 0u, 30u);
+    CHECK(!crop4.present, "a size that fits but an origin that pushes it past the frame is refused");
 }
 
 static void test_absent_metadata_no_crop_tags()
@@ -376,48 +387,79 @@ static void test_absent_metadata_no_crop_tags()
     // Every stock sensor today, and any driver whose metadata probe
     // failed: no active-size answer at all, so tags stay absent, one of
     // the two behaviours the spec explicitly allows for this case.
-    DngCropRect crop = computeDngCropRect(3840, 2200, std::nullopt, std::nullopt);
+    DngCropRect crop = computeDngCropRect(3840, 2200, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
     CHECK(!crop.present, "no driver metadata: tags absent, exactly as today");
 }
 
-// ── WP-CPR-3 review round 3 (finding C4-followup-2): windowed crop is NOT
-// refused ──────────────────────────────────────────────────────────────
+// ── WP-CPR-3 rework round 4: the origin is the call site's to justify,
+// not computeDngCropRect()'s to guess ────────────────────────────────────
 //
-// crop_left/crop_top (core/driver_mode_metadata.hpp, native sensor
-// coordinates per WP-585-1) locate the readout WINDOW on the physical
-// sensor -- e.g. WP-585-1's own worked example, a 1440x1080 2x2 window
-// reported as crop_left=480/crop_top=0 native (240,0 once divided by
-// binning=2). They are NOT the active picture's origin within this
-// frame's own delivered buffer, and must never be used as one -- see
-// ifd_builder.hpp's file comment; that part of the finding this test
-// once encoded still stands. A prior rework round, however, went further
-// and made computeDngCropRect() refuse the crop tags outright for ANY
-// windowed mode (crop_left != 0 || crop_top != 0), on the theory that a
-// windowed mode's buffer-local OB-padding geometry was unestablished. Per
-// ASPECT-RATIOS.md it is established: the RAW16 padding convention
-// (delivered buffer = active + 40 rows, split 20/20) is vertical-only and
-// applies identically to every ratio row, windowed or full-field alike --
-// so computeDngCropRect() no longer takes a window flag at all, and
-// centres for a windowed mode exactly as it does for a full-field one.
+// Rounds 1-3 established that crop_left/crop_top (core/driver_mode_
+// metadata.hpp, native sensor coordinates per WP-585-1) locate the readout
+// WINDOW on the physical sensor, not the active picture's origin within
+// this frame's own delivered buffer, and must never be used as the DNG
+// origin -- that still stands. Round 3 then had computeDngCropRect() ASSUME
+// the active picture is always centred in the buffer, reasoning that the
+// imx585's RAW16 OB-padding convention is uniform and vertical-only. It IS
+// uniform on the imx585 -- but the two imx585 tables in ASPECT-RATIOS.md do
+// NOT share a padding total: the 1x1 family pads +40 rows (20 top / 20
+// bottom), the 2x2-binned family pads +20 rows (10 top / 10 bottom), so
+// "the padding" is not one shared constant, only a shared SPLIT (half
+// above, half below). And on the imx283 centring is not even the right
+// SHAPE of answer: that sensor's optical-black rows are emitted first, so
+// its vertical padding is entirely at the top (16 rows, 0 at the bottom) --
+// a centred guess there would land the origin 8 rows into the real picture.
+//
+// So the assumption is retired. computeDngCropRect() takes the origin as
+// an explicit parameter and never guesses it; the decision of what origin
+// (if any) can be justified moves to the call site, which is the only place
+// that knows the sensor. These cases use real geometry from ASPECT-
+// RATIOS.md's own tables, not a mode that does not exist.
 
-static void test_windowed_crop_still_centred()
+static void test_explicit_origin_replaces_centring_guess()
 {
-    // WP-585-1's own 1440x1080 2x2 window, carrying the same +40-row
-    // RAW16 OB padding the full-field mode does (1440x1120 transport for
-    // a 1440x1080 active picture). No window flag exists any more to
-    // refuse it -- it centres exactly like the full-field case.
-    DngCropRect crop = computeDngCropRect(1440, 1120, 1440u, 1080u);
-    CHECK(crop.present, "a windowed sensor readout's padded mode still produces crop tags");
-    CHECK(crop.origin_x == 0 && crop.origin_y == 20,
-          "windowed padded mode centres identically to the full-field case (uniform vertical-only OB padding)");
-    CHECK(crop.width == 1440 && crop.height == 1080,
-          "windowed padded mode: crop size is the active picture size");
+    // imx585, 2x2-binned RAW16, 1440x1080 output: ASPECT-RATIOS.md's binned
+    // table advertises 1440x1100 for this active size -- +20 rows total,
+    // split 10 top / 10 bottom, i.e. origin (0, 10). Half of the 1x1
+    // family's split, which is exactly the point: no single "+40" applies
+    // to both families.
+    DngCropRect binned = computeDngCropRect(1440, 1100, 1440u, 1080u, 0u, 10u);
+    CHECK(binned.present, "imx585 2x2-binned RAW16: explicit origin produces crop tags");
+    CHECK(binned.origin_x == 0 && binned.origin_y == 10,
+          "imx585 2x2-binned RAW16: +20 total rows split 10/10, not the 1x1 family's 20/20");
+    CHECK(binned.width == 1440 && binned.height == 1080,
+          "imx585 2x2-binned RAW16: crop size is the active picture size");
 
-    // A mode with NO padding at all (its own local buffer already equals
-    // its active size) still gets no tags, windowed or not -- nothing to
-    // crop either way.
-    DngCropRect unpadded = computeDngCropRect(1440, 1080, 1440u, 1080u);
-    CHECK(!unpadded.present, "an unpadded mode has nothing to crop, windowed sensor or not");
+    // imx585, 1x1, 3840x2160 active: the 1x1 family's own +40 rows, split
+    // 20/20, i.e. origin (0, 20) -- the WORK-PACKAGES.md headline case,
+    // reproduced here with the origin now passed in rather than guessed.
+    DngCropRect fullField = computeDngCropRect(3840, 2200, 3840u, 2160u, 0u, 20u);
+    CHECK(fullField.present, "imx585 1x1 RAW16: explicit origin produces crop tags");
+    CHECK(fullField.origin_x == 0 && fullField.origin_y == 20,
+          "imx585 1x1 RAW16: +40 total rows split 20/20");
+
+    // imx283, mode 0, the 2.39:1 ratio row: ASPECT-RATIOS.md's imx283 table
+    // gives active 5472x2288 advertised as 5568x2304 (+96 columns, +16
+    // rows), and imx283_start_streaming emits the optical-black rows FIRST,
+    // so all 16 padding rows sit at the top and none at the bottom. A
+    // centring guess would compute origin (0, 8) -- provably wrong, since
+    // the real picture starts at row 16, not row 8. With no explicit
+    // origin supplied (the imx283 call site does not attempt one), no tags
+    // are written at all: refusing beats guessing.
+    DngCropRect imx283NoOrigin = computeDngCropRect(5568, 2304, 5472u, 2288u,
+                                                     std::nullopt, std::nullopt);
+    CHECK(!imx283NoOrigin.present,
+          "imx283: no explicit origin available -- no crop tags, not a centred guess");
+
+    // Had the imx283 call site been able to justify an origin, the real one
+    // (0, 16) -- all padding at the top -- is what the API accepts and
+    // writes, which is NOT what centring (0, 8) would have produced.
+    DngCropRect imx283RealOrigin = computeDngCropRect(5568, 2304, 5472u, 2288u, 0u, 16u);
+    CHECK(imx283RealOrigin.present, "imx283 with its real (asymmetric) origin produces crop tags");
+    CHECK(imx283RealOrigin.origin_x == 0 && imx283RealOrigin.origin_y == 16,
+          "imx283's real origin is (0, 16) -- all optical-black padding at the top, none at the bottom");
+    CHECK(imx283RealOrigin.origin_y != (2304 - 2288) / 2,
+          "imx283's real origin is NOT what a centred guess ((0, 8)) would have produced");
 }
 
 int main() {
@@ -428,7 +470,7 @@ int main() {
     test_unpadded_frame_no_crop_tags();
     test_oversized_crop_refused();
     test_absent_metadata_no_crop_tags();
-    test_windowed_crop_still_centred();
+    test_explicit_origin_replaces_centring_guess();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) std::printf("ALL TESTS PASSED\n");

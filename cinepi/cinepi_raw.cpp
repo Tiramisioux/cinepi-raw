@@ -217,18 +217,60 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			// was meant to fix -- crop_left/crop_top are native-SENSOR
 			// coordinates for FOV/zoom bookkeeping and were never usable
 			// as the DNG origin (that part stands, see ifd_builder.hpp's
-			// file comment), but the RAW16 OB padding this crop
-			// rectangle describes is a uniform, vertical-only,
-			// buffer-internal convention (ASPECT-RATIOS.md) independent
-			// of where the readout window sits on the sensor, so the
-			// windowed case does not need refusing. crop_left/crop_top
-			// are no longer passed here at all.
+			// file comment), but on the imx585 the RAW16 OB padding this
+			// crop rectangle describes is a vertical-only, buffer-internal
+			// convention (ASPECT-RATIOS.md) independent of where the
+			// readout window sits on the sensor, so the windowed case does
+			// not need refusing there. crop_left/crop_top are no longer
+			// passed here at all.
+			//
+			// WP-CPR-3 rework round 4: computeDngCropRect() no longer
+			// centres the active picture in the buffer on its own -- round
+			// 3's centring assumption does not hold for every sensor (the
+			// imx585's two RAW16 families do not even share one padding
+			// total, and the imx283's optical-black rows sit entirely at
+			// the top, not split). The origin is this call site's to
+			// justify, sensor by sensor, and today there is exactly ONE
+			// justified case: a genuine 16-bit sensor MODE (requested_bit_
+			// depth == 16, and only when mode_trusted -- the same guard
+			// setSensorModeTrusted() uses, because an untrusted bit depth
+			// cannot be believed to be 16 any more than it can be believed
+			// to be 12). Every 16-bit sensor mode this stack ships is an
+			// imx585 RAW16 family (ClearHDR 1x1 or 2x2-binned; the imx283
+			// has no 16-bit mode at all), and ASPECT-RATIOS.md establishes
+			// that family's OB padding is vertical-only, split evenly top
+			// and bottom around the active picture -- exactly what halving
+			// the transport-active height difference computes. A future
+			// 16-bit sensor with a different padding convention would need
+			// this reasoning revisited (WORK-PACKAGES.md WP-CPR-3 rework
+			// round 4); nothing here checks a sensor model name, only the
+			// bit depth this campaign's own convention is keyed on.
+			//
+			// Every other sensor -- every stock sensor, the imx283, and an
+			// imx585 mode that is not 16-bit -- gets no origin, so
+			// computeDngCropRect() refuses the crop tags exactly as it
+			// does for a stock sensor with no metadata at all.
 			if (have_driver_meta)
-				app.GetEncoder()->setActivePictureSize(
-					static_cast<unsigned int>(driver_meta.crop_width / driver_meta.binning),
-					static_cast<unsigned int>(driver_meta.crop_height / driver_meta.binning));
+			{
+				const unsigned int active_width =
+					static_cast<unsigned int>(driver_meta.crop_width / driver_meta.binning);
+				const unsigned int active_height =
+					static_cast<unsigned int>(driver_meta.crop_height / driver_meta.binning);
+
+				std::optional<unsigned int> origin_x, origin_y;
+				if (mode_trusted && requested_bit_depth == 16 && cfg.size.height > active_height)
+				{
+					// imx585 RAW16: no horizontal OB padding in any table
+					// (advertised width always equals active width), and the
+					// vertical padding splits evenly top/bottom.
+					origin_x = 0u;
+					origin_y = (cfg.size.height - active_height) / 2;
+				}
+
+				app.GetEncoder()->setActivePictureSize(active_width, active_height, origin_x, origin_y);
+			}
 			else
-				app.GetEncoder()->setActivePictureSize(std::nullopt, std::nullopt);
+				app.GetEncoder()->setActivePictureSize(std::nullopt, std::nullopt, std::nullopt, std::nullopt);
 			// Tell the encoder whether the two snapshots above can be
 			// believed at all — see setSensorModeTrusted()'s comment.
 			app.GetEncoder()->setSensorModeTrusted(mode_trusted);

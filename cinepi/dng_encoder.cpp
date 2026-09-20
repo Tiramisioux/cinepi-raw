@@ -1594,11 +1594,14 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
      * padding (pre-existing for the 3840x2200 RAW16 ClearHDR mode). Pixel
      * data is untouched either way; this only adds metadata. Absent
      * (computeDngCropRect().present == false) for a stock sensor with no
-     * driver crop metadata, an unpadded mode, or a crop that would claim
-     * more than this frame actually holds — see ifd_builder.hpp for why
-     * each of those refuses rather than guesses. */
+     * driver crop metadata, an unpadded mode, a mode whose origin the call
+     * site did not supply (WP-CPR-3 rework round 4 — the origin is no
+     * longer guessed by centring), or a crop that would claim more than
+     * this frame actually holds — see ifd_builder.hpp for why each of
+     * those refuses rather than guesses. */
     const DngCropRect crop_rect = computeDngCropRect(info.width, info.height,
-                                                      active_picture_width_, active_picture_height_);
+                                                      active_picture_width_, active_picture_height_,
+                                                      active_picture_origin_x_, active_picture_origin_y_);
     if (crop_rect.present)
     {
         uint32_t cropOrigin[2] = { crop_rect.origin_x, crop_rect.origin_y };

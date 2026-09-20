@@ -82,17 +82,34 @@ public:
 	 * crop_top != 0) purely to make computeDngCropRect() refuse the crop
 	 * tags for a windowed sensor readout. That refusal overshot the
 	 * original finding -- crop_left/crop_top are sensor-native readout-
-	 * window coordinates and were never usable as the DNG origin, but the
-	 * RAW16 OB-padding this crop rectangle actually describes is a
-	 * uniform, vertical-only, buffer-internal convention (ASPECT-RATIOS.md:
-	 * every ratio row, windowed or full-field, advertises `active + 40`)
-	 * independent of where the readout window sits on the sensor. The
-	 * parameter is gone; computeDngCropRect() now centres for every padded
-	 * mode this campaign ships, windowed or not. */
-	void setActivePictureSize(std::optional<unsigned int> width, std::optional<unsigned int> height)
+	 * window coordinates and were never usable as the DNG origin, but on
+	 * the imx585 the RAW16 OB-padding this crop rectangle actually
+	 * describes is a vertical-only, buffer-internal convention
+	 * (ASPECT-RATIOS.md) independent of where the readout window sits on
+	 * the sensor. The parameter was dropped for that reason.
+	 *
+	 * WP-CPR-3 rework round 4: round 3 then had computeDngCropRect() centre
+	 * the active picture in the buffer for EVERY padded mode, which
+	 * overshot in the other direction -- the imx585's two RAW16 families do
+	 * not even share one padding total (1x1 is +40 rows split 20/20,
+	 * 2x2-binned is +20 rows split 10/10), and the imx283's optical-black
+	 * rows are NOT centred at all (emitted first, so all of them sit at the
+	 * top). The origin is now a separate, explicit input (origin_x/origin_y
+	 * below), supplied by the ONE call site that knows the sensor -- see
+	 * cinepi_raw.cpp's comment at its setActivePictureSize() call for
+	 * exactly which case it currently justifies an origin for (the imx585
+	 * RAW16 families, where the split is an established, uniform-per-family
+	 * fact) and which it does not (every other sensor, including the
+	 * imx283, where centring would be provably wrong). std::nullopt here
+	 * means what it always meant: no crop tags written, refusing rather
+	 * than guessing. */
+	void setActivePictureSize(std::optional<unsigned int> width, std::optional<unsigned int> height,
+	                           std::optional<unsigned int> origin_x, std::optional<unsigned int> origin_y)
 	{
-		active_picture_width_  = width;
-		active_picture_height_ = height;
+		active_picture_width_    = width;
+		active_picture_height_   = height;
+		active_picture_origin_x_ = origin_x;
+		active_picture_origin_y_ = origin_y;
 	}
 
 	// Encode the given buffer.
@@ -413,6 +430,11 @@ private:
         bool sensor_mode_trusted_ = true;
         std::optional<unsigned int> active_picture_width_;
         std::optional<unsigned int> active_picture_height_;
+        /* WP-CPR-3 rework round 4: the active picture's origin within the
+         * delivered buffer, supplied by the call site alongside the size
+         * above -- see setActivePictureSize()'s own comment. */
+        std::optional<unsigned int> active_picture_origin_x_;
+        std::optional<unsigned int> active_picture_origin_y_;
 
         /* The CCMP decompand table for this configuration, or nullptr when the
          * mode is not 12-bit ClearHDR. Owned by the process-wide cache in

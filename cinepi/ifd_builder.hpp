@@ -58,28 +58,22 @@
  * round 2's rework stopped there and drew the wrong conclusion: it made
  * crop_left/crop_top != 0 (a WINDOWED readout) refuse the crop tags
  * outright, on the theory that a windowed mode's buffer-local padding
- * geometry was unestablished. It is established, and round 3 removes the
- * refusal: per ASPECT-RATIOS.md, the RAW16 OB-padding convention -- the
- * delivered buffer is `active + 40` rows, split 20/20 top and bottom --
- * is VERTICAL-ONLY and applies IDENTICALLY to every ratio row in every
- * table, windowed or not (imx585 1x1 table: "RAW16 advertised" is
- * `active + 40`; the 2x2-binned WINDOWED table: exactly the same
- * `output + 40` column, entry for entry). The padding is a property of
- * how RAW16 packs a frame into its own buffer, not of where that frame's
- * readout window sits on the physical sensor array -- so the
- * transport-vs-active centring formula below, which only ever reasons
- * about this frame's OWN buffer, is exactly as valid for a windowed mode
- * as for the full-field one. crop_left/crop_top remain unusable as the
- * DNG origin itself (that diagnosis stands) -- they are simply not
- * consulted here at all any more, for either purpose.
+ * geometry was unestablished. It is established, at least on the imx585,
+ * and round 3 removed the refusal for that sensor: per ASPECT-RATIOS.md,
+ * the imx585's RAW16 OB-padding convention is VERTICAL-ONLY, split evenly
+ * top and bottom, and applies IDENTICALLY to every ratio row in both its
+ * tables, windowed or not -- so a windowed imx585 mode does not need
+ * refusing on that account. crop_left/crop_top remain unusable as the DNG
+ * origin itself (that diagnosis stands) -- they are simply not consulted
+ * here at all any more, for either purpose.
  *
- * The active picture IS assumed CENTRED in the delivered buffer: true for
- * every padded mode in this campaign, windowed or full-field alike
- * (imx585.c's own mode table crops the OB rows evenly regardless of
- * window position, see WP-585-* and ASPECT-RATIOS.md), and the only
- * geometry the transport-vs-active SIZE difference alone can imply
- * without a separate per-axis offset from the driver. No pixel data is
- * ever touched by this -- only which sub-rectangle of the buffer already
+ * Round 3 went one step further than that finding supports, though: it had
+ * this function ASSUME the active picture is always centred in the
+ * delivered buffer, for every sensor, from the transport-vs-active SIZE
+ * difference alone. Round 4 (below) retires that assumption -- it does not
+ * hold for every sensor this campaign touches, and the two imx585 tables
+ * do not even share one padding total to centre by. No pixel data is ever
+ * touched by any of this -- only which sub-rectangle of the buffer already
  * written is the real picture.
  *
  * `active_width`/`active_height` are std::nullopt for a stock sensor
@@ -95,7 +89,40 @@
  * refused outright (never written) rather than clamped: clamping would
  * silently hide a wrong metadata reading behind plausible-looking tags,
  * where refusing leaves the file exactly as it would have been with no
- * metadata at all -- the safe, already-allowed fallback. */
+ * metadata at all -- the safe, already-allowed fallback.
+ *
+ * REWORK ROUND 4 (the centring assumption needs an owner, not a guess):
+ * round 3, above, had this function ASSUME the active picture is always
+ * centred in the delivered buffer, on the theory that the imx585's RAW16
+ * optical-black convention is uniform and vertical-only. The vertical-only
+ * part holds; "uniform" and "always" do not, and this file said them
+ * wrongly:
+ *
+ *   - the two imx585 tables in ASPECT-RATIOS.md do NOT share a padding
+ *     total. The 1x1 family's RAW16 column is `active + 40` rows (20 top /
+ *     20 bottom, e.g. 3840x2160 active -> 3840x2200 advertised); the
+ *     2x2-binned family's RAW16 column is `output + 20` rows (10 top / 10
+ *     bottom, e.g. 1440x1080 -> 1440x1100). Centring happened to compute the
+ *     right split for BOTH, because the split (half above, half below) IS
+ *     uniform even though the total is not -- but a comment claiming a
+ *     shared "+40" for both tables, which this file and two others once
+ *     did, is simply wrong about the 2x2 family.
+ *   - the imx283 is not symmetric at all. That sensor advertises active
+ *     plus 96 optical-black columns and 16 rows, and
+ *     `imx283_start_streaming` emits the optical-black rows FIRST, so its
+ *     vertical padding is 16 rows at the top and NONE at the bottom.
+ *     Centring there would compute origin (0, 8) -- 8 rows into the real
+ *     picture, not at its edge.
+ *
+ * So this function no longer computes an origin at all. `origin_x`/
+ * `origin_y` are now parameters, supplied by the call site -- the only
+ * place that knows which sensor and which padding convention it is
+ * looking at (see cinepi_raw.cpp's own comment at the setActivePictureSize()
+ * call for which case it currently justifies: the imx585 RAW16 families
+ * above, where the split is known). Absent (std::nullopt) exactly like an
+ * absent size: no origin to justify means no crop tags, refusing rather
+ * than falling back to a centring guess that is provably wrong on at
+ * least one sensor this campaign ships. */
 struct DngCropRect
 {
     bool     present  = false;
@@ -107,23 +134,29 @@ struct DngCropRect
 
 inline DngCropRect computeDngCropRect(uint32_t transport_width, uint32_t transport_height,
                                        std::optional<uint32_t> active_width,
-                                       std::optional<uint32_t> active_height)
+                                       std::optional<uint32_t> active_height,
+                                       std::optional<uint32_t> origin_x,
+                                       std::optional<uint32_t> origin_y)
 {
     DngCropRect r;
 
     if (!active_width || !active_height || *active_width == 0 || *active_height == 0)
         return r;   /* no driver metadata: tags absent, exactly as today */
 
-    if (*active_width > transport_width || *active_height > transport_height)
+    if (!origin_x || !origin_y)
+        return r;   /* size with no justified origin: refuse rather than guess */
+
+    if (*origin_x + *active_width > transport_width || *origin_y + *active_height > transport_height)
         return r;   /* refused: would claim more than the delivered frame */
 
-    if (*active_width == transport_width && *active_height == transport_height)
+    if (*active_width == transport_width && *active_height == transport_height &&
+        *origin_x == 0 && *origin_y == 0)
         return r;   /* no padding: crop == full frame, same bytes as today */
 
     r.width    = *active_width;
     r.height   = *active_height;
-    r.origin_x = (transport_width  - *active_width)  / 2;
-    r.origin_y = (transport_height - *active_height) / 2;
+    r.origin_x = *origin_x;
+    r.origin_y = *origin_y;
     r.present  = true;
     return r;
 }
