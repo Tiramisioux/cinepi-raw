@@ -15,7 +15,11 @@
 #include "post_processing_stages/post_processing_stage.hpp"
 
 #include <jpeglib.h>
-#include <nadjieb/mjpeg_streamer.hpp>
+// Vendored (and patched with setStaticResponse()) at
+// cinepi/third_party/nadjieb/mjpeg_streamer.hpp -- see that file's own
+// header comment for the upstream commit this was taken from and exactly
+// what the local patch changes.
+#include "third_party/nadjieb/mjpeg_streamer.hpp"
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -56,13 +60,60 @@ private:
 
 #define NAME "mjpegPreview"
 
-// The stream is published under two targets. "/stream" is the documented one;
-// "/" is here because that is what an operator actually types when told the
-// clean preview is "on port 8000", and nadjieb routes on the exact request
-// target, so a bare host:8000 was a bodyless 404 with no index and no
-// redirect.
+// "/stream" is the documented MJPEG target and the only one the cinemate web
+// GUI's <img> requests (grep-confirmed). "/" used to be a second multipart
+// topic carrying the identical stream -- so a bare host:8000 navigation
+// worked, but landed the browser on a bare image document with whatever
+// default canvas colour that browser happens to use (white in Safari, dark
+// grey in Chrome): no black surround, and nothing to style, because a
+// multipart/x-mixed-replace response carries no CSS. "/" is now a static
+// HTML page (INDEX_PAGE, below) registered once in Configure() via
+// setStaticResponse() -- the patch this vendored header adds -- instead of
+// being publish()ed a frame at a time; Process() therefore now publishes
+// only STREAM_PATH, which also halves the per-frame publish copy the
+// duration logging below already measures.
 static constexpr char const *STREAM_PATH = "/stream";
 static constexpr char const *ROOT_PATH = "/";
+
+// Full-window black page hosting the "/stream" <img>. No external resources
+// (fonts, scripts, stylesheets) -- this is the clean feed, not a second GUI.
+// The inline script is a single watchdog: if the <img> has not decoded a
+// first frame four seconds after the last (re)connect -- the
+// accepted-and-silent case documented where STREAM_PATH is registered in
+// Configure() below -- it drops and re-issues the identical "/stream" URL.
+// Per the handbook's measured identical-URL rule
+// (working/browser-side-traps.md): resetting `src` to the SAME URL while a
+// request is still in flight joins that pending request rather than issuing
+// a new one, so the reset is two steps in two tasks -- clear `src`, then set
+// it again 250 ms later -- not one. This page has no server-push channel and
+// no resolution-switch event to listen on (unlike the web GUI's own
+// multi-signal recovery), so this one timer is deliberately the whole
+// story.
+static constexpr char const *INDEX_PAGE =
+    "<!doctype html>\n"
+    "<html><head>\n"
+    "<meta charset=\"utf-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    "<title>CinePi preview</title>\n"
+    "<style>\n"
+    "html,body{margin:0;height:100%;background:#000}\n"
+    "img{width:100%;height:100%;object-fit:contain;display:block}\n"
+    "</style>\n"
+    "</head><body>\n"
+    "<img id=\"p\" src=\"/stream\">\n"
+    "<script>\n"
+    "var p=document.getElementById('p'),got=false;\n"
+    "p.onload=function(){got=true;};\n"
+    "function watch(){\n"
+    "  if(!got){\n"
+    "    p.removeAttribute('src');\n"
+    "    setTimeout(function(){got=false;p.src='/stream';},250);\n"
+    "  }\n"
+    "  setTimeout(watch,4000);\n"
+    "}\n"
+    "setTimeout(watch,4000);\n"
+    "</script>\n"
+    "</body></html>\n";
 
 char const *mjpegStreamStage::Name() const
 {
@@ -193,16 +244,23 @@ void mjpegStreamStage::Configure()
         streamer_ = std::make_unique<MJPEGStreamer>();
         try {
             streamer_->start(port_, 8);
-            // Register both targets before the first frame exists. nadjieb
-            // only learns a path when something is published to it, and
-            // 404s anything it does not know -- so opening the clean preview
-            // during boot or a camera restart hit a dead 404 page, and a
-            // plain browser navigation (unlike the GUI's <img>) has no retry
-            // to recover with. Publishing an empty buffer creates the topic
-            // with no clients and queues nothing, so a client that connects
-            // early is accepted and simply waits for the first real frame.
+            // Register the stream topic before the first frame exists.
+            // nadjieb only learns a multipart path when something is
+            // published to it, and 404s anything it does not know -- so
+            // opening the clean preview during boot or a camera restart hit
+            // a dead 404 page, and a plain browser navigation (unlike the
+            // GUI's <img>) has no retry to recover with. Publishing an empty
+            // buffer creates the topic with no clients and queues nothing,
+            // so a client that connects early is accepted and simply waits
+            // for the first real frame -- INDEX_PAGE's watchdog is exactly
+            // what recovers a client stuck in that accepted-and-silent
+            // state for more than four seconds.
             streamer_->publish(STREAM_PATH, std::string());
-            streamer_->publish(ROOT_PATH, std::string());
+            // The root page is a static, always-available response, not a
+            // multipart topic -- setStaticResponse() answers it immediately
+            // regardless of camera/frame state, so there is no equivalent
+            // boot race to work around here.
+            streamer_->setStaticResponse(ROOT_PATH, "text/html", INDEX_PAGE);
             return;
         } catch (std::exception const &e) {
             streamer_.reset();
@@ -243,11 +301,12 @@ bool mjpegStreamStage::Process(CompletedRequestPtr &completed_request)
     console->trace("Sending JPEG buffer size: {}", jpegBuffer.size());
 
     auto startPublish = std::chrono::high_resolution_clock::now();
-    // Built once and published twice; nadjieb copies into each topic's buffer,
-    // and a ~15 kB frame at 25 fps is well under a megabyte a second.
+    // Published once now: "/" is a static page (INDEX_PAGE, registered in
+    // Configure()) rather than a second multipart topic, so this no longer
+    // needs the per-frame copy into a second topic's buffer that publishing
+    // it twice used to cost.
     std::string const payload(jpegBuffer.begin(), jpegBuffer.end());
     streamer_->publish(STREAM_PATH, payload);
-    streamer_->publish(ROOT_PATH, payload);
     auto endPublish = std::chrono::high_resolution_clock::now();
 
     // Logging the durations

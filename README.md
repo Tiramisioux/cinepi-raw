@@ -54,11 +54,17 @@ sudo ninja -C build install && \
 cd
 ```
 
-### Install cpp-mjpeg-streamer
+### MJPEG preview
 
 ```shell
-sudo apt install -y libspdlog-dev libjsoncpp-dev && cd /home/pi && git clone https://github.com/nadjieb/cpp-mjpeg-streamer.git && cd cpp-mjpeg-streamer && mkdir build && cd build && cmake .. && make && sudo make install && cd
+sudo apt install -y libspdlog-dev libjsoncpp-dev
 ```
+
+nadjieb's single-header `cpp-mjpeg-streamer` is vendored (with a small local patch — see that
+file's own header comment) at `cinepi/third_party/nadjieb/mjpeg_streamer.hpp`, so no separate
+clone/build/install step is needed for it. On each sensor's preview port (`8000` for cam0,
+`8001` for cam1), `/` is a black full-window page hosting the picture and `/stream` is the raw
+MJPEG stream.
 
 ### Install cinepi-raw dependencies
 
