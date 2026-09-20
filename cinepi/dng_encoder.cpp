@@ -1587,6 +1587,31 @@ size_t DngEncoder::dng_save([[maybe_unused]] int                /*thread_num*/,
     ifd.addEntry(254 , TIFF_LONG , 1, &typeFull);
     ifd.addEntry(256 , TIFF_LONG , 1, &info.width);
     ifd.addEntry(257 , TIFF_LONG , 1, &info.height);
+
+    /* DefaultCropOrigin/Size/ActiveArea — WP-CPR-3 (finding C4). Tells a
+     * reader where the real picture is inside the buffer tags 256/257 just
+     * described, for a mode whose transport frame carries optical-black
+     * padding (pre-existing for the 3840x2200 RAW16 ClearHDR mode). Pixel
+     * data is untouched either way; this only adds metadata. Absent
+     * (computeDngCropRect().present == false) for a stock sensor with no
+     * driver crop metadata, an unpadded mode, or a crop that would claim
+     * more than this frame actually holds — see ifd_builder.hpp for why
+     * each of those refuses rather than guesses. */
+    const DngCropRect crop_rect = computeDngCropRect(info.width, info.height,
+                                                      active_picture_width_, active_picture_height_);
+    if (crop_rect.present)
+    {
+        uint32_t cropOrigin[2] = { crop_rect.origin_x, crop_rect.origin_y };
+        uint32_t cropSize[2]   = { crop_rect.width, crop_rect.height };
+        /* DNG's ActiveArea order is (top, left, bottom, right). */
+        uint32_t activeArea[4] = { crop_rect.origin_y, crop_rect.origin_x,
+                                    crop_rect.origin_y + crop_rect.height,
+                                    crop_rect.origin_x + crop_rect.width };
+        ifd.addEntry(0xC61F, TIFF_LONG, 2, cropOrigin);
+        ifd.addEntry(0xC620, TIFF_LONG, 2, cropSize);
+        ifd.addEntry(0xC68D, TIFF_LONG, 4, activeArea);
+    }
+
     ifd.addEntry(258 , TIFF_SHORT, 1, &bitsPacked);
     ifd.addEntry(259 , TIFF_SHORT, 1, &dng_info.compression);
     ifd.addEntry(262 , TIFF_SHORT, 1, &phot);

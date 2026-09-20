@@ -64,6 +64,24 @@ public:
 	 * existed. */
 	void setSensorModeTrusted(bool trusted) { sensor_mode_trusted_ = trusted; }
 
+	/* The active picture's size, OUTPUT-domain, for the mode about to be
+	 * recorded -- WP-CPR-3 (finding C4). std::nullopt when the sensor
+	 * exposes no driver crop metadata (every stock sensor today) or the
+	 * probe failed; dng_save() then writes no DefaultCropOrigin/Size/
+	 * ActiveArea tags at all, exactly as before this package. Snapshotted
+	 * at the same call site and for the same reason as setSensorBinning()
+	 * above: cinepi_raw.cpp reads WP-CPR-2's driver metadata once per
+	 * reconfigure, right after the validated raw StreamConfiguration is
+	 * known, and hands the OUTPUT-domain size straight through (its own
+	 * native-sensor-coordinate crop_width/crop_height already divided by
+	 * the driver's linear binning -- see core/driver_mode_metadata.hpp and
+	 * cinepi/ifd_builder.hpp's computeDngCropRect()). */
+	void setActivePictureSize(std::optional<unsigned int> width, std::optional<unsigned int> height)
+	{
+		active_picture_width_  = width;
+		active_picture_height_ = height;
+	}
+
 	// Encode the given buffer.
 	void EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const &info, int64_t timestamp_us) override;
 	void EncodeBuffer2(int fd, size_t size, void *mem, StreamInfo const &info, size_t losize, void *lomem, StreamInfo const &loinfo, int64_t timestamp_us, CompletedRequest::ControlList const &metadata);
@@ -380,6 +398,8 @@ private:
         unsigned int sensor_mode_bit_depth_ = 0;
         double sensor_binning_ = 0.0;
         bool sensor_mode_trusted_ = true;
+        std::optional<unsigned int> active_picture_width_;
+        std::optional<unsigned int> active_picture_height_;
 
         /* The CCMP decompand table for this configuration, or nullptr when the
          * mode is not 12-bit ClearHDR. Owned by the process-wide cache in

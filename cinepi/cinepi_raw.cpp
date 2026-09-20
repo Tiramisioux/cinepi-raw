@@ -195,6 +195,25 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 						   binning_decision.source == SensorBinningSource::kDriver
 							   ? "driver" : "ratio");
 			app.GetEncoder()->setSensorBinning(binning_decision.binning);
+			// WP-CPR-3 (finding C4): hand the encoder the active picture's
+			// OUTPUT-domain size, from the SAME driver metadata probe above
+			// (never re-probed), so dng_save() can write DefaultCropOrigin/
+			// Size/ActiveArea when the transport frame carries padding —
+			// see cinepi/ifd_builder.hpp's computeDngCropRect(). The
+			// driver's crop_width/crop_height are reported in NATIVE SENSOR
+			// coordinates (core/driver_mode_metadata.hpp); dividing by the
+			// driver's own linear binning (validated to 1 or 2 whenever
+			// have_driver_meta is true) converts to the OUTPUT-pixel domain
+			// dng_save()'s transport size (info.width/height) is already
+			// in. A stock sensor, or a probe that failed, reports nothing
+			// here either — same std::nullopt behaviour as before this
+			// package, so no crop tags are written.
+			if (have_driver_meta)
+				app.GetEncoder()->setActivePictureSize(
+					static_cast<unsigned int>(driver_meta.crop_width / driver_meta.binning),
+					static_cast<unsigned int>(driver_meta.crop_height / driver_meta.binning));
+			else
+				app.GetEncoder()->setActivePictureSize(std::nullopt, std::nullopt);
 			// Tell the encoder whether the two snapshots above can be
 			// believed at all — see setSensorModeTrusted()'s comment.
 			app.GetEncoder()->setSensorModeTrusted(mode_trusted);
