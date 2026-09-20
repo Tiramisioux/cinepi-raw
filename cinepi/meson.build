@@ -201,3 +201,15 @@ mjpeg_static_response_test = executable('mjpeg_static_response_test',
            include_directories : [include_directories('..'), include_directories('third_party')],
            install : false)
 test('mjpeg_static_response', mjpeg_static_response_test)
+
+# Unit test for MJPEGStreamer::clientCount(), added on
+# fix/mjpeg-worker-exhaustion so mjpegPreviewStage.cpp can log the
+# registered-client count periodically. Pure / self-contained, same shape as
+# mjpeg_static_response_test above -- see tests/mjpeg_client_count_test.cpp
+# for what it does and does not cover (socket lifecycle is not unit-testable
+# here; that part was checked with a standalone desk harness instead).
+mjpeg_client_count_test = executable('mjpeg_client_count_test',
+           '../tests/mjpeg_client_count_test.cpp',
+           include_directories : [include_directories('..'), include_directories('third_party')],
+           install : false)
+test('mjpeg_client_count', mjpeg_client_count_test)
