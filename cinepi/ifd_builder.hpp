@@ -8,6 +8,79 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <optional>
+
+/* ------------------- DNG crop geometry (WP-CPR-3) ------------------
+ *
+ * Finding C4: dng_encoder.cpp writes tags 256/257 (ImageWidth/Length) as
+ * the raw stream's own transport size and nothing else -- no
+ * DefaultCropOrigin (0xC61F), DefaultCropSize (0xC620) or ActiveArea
+ * (0xC68D). Every mode whose delivered buffer carries optical-black
+ * padding around the real picture (pre-existing for the 3840x2200 RAW16
+ * ClearHDR mode, and every padded crop the aspect-ratio family adds)
+ * therefore shows that padding as picture in any DNG reader.
+ *
+ * computeDngCropRect() decides the fix: given the transport size already
+ * written under tags 256/257, and the active picture size WP-CPR-2's
+ * driver metadata helper (core/driver_mode_metadata.hpp) reports --
+ * OUTPUT-domain, i.e. the caller has already divided crop_width/
+ * crop_height by the driver's linear "Mode Binning" -- it returns the
+ * crop rectangle to write, or `present == false` when none should be
+ * written at all.
+ *
+ * The active picture is assumed CENTRED in the delivered buffer: true for
+ * every padded mode in this campaign (imx585.c's own mode table crops the
+ * OB rows/columns evenly, see WP-585-* and ASPECT-RATIOS.md), and the
+ * only geometry the transport-vs-active SIZE difference alone can imply
+ * without a separate per-axis offset from the driver. No pixel data is
+ * ever touched by this -- only which sub-rectangle of the buffer already
+ * written is the real picture.
+ *
+ * `active_width`/`active_height` are std::nullopt for a stock sensor
+ * (every one of them today: none expose the five named geometry
+ * controls) or when the probe failed. Per the spec, that case is left
+ * exactly as before this package -- tags simply absent -- rather than
+ * writing a crop equal to the full frame; the two are equivalent to a
+ * reader (DefaultCropOrigin/Size default to (0,0)/the full image when
+ * absent) and "absent" is the smaller diff against every DNG this stack
+ * wrote before today.
+ *
+ * A crop that would claim MORE picture than the delivered buffer holds is
+ * refused outright (never written) rather than clamped: clamping would
+ * silently hide a wrong metadata reading behind plausible-looking tags,
+ * where refusing leaves the file exactly as it would have been with no
+ * metadata at all -- the safe, already-allowed fallback. */
+struct DngCropRect
+{
+    bool     present  = false;
+    uint32_t origin_x = 0;
+    uint32_t origin_y = 0;
+    uint32_t width    = 0;
+    uint32_t height   = 0;
+};
+
+inline DngCropRect computeDngCropRect(uint32_t transport_width, uint32_t transport_height,
+                                       std::optional<uint32_t> active_width,
+                                       std::optional<uint32_t> active_height)
+{
+    DngCropRect r;
+
+    if (!active_width || !active_height || *active_width == 0 || *active_height == 0)
+        return r;   /* no driver metadata: tags absent, exactly as today */
+
+    if (*active_width > transport_width || *active_height > transport_height)
+        return r;   /* refused: would claim more than the delivered frame */
+
+    if (*active_width == transport_width && *active_height == transport_height)
+        return r;   /* no padding: crop == full frame, same bytes as today */
+
+    r.width    = *active_width;
+    r.height   = *active_height;
+    r.origin_x = (transport_width  - *active_width)  / 2;
+    r.origin_y = (transport_height - *active_height) / 2;
+    r.present  = true;
+    return r;
+}
 
 /* --------------------------- Memory writer ------------------------ */
 struct MemoryBuffer

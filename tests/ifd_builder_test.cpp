@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 // ── tiny test harness (same shape as dng_pack_test.cpp) ──────────────────────
@@ -224,10 +225,169 @@ static void test_two_ifd_chain()
     }
 }
 
+// ── WP-CPR-3 (finding C4): DefaultCropOrigin/Size/ActiveArea ─────────────
+//
+// computeDngCropRect() (cinepi/ifd_builder.hpp) decides whether a frame
+// needs the three DNG crop tags at all, and what they say, from the
+// transport size already written under tags 256/257 and the active
+// picture size the driver metadata helper (WP-CPR-2's
+// core/driver_mode_metadata.hpp, output-domain: crop_width/crop_height
+// divided by the driver's linear binning) reports. Absent when there is
+// no such metadata (every stock sensor today) -- tags are then omitted,
+// exactly as before this package.
+
+static const uint8_t *find_out_of_line(const uint8_t *buf, uint32_t bufSize, uint32_t offset, uint32_t len)
+{
+    if (static_cast<size_t>(offset) + len > bufSize) return nullptr;
+    return buf + offset;
+}
+
+static void test_padded_raw16_crop_tags()
+{
+    // The WORK-PACKAGES.md headline case: a 3840x2200 RAW16 ClearHDR
+    // transport carrying a 3840x2160 active picture (40 OB rows split
+    // evenly top/bottom).
+    DngCropRect crop = computeDngCropRect(3840, 2200, 3840u, 2160u);
+    CHECK(crop.present, "padded RAW16 frame produces crop tags");
+    CHECK(crop.origin_x == 0, "padded RAW16 frame: origin_x is 0 (no horizontal padding)");
+    CHECK(crop.origin_y == 20, "padded RAW16 frame: origin_y is 20 (40 OB rows split evenly)");
+    CHECK(crop.width == 3840, "padded RAW16 frame: crop width is the active width");
+    CHECK(crop.height == 2160, "padded RAW16 frame: crop height is the active height");
+
+    // Build it the way dng_save() will and read it back with the
+    // independent parser: tags present, right type, right values.
+    std::vector<uint8_t> mem(4096, 0xCC);
+    MemoryBuffer buf{mem.data(), 0, 0, static_cast<uint32_t>(mem.size())};
+    write_uint32(buf, 0);
+
+    IFDBuilder ifd;
+    ifd.baseOffset = buf.usedSize;
+    static uint32_t w = 3840, h = 2200;
+    ifd.addEntry(256, TIFF_LONG, 1, &w);
+    ifd.addEntry(257, TIFF_LONG, 1, &h);
+    uint32_t origin[2] = { crop.origin_x, crop.origin_y };
+    uint32_t size[2]   = { crop.width, crop.height };
+    uint32_t activeArea[4] = { crop.origin_y, crop.origin_x,
+                                crop.origin_y + crop.height, crop.origin_x + crop.width };
+    ifd.addEntry(0xC61F, TIFF_LONG, 2, origin);
+    ifd.addEntry(0xC620, TIFF_LONG, 2, size);
+    ifd.addEntry(0xC68D, TIFF_LONG, 4, activeArea);
+    ifd.sortEntries();
+    ifd.build(buf);
+
+    auto chain = indep::walk_chain(mem.data(), buf.usedSize, ifd.baseOffset);
+    CHECK(chain.size() == 1, "crop-tag IFD builds as a single IFD");
+    if (chain.size() != 1) return;
+
+    auto find = [&](uint16_t tag) -> const indep::Entry * {
+        for (const auto &e : chain[0].entries)
+            if (e.tag == tag) return &e;
+        return nullptr;
+    };
+
+    const indep::Entry *originEntry = find(0xC61F);
+    const indep::Entry *sizeEntry   = find(0xC620);
+    const indep::Entry *areaEntry   = find(0xC68D);
+    CHECK(originEntry && originEntry->type == TIFF_LONG && originEntry->count == 2,
+          "DefaultCropOrigin (0xC61F) is a 2-element LONG");
+    CHECK(sizeEntry && sizeEntry->type == TIFF_LONG && sizeEntry->count == 2,
+          "DefaultCropSize (0xC620) is a 2-element LONG");
+    CHECK(areaEntry && areaEntry->type == TIFF_LONG && areaEntry->count == 4,
+          "ActiveArea (0xC68D) is a 4-element LONG");
+
+    if (originEntry)
+    {
+        const uint8_t *p = find_out_of_line(mem.data(), buf.usedSize, originEntry->value, 8);
+        CHECK(p != nullptr, "DefaultCropOrigin value offset lands inside the written buffer");
+        if (p)
+        {
+            CHECK(indep::rd32(p) == 0, "DefaultCropOrigin.x == 0");
+            CHECK(indep::rd32(p + 4) == 20, "DefaultCropOrigin.y == 20");
+        }
+    }
+    if (sizeEntry)
+    {
+        const uint8_t *p = find_out_of_line(mem.data(), buf.usedSize, sizeEntry->value, 8);
+        CHECK(p != nullptr, "DefaultCropSize value offset lands inside the written buffer");
+        if (p)
+        {
+            CHECK(indep::rd32(p) == 3840, "DefaultCropSize.width == 3840");
+            CHECK(indep::rd32(p + 4) == 2160, "DefaultCropSize.height == 2160");
+        }
+    }
+    if (areaEntry)
+    {
+        const uint8_t *p = find_out_of_line(mem.data(), buf.usedSize, areaEntry->value, 16);
+        CHECK(p != nullptr, "ActiveArea value offset lands inside the written buffer");
+        if (p)
+        {
+            // DNG order: top, left, bottom, right.
+            CHECK(indep::rd32(p) == 20, "ActiveArea.top == 20");
+            CHECK(indep::rd32(p + 4) == 0, "ActiveArea.left == 0");
+            CHECK(indep::rd32(p + 8) == 2180, "ActiveArea.bottom == 2180");
+            CHECK(indep::rd32(p + 12) == 3840, "ActiveArea.right == 3840");
+        }
+    }
+}
+
+static void test_unpadded_frame_no_crop_tags()
+{
+    // A 12-bit (or any non-padded) mode: the driver's active size equals
+    // the transport size exactly. No crop tags -- byte-identical to every
+    // DNG this stack wrote before WP-CPR-3.
+    DngCropRect crop = computeDngCropRect(1440, 1080, 1440u, 1080u);
+    CHECK(!crop.present, "unpadded frame: no crop tags (matches today's DNGs)");
+
+    std::vector<uint8_t> mem(4096, 0xCC);
+    MemoryBuffer buf{mem.data(), 0, 0, static_cast<uint32_t>(mem.size())};
+    write_uint32(buf, 0);
+    IFDBuilder ifd0;
+    build_ifd0(ifd0, buf);   // the existing fixture, untouched by this package
+
+    auto chain = indep::walk_chain(mem.data(), buf.usedSize, ifd0.baseOffset);
+    CHECK(chain.size() == 1, "unpadded fixture still builds as one IFD");
+    if (chain.size() != 1) return;
+    bool has_crop_tag = false;
+    for (const auto &e : chain[0].entries)
+        if (e.tag == 0xC61F || e.tag == 0xC620 || e.tag == 0xC68D)
+            has_crop_tag = true;
+    CHECK(!has_crop_tag, "no crop tags appear when the mode carries no padding");
+    CHECK(chain[0].entries.size() == 4, "entry count unchanged from the pre-WP-CPR-3 fixture");
+}
+
+static void test_oversized_crop_refused()
+{
+    // A crop rectangle must never claim more picture than the delivered
+    // buffer actually holds -- pixel data is never touched, so this would
+    // otherwise describe pixels that were never written.
+    DngCropRect crop = computeDngCropRect(1280, 720, 1920u, 1080u);
+    CHECK(!crop.present, "a crop rectangle larger than the delivered frame on both axes is refused");
+    CHECK(crop.width == 0 && crop.height == 0, "a refused crop carries no geometry");
+
+    DngCropRect crop2 = computeDngCropRect(1920, 1080, 1920u, 1200u);
+    CHECK(!crop2.present, "a crop taller than the frame on one axis alone is still refused");
+
+    DngCropRect crop3 = computeDngCropRect(1920, 1080, 2000u, 1080u);
+    CHECK(!crop3.present, "a crop wider than the frame on one axis alone is still refused");
+}
+
+static void test_absent_metadata_no_crop_tags()
+{
+    // Every stock sensor today, and any driver whose metadata probe
+    // failed: no active-size answer at all, so tags stay absent, one of
+    // the two behaviours the spec explicitly allows for this case.
+    DngCropRect crop = computeDngCropRect(3840, 2200, std::nullopt, std::nullopt);
+    CHECK(!crop.present, "no driver metadata: tags absent, exactly as today");
+}
+
 int main() {
     std::printf("=== ifd_builder unit tests ===\n");
     test_single_ifd_unchanged();
     test_two_ifd_chain();
+    test_padded_raw16_crop_tags();
+    test_unpadded_frame_no_crop_tags();
+    test_oversized_crop_refused();
+    test_absent_metadata_no_crop_tags();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) std::printf("ALL TESTS PASSED\n");
