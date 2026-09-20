@@ -380,6 +380,45 @@ static void test_absent_metadata_no_crop_tags()
     CHECK(!crop.present, "no driver metadata: tags absent, exactly as today");
 }
 
+// ── WP-CPR-3 rework (finding C4-followup): sensor_window_crop gate ───────
+//
+// crop_left/crop_top (core/driver_mode_metadata.hpp, native sensor
+// coordinates per WP-585-1) locate the readout WINDOW on the physical
+// sensor -- e.g. WP-585-1's own worked example, a 1440x1080 2x2 window
+// reported as crop_left=480/crop_top=0 native (240,0 once divided by
+// binning=2). They are NOT the active picture's origin within this
+// frame's own delivered buffer, and must never be used as one -- see
+// ifd_builder.hpp's file comment. computeDngCropRect() instead takes a
+// plain `sensor_window_crop` bool (the caller's crop_left != 0 ||
+// crop_top != 0) and refuses outright for a windowed mode, exactly like
+// the oversized-crop guard, rather than centre-guessing a geometry this
+// campaign has not established.
+
+static void test_windowed_crop_refused()
+{
+    // WP-585-1's own 1440x1080 2x2 window, hypothetically carrying the
+    // same +40-row RAW16 OB padding the full-field mode does (1440x1120
+    // transport for a 1440x1080 active picture). Even though the size
+    // math looks exactly like the padded-frame case that produces tags,
+    // the window flag must refuse it.
+    DngCropRect crop = computeDngCropRect(1440, 1120, 1440u, 1080u, /*sensor_window_crop=*/true);
+    CHECK(!crop.present, "a windowed sensor readout gets no crop tags (centring unverified for it)");
+    CHECK(crop.width == 0 && crop.height == 0, "a refused windowed crop carries no geometry");
+
+    // The gate must not fire for the default (full-field) case: same
+    // sizes, sensor_window_crop left at its default, still produces tags.
+    DngCropRect full_field = computeDngCropRect(1440, 1120, 1440u, 1080u);
+    CHECK(full_field.present, "the same sizes with no window flag still produce crop tags");
+    CHECK(full_field.origin_x == 0 && full_field.origin_y == 20,
+          "full-field default centres exactly as before this gate existed");
+
+    // A windowed mode with NO padding at all (its own local buffer already
+    // equals its active size) still gets no tags -- same as any other
+    // unpadded mode -- rather than being refused for nothing.
+    DngCropRect unpadded_window = computeDngCropRect(1440, 1080, 1440u, 1080u, /*sensor_window_crop=*/true);
+    CHECK(!unpadded_window.present, "an unpadded windowed mode has nothing to crop either way");
+}
+
 int main() {
     std::printf("=== ifd_builder unit tests ===\n");
     test_single_ifd_unchanged();
@@ -388,6 +427,7 @@ int main() {
     test_unpadded_frame_no_crop_tags();
     test_oversized_crop_refused();
     test_absent_metadata_no_crop_tags();
+    test_windowed_crop_refused();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) std::printf("ALL TESTS PASSED\n");

@@ -28,13 +28,61 @@
  * crop rectangle to write, or `present == false` when none should be
  * written at all.
  *
- * The active picture is assumed CENTRED in the delivered buffer: true for
- * every padded mode in this campaign (imx585.c's own mode table crops the
- * OB rows/columns evenly, see WP-585-* and ASPECT-RATIOS.md), and the
- * only geometry the transport-vs-active SIZE difference alone can imply
- * without a separate per-axis offset from the driver. No pixel data is
- * ever touched by this -- only which sub-rectangle of the buffer already
- * written is the real picture.
+ * WHY CENTRING, AND NOT THE DRIVER'S crop_left/crop_top (rework note,
+ * WP-CPR-3 review round 2, finding C4-followup):
+ *
+ * DriverModeMetadata.crop_left/crop_top (core/driver_mode_metadata.hpp)
+ * look like the obvious "real" origin to thread through here instead of
+ * guessing by centring -- WP-CPR-2 already probes them and cinepi_raw.cpp
+ * has them in scope right next to the setActivePictureSize() call. They
+ * are NOT usable for that, because they answer a different question.
+ * Per WP-585-1 (WORK-PACKAGES.md) those fields are the sensor's readout
+ * WINDOW position in native pixel-array coordinates -- what libcamera
+ * needs to compute ScalerCrop/zoom and what `--list-cameras` prints as
+ * e.g. `(480, 0)/2880x2160` for the 1440x1080 2x2 window (WP-585-1's own
+ * worked example, also the imx585 experimental-crop-modes case this
+ * package's own open_questions #2 flagged). That number is non-zero
+ * precisely for a WINDOWED mode -- one reading fewer than the full
+ * 3840x2160 array -- and is 0,0 for every full-field mode, INCLUDING the
+ * one mode this campaign ships today (3840x2200 RAW16 ClearHDR): its
+ * crop.top is 0 per WP-585-1's own invariant table ("non-windowed entries
+ * keep the full active area"), even though the delivered buffer's real
+ * picture starts 20 rows in. Using crop_top as the DNG origin would
+ * therefore write origin_y = 0 for that shipped mode -- wrong, and a
+ * regression against the tested, Pi-gated behaviour (test_padded_raw16_
+ * crop_tags below expects 20). The two origins are unrelated: crop_left/
+ * crop_top locate the readout window ON THE SENSOR; DefaultCropOrigin
+ * locates the active picture WITHIN THIS FRAME'S OWN DELIVERED BUFFER,
+ * whose optical-black padding (ASPECT-RATIOS.md: "RAW16 ClearHDR adds the
+ * sensor's optical-black rows... split evenly") is a vertical-only
+ * property of the RAW16 packing, independent of where that window sits on
+ * the sensor.
+ *
+ * What IS safe to take from crop_left/crop_top -- and what this function
+ * now does -- is use them as a GATE, not a value: the transport-vs-active
+ * centring formula below is verified only for a full-field mode
+ * (crop_left == crop_top == 0). A genuine windowed readout's buffer-local
+ * padding geometry is not established by this campaign -- WP-283-7
+ * (WORK-PACKAGES.md) independently records that a centred SENSOR crop can
+ * still land on an odd, non-obviously-symmetric origin once register
+ * base offsets are involved, which is exactly the kind of case that would
+ * make blind centring wrong here too. So `sensor_window_crop == true`
+ * (the caller's crop_left/crop_top were non-zero) makes this function
+ * refuse outright, same as an oversized crop below, rather than guess.
+ * This must be revisited -- with real per-mode geometry, not a formula --
+ * before a Pi gate (G7 or later) exercises a windowed/cropped RAW16 mode
+ * (the imx585 experimental crop family, or imx283 via WP-283-5) and
+ * expects crop tags on it; until then such a mode simply gets no crop
+ * tags, exactly like a stock sensor with no metadata at all.
+ *
+ * The active picture IS assumed CENTRED in the delivered buffer for the
+ * full-field case this guards for: true for every full-field padded mode
+ * in this campaign (imx585.c's own mode table crops the OB rows evenly,
+ * see WP-585-* and ASPECT-RATIOS.md), and the only geometry the
+ * transport-vs-active SIZE difference alone can imply without a separate
+ * per-axis offset from the driver. No pixel data is ever touched by this
+ * -- only which sub-rectangle of the buffer already written is the real
+ * picture.
  *
  * `active_width`/`active_height` are std::nullopt for a stock sensor
  * (every one of them today: none expose the five named geometry
@@ -61,7 +109,8 @@ struct DngCropRect
 
 inline DngCropRect computeDngCropRect(uint32_t transport_width, uint32_t transport_height,
                                        std::optional<uint32_t> active_width,
-                                       std::optional<uint32_t> active_height)
+                                       std::optional<uint32_t> active_height,
+                                       bool sensor_window_crop = false)
 {
     DngCropRect r;
 
@@ -73,6 +122,11 @@ inline DngCropRect computeDngCropRect(uint32_t transport_width, uint32_t transpo
 
     if (*active_width == transport_width && *active_height == transport_height)
         return r;   /* no padding: crop == full frame, same bytes as today */
+
+    if (sensor_window_crop)
+        return r;   /* refused: centring is unverified for a windowed sensor
+                       readout (driver-reported crop_left/crop_top != 0) --
+                       see the file comment above. */
 
     r.width    = *active_width;
     r.height   = *active_height;

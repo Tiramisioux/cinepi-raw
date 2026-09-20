@@ -75,11 +75,24 @@ public:
 	 * known, and hands the OUTPUT-domain size straight through (its own
 	 * native-sensor-coordinate crop_width/crop_height already divided by
 	 * the driver's linear binning -- see core/driver_mode_metadata.hpp and
-	 * cinepi/ifd_builder.hpp's computeDngCropRect()). */
-	void setActivePictureSize(std::optional<unsigned int> width, std::optional<unsigned int> height)
+	 * cinepi/ifd_builder.hpp's computeDngCropRect()).
+	 *
+	 * `sensor_window_crop` is the caller's driver_meta.crop_left != 0 ||
+	 * driver_meta.crop_top != 0 (native sensor coordinates, WP-585-1):
+	 * whether this mode reads a WINDOW of the sensor rather than the full
+	 * field. It is NOT an origin -- see ifd_builder.hpp's file comment for
+	 * why crop_left/crop_top cannot be used as one -- only a gate that
+	 * makes computeDngCropRect() refuse rather than centre-guess for a
+	 * windowed readout, whose buffer-local padding geometry this campaign
+	 * has not established. Defaults to false, which is correct whenever
+	 * `width`/`height` are std::nullopt (the gate is never consulted) and
+	 * matches every full-field mode this campaign ships today. */
+	void setActivePictureSize(std::optional<unsigned int> width, std::optional<unsigned int> height,
+							   bool sensor_window_crop = false)
 	{
 		active_picture_width_  = width;
 		active_picture_height_ = height;
+		active_picture_is_sensor_window_crop_ = sensor_window_crop;
 	}
 
 	// Encode the given buffer.
@@ -400,6 +413,7 @@ private:
         bool sensor_mode_trusted_ = true;
         std::optional<unsigned int> active_picture_width_;
         std::optional<unsigned int> active_picture_height_;
+        bool active_picture_is_sensor_window_crop_ = false;
 
         /* The CCMP decompand table for this configuration, or nullptr when the
          * mode is not 12-bit ClearHDR. Owned by the process-wide cache in
