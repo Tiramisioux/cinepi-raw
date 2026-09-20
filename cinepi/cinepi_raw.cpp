@@ -16,6 +16,8 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include "cinepi_options.hpp"
+#include "core/driver_mode_metadata.hpp"
+#include "sensor_binning_source.hpp"
 #include <libcamera/controls.h>
 
 
@@ -166,7 +168,25 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			// Same snapshot, same reason: the CCMP decompand table is selected
 			// on the BINNING of the stream the camera actually configured —
 			// cfg.size, not the (possibly since-mutated) requested mode.
-			app.GetEncoder()->setSensorBinning(app.SensorBinning(cfg.size.width, cfg.size.height));
+			//
+			// WP-CPR-2 (finding C2): the active-area/delivered-size ratio
+			// below is wrong for a window crop (a 1440x1080 2x2 window rounds
+			// to 6, a 1x1 1920x1120 crop rounds to 4 when the truth is 1),
+			// which is exactly the case the aspect-ratio family and the
+			// windowed HDR modes introduce. Prefer the sensor driver's own
+			// "Mode Binning"/"Mode Crop *" controls when it exposes them and
+			// the value is sane; a stock sensor (or a driver not yet carrying
+			// WP-585-1/WP-283-5) reports no such control, so this falls back
+			// to the ratio exactly as before — see sensor_binning_source.hpp.
+			DriverModeMetadata driver_meta;
+			const bool have_driver_meta = read_driver_mode_metadata(driver_meta);
+			const SensorBinningDecision binning_decision = choose_sensor_binning(
+				have_driver_meta ? std::optional<int>(driver_meta.binning) : std::nullopt,
+				app.SensorBinning(cfg.size.width, cfg.size.height));
+			console->info("Sensor binning {} (source: {})", binning_decision.binning,
+						   binning_decision.source == SensorBinningSource::kDriver
+							   ? "driver" : "ratio");
+			app.GetEncoder()->setSensorBinning(binning_decision.binning);
 			// Tell the encoder whether the two snapshots above can be
 			// believed at all — see setSensorModeTrusted()'s comment.
 			app.GetEncoder()->setSensorModeTrusted(mode_trusted);
