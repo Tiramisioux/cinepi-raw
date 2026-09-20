@@ -53,6 +53,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include "core/buffer_sync.hpp"
+#include "core/driver_mode_metadata.hpp"
 #include "core/rpicam_app.hpp"
 #include "core/stream_info.hpp"
 #include "post_processing_stages/post_processing_stage.hpp"
@@ -61,6 +62,7 @@
 #include "ccmp_preview.hpp"
 #include "clip_ceiling.hpp"
 #include "cinepi_recorder.hpp"
+#include "sensor_binning_source.hpp"
 
 using Stream = libcamera::Stream;
 
@@ -314,8 +316,24 @@ void ccmpPreviewStage::Configure()
 	 *
 	 * Skipped entirely when linear: 16-bit ClearHDR never went through the
 	 * compander, so there is no table to be missing and nothing for a binning
-	 * factor to key. */
-	const double binning = static_cast<CinePIRecorder *>(app_)->SensorBinning(raw_info.width, raw_info.height);
+	 * factor to key.
+	 *
+	 * WP-CPR-2 rework: this used to call SensorBinning() directly, the same
+	 * wrong ratio finding C2 describes (see sensor_binning_source.hpp) —
+	 * round(2.67)*round(2)=6 for a 1440x1080 2x2 window, which get_ccmp_lut()
+	 * below then refuses, leaving the LIVE preview magenta even after
+	 * cinepi_raw.cpp/dng_encoder.cpp were fixed to prefer the driver's own
+	 * "Mode Binning" control. This is a second, independent consumer of
+	 * "which binning to trust" (recording-time decompand vs. live preview),
+	 * so it needs the same read_driver_mode_metadata()/choose_sensor_binning()
+	 * sequence, bound to this process's own camera the same way — see that
+	 * call site's comment in cinepi_raw.cpp. */
+	DriverModeMetadata driver_meta;
+	const bool have_driver_meta = read_driver_mode_metadata(driver_meta, app_->CameraId());
+	const SensorBinningDecision binning_decision = choose_sensor_binning(
+		have_driver_meta ? std::optional<int>(driver_meta.binning) : std::nullopt,
+		static_cast<CinePIRecorder *>(app_)->SensorBinning(raw_info.width, raw_info.height));
+	const double binning = binning_decision.binning;
 	std::string err;
 	const CcmpLut *lut = nullptr;
 	if (!linear)

@@ -66,7 +66,12 @@ enum class SubdevBindingResult
 struct SubdevBindingDecision
 {
 	SubdevBindingResult result;
-	int index; /* into the `candidates` vector passed in; -1 unless kUseCandidate */
+	int index; /* the raw /dev/v4l-subdevN index (0..31) of the matched
+	            * candidate -- i.e. candidates[i].first for whichever pair
+	            * matched, NOT a position into the `candidates` vector itself.
+	            * See core/driver_mode_metadata.hpp's `c.index == decision.index`
+	            * match, which compares against that same raw subdev index.
+	            * -1 unless kUseCandidate. */
 };
 
 /*
