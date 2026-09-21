@@ -87,7 +87,12 @@ struct DriverModeMetadata
 namespace driver_mode_metadata_detail
 {
 
-inline int xioctl(int fd, unsigned long ctl, void *arg)
+/* Deliberately NOT called `xioctl`. A translation unit that includes this header
+ * may have its own file-scope `xioctl` -- core/options.cpp does -- and because the
+ * v4l2 argument types live in the global namespace, argument-dependent lookup adds
+ * that one beside this one at every unqualified call, which is ambiguous and does
+ * not compile. The name carries the namespace so the two can never collide. */
+inline int metadata_ioctl(int fd, unsigned long ctl, void *arg)
 {
 	int ret, num_tries = 10;
 	do
@@ -126,7 +131,7 @@ inline bool read_control_value(int fd, __u32 id, int &value)
 	ctrls.count = 1;
 	ctrls.controls = &ctrl;
 
-	if (xioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) == 0)
+	if (metadata_ioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) == 0)
 	{
 		value = ctrl.value;
 		return true;
@@ -135,7 +140,7 @@ inline bool read_control_value(int fd, __u32 id, int &value)
 	// Some drivers only answer the legacy user-control ioctl for a custom
 	// control; try it before giving up.
 	v4l2_control legacy{ id, 0 };
-	if (xioctl(fd, VIDIOC_G_CTRL, &legacy) == 0)
+	if (metadata_ioctl(fd, VIDIOC_G_CTRL, &legacy) == 0)
 	{
 		value = legacy.value;
 		return true;
@@ -154,7 +159,7 @@ inline bool find_control_by_name(int fd, const char *name, __u32 hint_id, __u32 
 	{
 		v4l2_queryctrl q{};
 		q.id = hint_id;
-		if (xioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 &&
+		if (metadata_ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 &&
 			!(q.flags & V4L2_CTRL_FLAG_DISABLED) &&
 			control_name(q) == name)
 		{
@@ -165,7 +170,7 @@ inline bool find_control_by_name(int fd, const char *name, __u32 hint_id, __u32 
 
 	v4l2_queryctrl q{};
 	q.id = V4L2_CTRL_FLAG_NEXT_CTRL;
-	while (xioctl(fd, VIDIOC_QUERYCTRL, &q) == 0)
+	while (metadata_ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0)
 	{
 		if (!(q.flags & V4L2_CTRL_FLAG_DISABLED) && control_name(q) == name)
 		{

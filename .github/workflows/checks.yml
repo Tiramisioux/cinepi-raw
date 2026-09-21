@@ -89,6 +89,11 @@ jobs:
           build_and_run lores_fit
           build_and_run sensor_binning_source
           build_and_run subdev_binding
+          # A compile-only test: it needs the stub kernel headers in
+          # tests/stub-linux/ and has no binary to run.
+          echo "== driver_mode_metadata_adl (compile only)"
+          g++ -std=c++17 -fsyntax-only -Wall -Wextra -I. -Itests/stub-linux \
+              tests/driver_mode_metadata_adl_test.cpp
 
           exit "$fail"
 

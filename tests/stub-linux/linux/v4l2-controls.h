@@ -1,0 +1,5 @@
+#pragma once
+#define V4L2_CID_USER_BASE        0x00980900
+#define V4L2_CTRL_FLAG_DISABLED   0x0001
+#define V4L2_CTRL_FLAG_NEXT_CTRL  0x80000000u
+#define V4L2_CTRL_ID2CLASS(id)    ((id) & 0x0fff0000UL)
