@@ -131,6 +131,17 @@ lores_fit_test = executable('lores_fit_test',
            install : false)
 test('lores_fit', lores_fit_test)
 
+# A COMPILE-ONLY check, deliberately built but never registered with test(): building
+# it IS the check. core/driver_mode_metadata.hpp reaches into <linux/videodev2.h>, so
+# this target compiles against the stub headers in tests/stub-linux/ rather than the
+# real ones -- the point is name resolution in a translation unit that also has its own
+# `xioctl`, which is what broke the build on the camera once, not the kernel structs.
+# Running the binary would issue real ioctls, so it is not a test() target.
+driver_mode_metadata_adl_test = executable('driver_mode_metadata_adl_test',
+           '../tests/driver_mode_metadata_adl_test.cpp',
+           include_directories : [include_directories('..'), include_directories('../tests/stub-linux')],
+           install : false)
+
 # Unit tests for IFDBuilder's multi-IFD chaining contract (C9 Phase 0's
 # embedded DNG thumbnail). No libcamera deps — it includes only
 # cinepi/ifd_builder.hpp. Run with `meson test`.
