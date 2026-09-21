@@ -86,6 +86,9 @@ jobs:
           build_and_run clip_ceiling \
             -DCLIP_CEILING_DATA_DIR="\"${PWD}/tests/data\""
           build_and_run mjpeg_static_response
+          build_and_run lores_fit
+          build_and_run sensor_binning_source
+          build_and_run subdev_binding
 
           exit "$fail"
 
