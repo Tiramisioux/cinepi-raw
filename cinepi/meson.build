@@ -120,6 +120,17 @@ subdev_binding_test = executable('subdev_binding_test',
            install : false)
 test('subdev_binding', subdev_binding_test)
 
+# Unit tests for fitting a requested lores/preview stream size inside the raw
+# stream's delivered size (cinepi/lores_fit.hpp) -- WP-CPR-1 / finding C1:
+# RPiCamApp::ConfigureVideo used to throw "Low res image larger than raw
+# image" instead of fitting the request. No libcamera deps. Run with
+# `meson test`.
+lores_fit_test = executable('lores_fit_test',
+           '../tests/lores_fit_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('lores_fit', lores_fit_test)
+
 # Unit tests for IFDBuilder's multi-IFD chaining contract (C9 Phase 0's
 # embedded DNG thumbnail). No libcamera deps — it includes only
 # cinepi/ifd_builder.hpp. Run with `meson test`.
