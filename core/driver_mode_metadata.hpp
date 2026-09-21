@@ -88,6 +88,18 @@ struct DriverModeMetadata
 	int binning = 0;      /* linear factor: 1, 2, 3 ... NOT squared */
 	int crop_left = 0;
 	int crop_top = 0;
+	/* Where the picture starts inside the TRANSPORT FRAME, in that frame's
+	 * own pixels -- a different space from crop_left/crop_top, which are
+	 * native sensor coordinates for FOV bookkeeping and were never usable
+	 * as a DNG origin (see this file's comment and ifd_builder.hpp).
+	 *
+	 * Optional: `active_origin_known` is false for a driver that does not
+	 * expose the "Mode Active Left"/"Mode Active Top" pair, which is every
+	 * driver except the imx283 today. A caller must keep whatever it did
+	 * before in that case -- absent means UNKNOWN, never zero. */
+	int active_left = 0;
+	int active_top = 0;
+	bool active_origin_known = false;
 	int crop_width = 0;
 	int crop_height = 0;
 	bool valid = false;
@@ -301,6 +313,19 @@ inline bool read_driver_mode_metadata(DriverModeMetadata &m, const std::string &
 			read_control_value(fd, id_width, width) &&
 			read_control_value(fd, id_height, height);
 
+		/* Optional pair, looked up by name with no fallback id: a driver
+		 * that does not have them is not disqualified, it just leaves the
+		 * active origin unknown. Both or neither -- half an origin is not
+		 * usable, and accepting one would silently make the other zero. */
+		__u32 id_active_left = 0, id_active_top = 0;
+		int active_left = 0, active_top = 0;
+		const bool active_ok =
+			find_control_by_name(fd, "Mode Active Left", 0, id_active_left) &&
+			find_control_by_name(fd, "Mode Active Top", 0, id_active_top) &&
+			read_control_value(fd, id_active_left, active_left) &&
+			read_control_value(fd, id_active_top, active_top) &&
+			active_left >= 0 && active_top >= 0;
+
 		close(fd);
 
 		if (!ok || binning < 1 || binning > kMaxSaneBinning ||
@@ -313,6 +338,12 @@ inline bool read_driver_mode_metadata(DriverModeMetadata &m, const std::string &
 		candidate_meta.crop_top = top;
 		candidate_meta.crop_width = width;
 		candidate_meta.crop_height = height;
+		if (active_ok)
+		{
+			candidate_meta.active_left = active_left;
+			candidate_meta.active_top = active_top;
+			candidate_meta.active_origin_known = true;
+		}
 		candidate_meta.valid = true;
 
 		candidates.push_back({ i, candidate_meta });

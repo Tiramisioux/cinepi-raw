@@ -228,10 +228,15 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			// centres the active picture in the buffer on its own -- round
 			// 3's centring assumption does not hold for every sensor (the
 			// imx585's two RAW16 families do not even share one padding
-			// total, and the imx283's optical-black rows sit entirely at
-			// the top, not split). The origin is this call site's to
-			// justify, sensor by sensor, and today there is exactly ONE
-			// justified case: a genuine 16-bit sensor MODE (requested_bit_
+			// total, and the imx283's padding is not centred in either
+			// axis -- its optical-black COLUMNS lead and its ROWS trail,
+			// measured from DNGs on a CM5; an earlier version of this
+			// comment said its rows "sit entirely at the top", which is
+			// the wrong edge). The origin is this call site's to justify,
+			// sensor by sensor, except where the driver simply says --
+			// see the active_origin_known branch below, which the imx283
+			// now takes. Beyond that there is exactly ONE justified
+			// inference: a genuine 16-bit sensor MODE (requested_bit_
 			// depth == 16, and only when mode_trusted -- the same guard
 			// setSensorModeTrusted() uses, because an untrusted bit depth
 			// cannot be believed to be 16 any more than it can be believed
@@ -258,11 +263,37 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 					static_cast<unsigned int>(driver_meta.crop_height / driver_meta.binning);
 
 				std::optional<unsigned int> origin_x, origin_y;
-				if (mode_trusted && requested_bit_depth == 16 && cfg.size.height > active_height)
+				if (driver_meta.active_origin_known)
+				{
+					// The driver said where the picture starts inside the
+					// frame it sends ("Mode Active Left"/"Mode Active Top").
+					// That beats anything inferred here, and it is the only
+					// way to be right about a sensor whose padding is not
+					// symmetric: the imx283 puts its optical-black columns
+					// LEADING and its rows TRAILING, measured on a CM5 at
+					// 3936x2176 (cols 0..95 black, rows 2160..2175 zero) and
+					// 2784x1828 (cols 0..47 black, rows 1824..1827 zero).
+					// Centring, or assuming vertical-only padding, would be
+					// wrong in both axes there.
+					//
+					// Bounds-checked against this frame rather than trusted
+					// blind, because a wrong ActiveArea silently crops a
+					// take: computeDngCropRect() refuses anything claiming
+					// more than the frame holds, and these two are what it
+					// checks the claim with.
+					if (driver_meta.active_left >= 0 && driver_meta.active_top >= 0)
+					{
+						origin_x = static_cast<unsigned int>(driver_meta.active_left);
+						origin_y = static_cast<unsigned int>(driver_meta.active_top);
+					}
+				}
+				else if (mode_trusted && requested_bit_depth == 16 && cfg.size.height > active_height)
 				{
 					// imx585 RAW16: no horizontal OB padding in any table
 					// (advertised width always equals active width), and the
-					// vertical padding splits evenly top/bottom.
+					// vertical padding splits evenly top/bottom. Unchanged --
+					// that driver does not report the active origin, and this
+					// inference stays its answer until it does.
 					origin_x = 0u;
 					origin_y = (cfg.size.height - active_height) / 2;
 				}
