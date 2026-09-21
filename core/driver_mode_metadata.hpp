@@ -24,7 +24,7 @@
  * and the walk still runs when the guess misses.
  *
  * Values are reported by the driver in NATIVE SENSOR COORDINATES: binning is
- * the linear factor (1 or 2, never the squared "pixels summed" factor), and
+ * the linear factor (1, 2, 3 ... never the squared "pixels summed" factor), and
  * crop_left/top/width/height are the sensor-side readout window. Squaring
  * the binning into the samples-per-pixel factor the CCMP tables key on
  * (cinepi/ccmp_lut.hpp's kT1Effective, 1 or 4) is the CALLER's job — see
@@ -71,12 +71,21 @@
 
 #include "cinepi/subdev_binding.hpp"
 
+/* Upper bound on a believable linear binning factor. A sanity rail, not a
+ * statement about any sensor: sensors in this stack program 1, 2 or 3, and
+ * the point of the check is to reject a control that was never updated (0),
+ * a negative stray, or a wild read -- not to enumerate what drivers may do.
+ * Set it above what is plausible rather than at what is currently shipped,
+ * because the failure mode of setting it too low is silent (see the
+ * kMaxSaneBinning note on driver_mode_metadata() below). */
+static constexpr int kMaxSaneBinning = 8;
+
 /* The driver's answer for the currently active mode, in native sensor
  * coordinates. `valid` is false until a sub-device has been found that
  * exposes all five controls by name with sane values. */
 struct DriverModeMetadata
 {
-	int binning = 0;      /* linear factor: 1 or 2, NOT squared */
+	int binning = 0;      /* linear factor: 1, 2, 3 ... NOT squared */
 	int crop_left = 0;
 	int crop_top = 0;
 	int crop_width = 0;
@@ -221,11 +230,28 @@ inline std::string subdev_sysfs_name(int index)
  * such sub-device the hint changes nothing — that candidate is used either
  * way, exactly as before this parameter existed.
  *
- * A sane binning is 1 or 2 (imx585_program_window and its imx283 equivalent
- * only ever program 1x1 or 2x2). Anything else — 0 (never updated), a
- * negative stray, or something larger — is treated as "no metadata" so a
- * caller falls back to its own derivation rather than trusting a bogus
- * value.
+ * A sane binning is 1..kMaxSaneBinning. Anything else — 0 (never updated),
+ * a negative stray, or something implausibly large — is treated as "no
+ * metadata" so a caller falls back to its own derivation rather than
+ * trusting a bogus value.
+ *
+ * This used to read `binning > 2`, on the stated grounds that "imx585 and
+ * its imx283 equivalent only ever program 1x1 or 2x2". That was true of
+ * the imx585 and never true of the imx283: IMX283_MODE_3 is a 3x3 readout,
+ * it is not experimental, and it is listed. The bound was in fact the
+ * imx585 control's own .max = 2 copied into a shared reader, and the cost
+ * was silent — a rejected candidate drops the WHOLE annotation, so on the
+ * first imx283 hardware run its 1856x1220 mode came out of --list-cameras
+ * as a bare `[60.36 fps - (0, 0)/5472x3648 crop]` with no binning or
+ * mode-crop clause at all, while the other 20 modes carried theirs. It
+ * read as a driver gap; it was this line.
+ *
+ * KNOWN GAP, not fixed here: "Mode Binning" is a single integer, so it
+ * cannot express an asymmetric ratio. The imx283's 3x1 subsampling modes
+ * (MODE_4, MODE_5) report 3 per DEC-4's "report the horizontal ratio",
+ * which a consumer will read as 3x3. Both are gated off behind that
+ * driver's experimental_modes param today. Expressing them needs a second
+ * control and a contract change on both sides.
  *
  * When more than one sub-device qualifies and the hint does not pick out
  * exactly one of them (no hint given, or it matches zero or more than one),
@@ -277,7 +303,7 @@ inline bool read_driver_mode_metadata(DriverModeMetadata &m, const std::string &
 
 		close(fd);
 
-		if (!ok || binning < 1 || binning > 2 ||
+		if (!ok || binning < 1 || binning > kMaxSaneBinning ||
 			left < 0 || top < 0 || width <= 0 || height <= 0)
 			continue;
 
