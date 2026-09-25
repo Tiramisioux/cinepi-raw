@@ -100,6 +100,38 @@ struct DriverModeMetadata
 	int active_left = 0;
 	int active_top = 0;
 	bool active_origin_known = false;
+
+	/* The picture's own SIZE inside the TRANSPORT FRAME, in that frame's
+	 * own pixels -- the same space as active_left/active_top above, and a
+	 * different space from crop_width/crop_height below, which are native
+	 * sensor coordinates (the readout window's size on the sensor, not
+	 * the delivered buffer's).
+	 *
+	 * Why this cannot just be derived from crop_width/crop_height by
+	 * dividing out the binning, the way callers used to: on a 2x2-binned
+	 * imx283 mode the transport frame is 32 columns narrower than
+	 * crop_width/binning predicts -- measured from two DNGs recorded a
+	 * day apart whose trailing 32 columns are byte-identical, which is
+	 * only possible if that band is stale buffer and not sensor data
+	 * (development/imx283-active-size/BRIEF.md has the two frames' full
+	 * tag readout). The shortfall happens AFTER binning, so no ratio
+	 * applied to a BEFORE-binning number can ever reproduce it; only the
+	 * driver that produced the frame knows its own answer.
+	 *
+	 * Optional, same contract as active_origin_known immediately above:
+	 * `active_size_known` is false for a driver that does not expose the
+	 * "Mode Active Width"/"Mode Active Height" pair -- as of this writing
+	 * that is every driver, INCLUDING the imx283's "Mode Active Left"/
+	 * "Mode Active Top" driver: it has the origin pair but not this one
+	 * yet (development/imx283-active-size/BRIEF.md, Step 1). Both or
+	 * neither -- half a size is not usable, and accepting one would
+	 * silently make the other zero. A caller must keep whatever it did
+	 * before (its own ratio-derived fallback) when this is false, exactly
+	 * as for the origin pair. */
+	int active_width = 0;
+	int active_height = 0;
+	bool active_size_known = false;
+
 	int crop_width = 0;
 	int crop_height = 0;
 	bool valid = false;
@@ -326,6 +358,22 @@ inline bool read_driver_mode_metadata(DriverModeMetadata &m, const std::string &
 			read_control_value(fd, id_active_top, active_top) &&
 			active_left >= 0 && active_top >= 0;
 
+		/* Second optional pair, same contract as active_left/active_top
+		 * immediately above: both or neither, and a driver without it is
+		 * not disqualified -- it just leaves active_size_known false, so
+		 * the caller keeps deriving the size from crop_width/crop_height
+		 * and the binning ratio exactly as it always has. See this
+		 * struct's own comment (above) for why that ratio cannot be
+		 * trusted to replace this pair on every driver. */
+		__u32 id_active_width = 0, id_active_height = 0;
+		int active_width = 0, active_height = 0;
+		const bool active_size_ok =
+			find_control_by_name(fd, "Mode Active Width", 0, id_active_width) &&
+			find_control_by_name(fd, "Mode Active Height", 0, id_active_height) &&
+			read_control_value(fd, id_active_width, active_width) &&
+			read_control_value(fd, id_active_height, active_height) &&
+			active_width > 0 && active_height > 0;
+
 		close(fd);
 
 		if (!ok || binning < 1 || binning > kMaxSaneBinning ||
@@ -343,6 +391,12 @@ inline bool read_driver_mode_metadata(DriverModeMetadata &m, const std::string &
 			candidate_meta.active_left = active_left;
 			candidate_meta.active_top = active_top;
 			candidate_meta.active_origin_known = true;
+		}
+		if (active_size_ok)
+		{
+			candidate_meta.active_width = active_width;
+			candidate_meta.active_height = active_height;
+			candidate_meta.active_size_known = true;
 		}
 		candidate_meta.valid = true;
 
