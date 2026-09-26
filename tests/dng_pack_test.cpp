@@ -919,12 +919,70 @@ static void test_unpack_pisp_comp1_row_to_packed10() {
     }
 }
 
+
+/* An ODD row width must not read past the source row or write past the
+ * destination row.
+ *
+ * pack_row_12bit()/pack_row_16_to_12bit() used to loop `x < width; x += 2`
+ * and read src[x + 1] unconditionally, so an odd width read one uint16 past
+ * the row and wrote a third byte into a buffer sized (width*12+7)/8 -- a
+ * one-byte heap overflow on every row of every frame. AddressSanitizer
+ * reports it as a heap-buffer-overflow READ in pack_row_12bit.
+ *
+ * This was reachable from an ordinary mode, not a corner case: the imx283's
+ * aspect-ratio table carries widths 2975, 3055, 2093, 2155, 2355, 2473,
+ * 1649 and 1697. pack_row_10bit() had already been hardened for the same
+ * shape; these two had not.
+ *
+ * The widths below are those eight, plus the two even ones that were always
+ * fine, so a regression shows up as a failure rather than as a silent
+ * corruption of the last column. */
+static void test_pack_12bit_odd_width_stays_in_bounds() {
+    std::printf("\n-- pack_row_12bit / pack_row_16_to_12bit: odd widths --\n");
+    const uint32_t widths[] = { 2975, 3055, 2093, 2155, 2355, 2473, 1649, 1697,
+                                2784, 2144, 1, 2, 3 };
+    for (uint32_t w : widths) {
+        const size_t need = (size_t(w) * 12 + 7) / 8;
+        const uint8_t guard = 0x5A;
+        std::vector<uint16_t> src(w, 0x0ABC);
+        std::vector<uint8_t> dst(need + 8, guard);
+
+        pack_row_12bit(src.data(), dst.data(), w);
+        bool clean = true;
+        for (size_t i = need; i < dst.size(); ++i)
+            if (dst[i] != guard) clean = false;
+        CHECK(clean, "pack_row_12bit writes no byte past (width*12+7)/8");
+
+        std::vector<uint16_t> src16(w, 0xABC0);
+        std::vector<uint8_t> dst16(need + 8, guard);
+        pack_row_16_to_12bit(src16.data(), dst16.data(), w);
+        clean = true;
+        for (size_t i = need; i < dst16.size(); ++i)
+            if (dst16[i] != guard) clean = false;
+        CHECK(clean, "pack_row_16_to_12bit writes no byte past (width*12+7)/8");
+    }
+
+    /* The pixels that ARE in range must still be packed correctly, and the
+     * odd row's final pixel must survive with its padding nibble zeroed. */
+    {
+        const uint32_t w = 3;
+        uint16_t src[3] = { 0x123, 0x456, 0x789 };
+        uint8_t dst[(3 * 12 + 7) / 8] = {};
+        pack_row_12bit(src, dst, w);
+        CHECK(dst[0] == 0x12 && dst[1] == 0x34 && dst[2] == 0x56,
+              "odd row: the leading pair packs unchanged");
+        CHECK(dst[3] == 0x78 && dst[4] == 0x90,
+              "odd row: the final pixel keeps its 12 bits and zero padding");
+    }
+}
+
 int main() {
     std::printf("=== dng_pack unit tests ===\n");
     // Tier 1
     test_pack_row_16_to_12bit();
     test_right_justify_row();
     test_pack_row_12bit();
+    test_pack_12bit_odd_width_stays_in_bounds();
     test_pack_row_10bit();
     test_pack_row_16_to_10bit();
     test_round_16_to_10bit();

@@ -433,6 +433,22 @@ bool Options::Parse(int argc, char *argv[])
 						DriverModeMetadata driver_meta;
 						const bool have_driver_meta = read_driver_mode_metadata(driver_meta, cam->id());
 
+						// The active picture's own rectangle inside the TRANSPORT
+						// frame (a different space from crop_left/top/width/height
+						// just above, which are native SENSOR coordinates -- see
+						// core/driver_mode_metadata.hpp's active_left/active_width
+						// comments). Printed here so CineMate can stop deriving the
+						// active picture by dividing the sensor-side crop by the
+						// binning ratio (development/imx283-active-size/ROUND2.md,
+						// Defect D's prerequisite: that ratio is measurably wrong
+						// on a 2x2-binned imx283 mode, see driver_mode_metadata.hpp).
+						// Both pairs (origin, size) must be known together, or a
+						// caller would have a half rectangle to parse -- either one
+						// missing skips this clause exactly as `have_driver_meta`
+						// already gates the mode-crop clause above.
+						const bool have_active_rect = have_driver_meta && driver_meta.active_origin_known &&
+							driver_meta.active_size_known;
+
 						std::ostringstream signature;
 						signature << size.width << "x" << size.height;
 						if (have_driver_meta)
@@ -441,6 +457,11 @@ bool Options::Parse(int argc, char *argv[])
 							  << "/" << driver_meta.crop_top
 							  << "/" << driver_meta.crop_width
 							  << "/" << driver_meta.crop_height;
+						if (have_active_rect)
+							signature << "/" << driver_meta.active_left
+							  << "/" << driver_meta.active_top
+							  << "/" << driver_meta.active_width
+							  << "/" << driver_meta.active_height;
 						if (!seen_modes.insert(signature.str()).second)
 							continue;
 
@@ -457,6 +478,18 @@ bool Options::Parse(int argc, char *argv[])
 								  << driver_meta.crop_top << ")/"
 								  << driver_meta.crop_width << "x"
 								  << driver_meta.crop_height;
+						}
+						if (have_active_rect)
+						{
+							// Deliberately appended AFTER the existing "binning
+							// .../mode-crop ..." clause, in the same "(x,y)/WxH"
+							// shape, so CineMate's existing regex parser for that
+							// text is unaffected -- this is new text alongside it,
+							// not a rewrite of it.
+							std::cout << "; active (" << driver_meta.active_left << ","
+								  << driver_meta.active_top << ")/"
+								  << driver_meta.active_width << "x"
+								  << driver_meta.active_height;
 						}
 						std::cout << "]";
 

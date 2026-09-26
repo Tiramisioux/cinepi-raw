@@ -255,12 +255,50 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			// imx585 mode that is not 16-bit -- gets no origin, so
 			// computeDngCropRect() refuses the crop tags exactly as it
 			// does for a stock sensor with no metadata at all.
+			//
+			// Step 1 (development/imx283-active-size/BRIEF.md): the
+			// crop_width/crop_height-over-binning ratio just below is
+			// itself wrong on a 2x2-binned imx283 mode -- its transport
+			// frame is measurably 32 columns narrower than that ratio
+			// predicts, because the shortfall happens AFTER binning and no
+			// BEFORE-binning ratio can reproduce a post-binning loss. So
+			// the ratio is now only the fallback: when the driver also
+			// reports its own transport-frame SIZE (active_size_known, the
+			// "Mode Active Width"/"Mode Active Height" pair -- no driver
+			// ships it yet, but the imx283 already ships the matching
+			// origin pair used below), that size is used instead, bounds-
+			// checked against this frame the same way the origin is. See
+			// the local active_size_trusted just below and
+			// core/driver_mode_metadata.hpp's active_width/active_height
+			// comment for the measurement.
 			if (have_driver_meta)
 			{
-				const unsigned int active_width =
+				// The ratio-derived size (see the Step 1 paragraph above)
+				// is kept as the fallback for every driver that does not
+				// report its own transport-frame size.
+				const unsigned int ratio_active_width =
 					static_cast<unsigned int>(driver_meta.crop_width / driver_meta.binning);
-				const unsigned int active_height =
+				const unsigned int ratio_active_height =
 					static_cast<unsigned int>(driver_meta.crop_height / driver_meta.binning);
+
+				// Bounds-checked against cfg.size (this call's own
+				// transport frame) before the driver's size is trusted:
+				// computeDngCropRect() already refuses an ActiveArea
+				// claiming more than the buffer holds, but that refusal
+				// fires silently at the very last moment, which is worse
+				// than declining to use a bad value here, one comment
+				// above the rejection.
+				const bool active_size_trusted =
+					driver_meta.active_size_known &&
+					driver_meta.active_width > 0 && driver_meta.active_height > 0 &&
+					static_cast<unsigned int>(driver_meta.active_width) <= cfg.size.width &&
+					static_cast<unsigned int>(driver_meta.active_height) <= cfg.size.height;
+				const unsigned int active_width =
+					active_size_trusted ? static_cast<unsigned int>(driver_meta.active_width)
+										 : ratio_active_width;
+				const unsigned int active_height =
+					active_size_trusted ? static_cast<unsigned int>(driver_meta.active_height)
+										 : ratio_active_height;
 
 				std::optional<unsigned int> origin_x, origin_y;
 				if (driver_meta.active_origin_known)
@@ -299,9 +337,25 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 				}
 
 				app.GetEncoder()->setActivePictureSize(active_width, active_height, origin_x, origin_y);
+
+				// Same geometry, same probe, applied to the PREVIEW path
+				// instead of the DNG: development/imx283-active-size/
+				// ROUND2.md, Defect B. Keeping this alongside the encoder's
+				// own setActivePictureSize() call (rather than re-deriving
+				// active_width/height/origin_x/origin_y elsewhere) is what
+				// guarantees the preview crop can never disagree with the
+				// DNG's own ActiveArea tags.
+				controller.applyActivePictureCrop(origin_x, origin_y, active_width, active_height, cfg.size);
 			}
 			else
+			{
 				app.GetEncoder()->setActivePictureSize(std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+				// No driver metadata at all (stock sensor, or a probe that
+				// failed): nothing to compensate with, so clear any stale
+				// baseline from a previous mode and leave ScalerCrop at the
+				// ISP's own full-frame default.
+				controller.applyActivePictureCrop(std::nullopt, std::nullopt, 0, 0, cfg.size);
+			}
 			// Tell the encoder whether the two snapshots above can be
 			// believed at all — see setSensorModeTrusted()'s comment.
 			app.GetEncoder()->setSensorModeTrusted(mode_trusted);
@@ -338,6 +392,11 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			console->error("No camera frames received for 3s, attempting a camera restart!!!");
 			app.StopCamera();
 			app.StartCamera();
+			// StartCamera() just reset ScalerCrop to full frame -- the
+			// sensor mode itself has not changed, so reprogram the
+			// last-known OB-compensation baseline rather than re-probing the
+			// driver. development/imx283-active-size/ROUND2.md, Defect B.
+			controller.reapplyActivePictureCrop();
 			continue;
 		}
 		if (msg.type != CinePIRecorder::MsgType::RequestComplete)

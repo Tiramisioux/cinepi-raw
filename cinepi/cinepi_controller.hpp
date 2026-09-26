@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cmath>
 #include <algorithm>
+#include <optional>
 
 //external dependancies
 #include <sw/redis++/redis++.h>
@@ -142,6 +143,39 @@ class CinePIController : public CinePIState
         // defect class as cinemate's shutter_a set_value dedup after a mode
         // switch (cinemate fix/mode-switch-control-reapply).
         void resetZoomDedup() { last_zoom_.store(1.0); }
+
+        // ── Preview optical-black compensation ──────────────────────────────
+        // development/imx283-active-size/ROUND2.md, Defect B ("the preview
+        // bands"). ScalerCrop defaults to the whole sensor frame, which on
+        // this fork's sensors includes the leading optical-black band the
+        // sensor cannot drop at the source (imx283.c's own comment on
+        // HTRIMMING); every consumer of the lores stream shows that band as a
+        // dark strip. These set (or clear) the ScalerCrop baseline that keeps
+        // the ISP scaling only the active picture -- see
+        // cinepi/preview_active_crop.hpp for the mapping and
+        // cinepi_controller.cpp for the call sites.
+        //
+        // applyActivePictureCrop(): call once per mode (re)configure, right
+        // alongside the encoder's own setActivePictureSize() call in
+        // cinepi_raw.cpp -- same driver-metadata probe, same origin/size
+        // values, so the preview crop can never disagree with the DNG's own
+        // ActiveArea. originX/Y absent, or activeWidth/Height == 0, means "no
+        // active-picture geometry known": clears the baseline instead (the
+        // ISP's full-frame default is then already correct, or there is
+        // nothing trustworthy to compensate with).
+        void applyActivePictureCrop(std::optional<unsigned int> originX, std::optional<unsigned int> originY,
+                                     unsigned int activeWidth, unsigned int activeHeight,
+                                     const libcamera::Size &transportFrame);
+
+        // reapplyActivePictureCrop(): call after a camera restart that is NOT
+        // a mode reconfigure (the WaitFor timeout path in cinepi_raw.cpp,
+        // "attempting a camera restart"): ScalerCrop is reset to full frame
+        // by ANY StartCamera(), per the pre-existing comment at this class's
+        // resetZoomDedup(), so the last-applied baseline above must be
+        // reprogrammed. No-op (leaves the ISP default) when no baseline is
+        // currently known. Does not re-probe the driver: the sensor mode has
+        // not changed, so the last-known geometry is still correct.
+        void reapplyActivePictureCrop();
 
     // ── Dual-sensor record gate ─────────────────────────────────────────────
     // Which sensor(s) record the current take is published by cinemate in the
@@ -349,6 +383,60 @@ class CinePIController : public CinePIState
         // handler's dedup baseline. Written by the Redis subscriber thread,
         // reset from the main loop via resetZoomDedup(), hence atomic.
         std::atomic<double> last_zoom_{1.0};
+
+        // The OB-compensated "no zoom" ScalerCrop baseline (native sensor
+        // coordinates -- the same domain as ScalerCropMaximum), set by
+        // applyActivePictureCrop()/reapplyActivePictureCrop() and read by the
+        // zoom handlers so a zoom fraction composes WITHIN the active
+        // rectangle rather than the whole sensor frame (ROUND2.md Defect B,
+        // "It must compose with the existing zoom handler"). activeCropKnown_
+        // false means no active-picture geometry is known (or it covers the
+        // whole transport frame, i.e. no OB to compensate): the zoom handlers
+        // fall back to the full sensor rect, exactly their pre-existing
+        // behaviour.
+        //
+        // Written only from the main loop's event_loop() thread (StartCamera
+        // / restart handling), read from the Redis subscriber thread by the
+        // zoom handlers -- same cross-thread shape as last_zoom_ just above,
+        // which is why each field here is its own atomic rather than a
+        // plain libcamera::Rectangle (not atomic, and this file has no
+        // mutex anywhere else to protect one). Four independent atomics
+        // means a reader racing an in-progress write can observe a torn
+        // combination (e.g. a new x with a stale width) for one zoom
+        // command; the next zoom message reads a consistent set again. That
+        // is judged acceptable here because writes are rare (a mode change
+        // or a camera restart, not a per-frame event) and a torn read only
+        // ever produces a crop rectangle close to a real one the ISP has
+        // actually been asked for before or will be asked for next, never a
+        // fabricated one -- the same order of risk the rest of this file
+        // already accepts by using bare atomics instead of a lock for
+        // multi-field state (see cameraInit_/configChanged() beside it).
+        std::atomic_bool activeCropKnown_{ false };
+        std::atomic<int> activeCropX_{ 0 };
+        std::atomic<int> activeCropY_{ 0 };
+        std::atomic<unsigned int> activeCropWidth_{ 0 };
+        std::atomic<unsigned int> activeCropHeight_{ 0 };
+
+        // Reconstructs the current OB-compensated baseline from the atomics
+        // above, or returns `fallback` (the full sensor rect) when none is
+        // known -- the one place both zoom handlers get their "base"
+        // rectangle from, so they cannot disagree on the read order.
+        libcamera::Rectangle activeCropOrFallback(const libcamera::Rectangle &fallback) const
+        {
+            if (!activeCropKnown_.load())
+                return fallback;
+            return libcamera::Rectangle(activeCropX_.load(), activeCropY_.load(), activeCropWidth_.load(),
+                                         activeCropHeight_.load());
+        }
+
+        // The last geometry passed to applyActivePictureCrop(), kept so
+        // reapplyActivePictureCrop() (the non-reconfigure restart path) can
+        // reprogram the same baseline without re-probing the driver.
+        std::optional<unsigned int> lastActiveOriginX_;
+        std::optional<unsigned int> lastActiveOriginY_;
+        unsigned int lastActiveWidth_ = 0;
+        unsigned int lastActiveHeight_ = 0;
+        libcamera::Size lastTransportFrame_{};
 
         std::shared_ptr<spdlog::logger> console;
 
