@@ -22,19 +22,44 @@
 /*  Helper: pack a single 16-bit row → 12-bit packed               */
 /*  width must be even (IMX585 gives even pixel counts).          */
 /* ────────────────────────────────────────────────────────────── */
+/* One pixel of a packed-12-bit row, for a row whose width is ODD.
+ *
+ * A 12-bit row occupies (width*12+7)/8 bytes. For an odd width that is an
+ * exact number of pixel PAIRS plus two more bytes -- 12 bits of real pixel
+ * and 4 bits of padding -- so the final pixel gets two bytes, not three.
+ *
+ * This exists because the pair loops below used to run `x < width; x += 2`
+ * and read src[x + 1] unconditionally. On an odd width the last iteration
+ * read one uint16 past the end of the source row AND wrote a third byte the
+ * destination did not have, overflowing the row buffer by one byte on every
+ * row of every frame. pack_row_10bit() was hardened for exactly this case
+ * already; these two were not, and the imx283's aspect-ratio table has modes
+ * with odd widths (2975, 3055, 2093, 2155, 2355, 2473, 1649, 1697), so the
+ * bug was reachable by selecting an ordinary mode.
+ *
+ * The padding nibble is zeroed rather than left as whatever followed the row,
+ * so a file is bit-identical run to run. */
+static inline void pack_tail_12bit(uint16_t p0, uint8_t *dst)
+{
+    dst[0] = static_cast<uint8_t>(p0 >> 4);          /* upper 8 bits      */
+    dst[1] = static_cast<uint8_t>((p0 << 4) & 0xF0); /* lower 4 + padding */
+}
+
 static inline void pack_row_12bit(const uint16_t *src,
                                   uint8_t       *dst,
                                   uint32_t       width)
 {
-    for (uint32_t x = 0; x < width; x += 2)
+    uint32_t x = 0;
+    for (; x + 2u <= width; x += 2u, dst += 3)
     {
         uint16_t p0 = src[x];
         uint16_t p1 = src[x + 1];
         dst[0] =  p0 >> 4;                     /* upper 8 bits of pixel 0      */
         dst[1] = (p0 << 4) | (p1 >> 8);        /* lower 4 + upper 4            */
         dst[2] =  p1;                          /* lower 8 bits of pixel 1       */
-        dst += 3;
     }
+    if (x < width)
+        pack_tail_12bit(src[x], dst);
 }
 
 /* Pack a 16-bit source row to packed 12-bit output while dropping 4 LSBs. */
@@ -42,15 +67,17 @@ static inline void pack_row_16_to_12bit(const uint16_t *src,
                                         uint8_t       *dst,
                                         uint32_t       width)
 {
-    for (uint32_t x = 0; x < width; x += 2)
+    uint32_t x = 0;
+    for (; x + 2u <= width; x += 2u, dst += 3)
     {
         const uint16_t p0 = src[x] >> 4;
         const uint16_t p1 = src[x + 1] >> 4;
         dst[0] = p0 >> 4;
         dst[1] = (p0 << 4) | (p1 >> 8);
         dst[2] = p1;
-        dst += 3;
     }
+    if (x < width)
+        pack_tail_12bit(static_cast<uint16_t>(src[x] >> 4), dst);
 }
 
 /* Shift an MSB-aligned row down into the sensor's own right-justified domain.
