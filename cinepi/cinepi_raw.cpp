@@ -337,9 +337,25 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 				}
 
 				app.GetEncoder()->setActivePictureSize(active_width, active_height, origin_x, origin_y);
+
+				// Same geometry, same probe, applied to the PREVIEW path
+				// instead of the DNG: development/imx283-active-size/
+				// ROUND2.md, Defect B. Keeping this alongside the encoder's
+				// own setActivePictureSize() call (rather than re-deriving
+				// active_width/height/origin_x/origin_y elsewhere) is what
+				// guarantees the preview crop can never disagree with the
+				// DNG's own ActiveArea tags.
+				controller.applyActivePictureCrop(origin_x, origin_y, active_width, active_height, cfg.size);
 			}
 			else
+			{
 				app.GetEncoder()->setActivePictureSize(std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+				// No driver metadata at all (stock sensor, or a probe that
+				// failed): nothing to compensate with, so clear any stale
+				// baseline from a previous mode and leave ScalerCrop at the
+				// ISP's own full-frame default.
+				controller.applyActivePictureCrop(std::nullopt, std::nullopt, 0, 0, cfg.size);
+			}
 			// Tell the encoder whether the two snapshots above can be
 			// believed at all — see setSensorModeTrusted()'s comment.
 			app.GetEncoder()->setSensorModeTrusted(mode_trusted);
@@ -376,6 +392,11 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			console->error("No camera frames received for 3s, attempting a camera restart!!!");
 			app.StopCamera();
 			app.StartCamera();
+			// StartCamera() just reset ScalerCrop to full frame -- the
+			// sensor mode itself has not changed, so reprogram the
+			// last-known OB-compensation baseline rather than re-probing the
+			// driver. development/imx283-active-size/ROUND2.md, Defect B.
+			controller.reapplyActivePictureCrop();
 			continue;
 		}
 		if (msg.type != CinePIRecorder::MsgType::RequestComplete)

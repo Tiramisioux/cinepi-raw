@@ -131,6 +131,17 @@ lores_fit_test = executable('lores_fit_test',
            install : false)
 test('lores_fit', lores_fit_test)
 
+# Unit tests for the ScalerCrop mapping that keeps the leading optical-black
+# band the sensor cannot drop at the source out of the preview (lores/HDMI)
+# path -- development/imx283-active-size/ROUND2.md, Defect B. No libcamera
+# deps -- it includes only cinepi/preview_active_crop.hpp, and pins the
+# brief's own worked example. Run with `meson test`.
+preview_active_crop_test = executable('preview_active_crop_test',
+           '../tests/preview_active_crop_test.cpp',
+           include_directories : [include_directories('..')],
+           install : false)
+test('preview_active_crop', preview_active_crop_test)
+
 # A COMPILE-ONLY check, deliberately built but never registered with test(): building
 # it IS the check. core/driver_mode_metadata.hpp reaches into <linux/videodev2.h>, so
 # this target compiles against the stub headers in tests/stub-linux/ rather than the

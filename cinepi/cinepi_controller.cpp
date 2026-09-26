@@ -1,4 +1,5 @@
 #include "cinepi_controller.hpp"
+#include "preview_active_crop.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -459,6 +460,118 @@ void CinePIController::sync(){
 }
 
 /* ------------------------------------------------------------------ */
+/*  CinePIController::applyActivePictureCrop / reapplyActivePictureCrop */
+/*  development/imx283-active-size/ROUND2.md, Defect B.                */
+/* ------------------------------------------------------------------ */
+void CinePIController::applyActivePictureCrop(std::optional<unsigned int> originX,
+                                               std::optional<unsigned int> originY, unsigned int activeWidth,
+                                               unsigned int activeHeight, const libcamera::Size &transportFrame)
+{
+    // Remember the request as-is (even when it turns out to be "no
+    // compensation possible") so reapplyActivePictureCrop() can redo exactly
+    // this decision after a restart that does not go through this call site.
+    lastActiveOriginX_ = originX;
+    lastActiveOriginY_ = originY;
+    lastActiveWidth_ = activeWidth;
+    lastActiveHeight_ = activeHeight;
+    lastTransportFrame_ = transportFrame;
+
+    // "No active-picture geometry known" (no driver metadata, or the driver
+    // origin pair specifically is unknown -- see
+    // core/driver_mode_metadata.hpp's active_origin_known comment) or "the
+    // active picture already covers the whole transport frame" (nothing to
+    // compensate) both mean: clear the baseline and leave ScalerCrop at the
+    // ISP's own full-frame default, which is already correct in that case.
+    const bool have_geometry = originX.has_value() && originY.has_value() && activeWidth > 0 && activeHeight > 0 &&
+                                transportFrame.width > 0 && transportFrame.height > 0;
+    const bool needs_compensation =
+        have_geometry && (activeWidth < transportFrame.width || activeHeight < transportFrame.height ||
+                           *originX != 0 || *originY != 0);
+
+    if (!needs_compensation)
+    {
+        if (activeCropKnown_)
+            console->info("Preview OB compensation cleared (no active-picture geometry, or nothing to compensate).");
+        activeCropKnown_.store(false);
+        // Reset the zoom dedup baseline regardless: a mode reconfigure that
+        // reaches this call has already reset ScalerCrop via StartCamera(),
+        // so any previously-applied zoom no longer matches what the ISP is
+        // actually doing.
+        resetZoomDedup();
+        return;
+    }
+
+    // A = the sensor's own reported crop rectangle, read live (never
+    // hard-coded -- it differs per sensor mode). ScalerCropMaximum is
+    // exactly this: libcamera sets it to sensorInfo_.analogCrop, the same
+    // rectangle CameraData::applyScalerCrop() measures every ScalerCrop
+    // request against (see cinepi/preview_active_crop.hpp's file comment).
+    auto cameras = app_->GetCameras();
+    if (cameras.empty())
+    {
+        console->warn("Preview OB compensation: no camera available to read ScalerCropMaximum from.");
+        activeCropKnown_.store(false);
+        resetZoomDedup();
+        return;
+    }
+    libcamera::Rectangle sensorMax =
+        cameras[0]->properties().get(libcamera::properties::ScalerCropMaximum).value_or(libcamera::Rectangle());
+    if (sensorMax.width == 0 || sensorMax.height == 0)
+    {
+        console->warn("Preview OB compensation: ScalerCropMaximum unavailable; leaving ScalerCrop at its default.");
+        activeCropKnown_.store(false);
+        resetZoomDedup();
+        return;
+    }
+
+    PreviewScalerCropRect mapped =
+        compute_preview_scaler_crop(sensorMax.x, sensorMax.y, sensorMax.width, sensorMax.height, transportFrame.width,
+                                     transportFrame.height, *originX, *originY, activeWidth, activeHeight);
+
+    libcamera::Rectangle scalerCrop(mapped.left, mapped.top, static_cast<unsigned int>(mapped.width),
+                                     static_cast<unsigned int>(mapped.height));
+
+    // Publish the new baseline for the zoom handlers (a different thread --
+    // see this class's activeCropKnown_ comment) width/height first, then
+    // origin, then the "known" flag last: a torn read while this is
+    // in-flight then either still sees the OLD complete rectangle (flag not
+    // yet flipped) or a mix of old/new numbers once the flag is up, never a
+    // read of the "known" flag racing ahead of any of the numbers it
+    // describes.
+    activeCropWidth_.store(static_cast<unsigned int>(scalerCrop.width));
+    activeCropHeight_.store(static_cast<unsigned int>(scalerCrop.height));
+    activeCropX_.store(scalerCrop.x);
+    activeCropY_.store(scalerCrop.y);
+    activeCropKnown_.store(true);
+
+    libcamera::ControlList cl;
+    cl.set(libcamera::controls::ScalerCrop, scalerCrop);
+    app_->SetControls(cl);
+
+    console->info("Preview OB compensation: ScalerCrop {} (active picture ({},{})/{}x{} inside {}x{} frame, sensor "
+                  "rect {})",
+                  scalerCrop.toString(), *originX, *originY, activeWidth, activeHeight, transportFrame.width,
+                  transportFrame.height, sensorMax.toString());
+
+    // A restart just reset ScalerCrop to full frame, and we have just
+    // reprogrammed the OB-compensated baseline as the new "no zoom" state --
+    // any zoom the operator had dialled in before must be re-published by
+    // the caller (cinemate) rather than assumed still applied. See this
+    // method's header comment and resetZoomDedup()'s own comment.
+    resetZoomDedup();
+}
+
+void CinePIController::reapplyActivePictureCrop()
+{
+    // Re-run exactly the same decision applyActivePictureCrop() made last
+    // time, without re-probing the driver: the sensor mode has not changed
+    // (this is the WaitFor-timeout restart path in cinepi_raw.cpp, not a
+    // reconfigure), so the last-known geometry is still correct.
+    applyActivePictureCrop(lastActiveOriginX_, lastActiveOriginY_, lastActiveWidth_, lastActiveHeight_,
+                            lastTransportFrame_);
+}
+
+/* ------------------------------------------------------------------ */
 /*  CinePIController::process – v2 (real TOD timestamps)              */
 /* ------------------------------------------------------------------ */
 void CinePIController::process(CompletedRequestPtr &completed_request)
@@ -814,20 +927,32 @@ void CinePIController::mainThread(){
                 // Retrieve the maximum sensor area
                 libcamera::Rectangle sensor_area = app_->GetCameras()[0]->controls().at(&controls::ScalerCrop).max().get<libcamera::Rectangle>();
 
+                // Zoom must compose WITHIN the OB-compensated active
+                // rectangle, not the whole sensor frame, or a "no zoom"
+                // request here would re-admit the optical-black band
+                // applyActivePictureCrop() just removed (ROUND2.md Defect
+                // B). Falls back to the full sensor rect when no active-
+                // picture geometry is known, i.e. this handler's pre-
+                // existing behaviour.
+                libcamera::Rectangle base = activeCropOrFallback(sensor_area);
+
                 // Calculate the dimensions of the zoomed-in area based on the zoom factor
-                int w = static_cast<int>(sensor_area.width / zoomFactor);
-                int h = static_cast<int>(sensor_area.height / zoomFactor);
+                int w = static_cast<int>(base.width / zoomFactor);
+                int h = static_cast<int>(base.height / zoomFactor);
 
                 // Calculate the top-left corner of the new crop area to keep it centered
-                int x = (sensor_area.width - w) / 2;
-                int y = (sensor_area.height - h) / 2;
+                int x = (base.width - w) / 2;
+                int y = (base.height - h) / 2;
 
                 // Define the crop rectangle
                 libcamera::Rectangle crop(x, y, w, h);
 
-                // Translate the crop rectangle by the sensor area's top-left point to align with the global coordinate system, if necessary
-                // This step might be redundant if the sensor_area's top-left is already considered (0,0) in your coordinate system.
-                // crop.translateBy(sensor_area.topLeft());
+                // Translate into the global (sensor) coordinate system: base
+                // may itself be offset from (0,0) -- both the full sensor
+                // rect on this fork and the OB-compensated active rectangle
+                // usually are -- so this is no longer the no-op the old
+                // comment here assumed.
+                crop.translateBy(base.topLeft());
 
                 // Log and apply the crop
                 LOG(2, "Using crop " << crop.toString());
@@ -967,9 +1092,19 @@ void CinePIController::mainThread(){
                     .get(libcamera::properties::ScalerCropMaximum)
                     .value_or(libcamera::Rectangle());          // fallback 0,0,0,0
 
-            uint32_t Sw = sensor.width;                         // e.g. 3856
-            uint32_t Sh = sensor.height;                        // e.g. 2180
-            console->debug("Sensor active {}×{}  {}", Sw, Sh, sensor.toString());
+            /* Zoom must compose WITHIN the OB-compensated active rectangle,
+             * not the whole sensor frame -- ROUND2.md Defect B, "It must
+             * compose with the existing zoom handler": a 1.0x-in-name-only
+             * zoom must not re-admit the optical-black band
+             * applyActivePictureCrop() removed. Falls back to the full
+             * sensor rect when no active-picture geometry is known
+             * (activeCropKnown_ false), this handler's pre-existing
+             * behaviour. */
+            libcamera::Rectangle base = activeCropOrFallback(sensor);
+
+            uint32_t Sw = base.width;                           // e.g. 3856
+            uint32_t Sh = base.height;                          // e.g. 2180
+            console->debug("Zoom base {}×{}  {}", Sw, Sh, base.toString());
 
             /* ─────────── 2. requested FoV (pixels) ──────── */
             float w_frac = 1.f / z;
@@ -977,8 +1112,13 @@ void CinePIController::mainThread(){
             float x_frac = (1.f - w_frac) / 2.f;
             float y_frac = x_frac;
 
-            uint32_t x = static_cast<uint32_t>(x_frac * Sw) & ~1U;   // even align
-            uint32_t y = static_cast<uint32_t>(y_frac * Sh) & ~1U;
+            // x/y are offsets WITHIN base, so the result must be translated
+            // by base's own top-left to land in the sensor's global
+            // coordinate system -- base is not (0,0)-rooted in general (the
+            // OB-compensated rectangle never is, and neither is the full
+            // sensor rect on this fork).
+            uint32_t x = base.x + (static_cast<uint32_t>(x_frac * Sw) & ~1U);   // even align
+            uint32_t y = base.y + (static_cast<uint32_t>(y_frac * Sh) & ~1U);
             uint32_t w = static_cast<uint32_t>(w_frac * Sw) & ~1U;
             uint32_t h = static_cast<uint32_t>(h_frac * Sh) & ~1U;
 
