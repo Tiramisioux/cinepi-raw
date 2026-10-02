@@ -173,10 +173,8 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-rawâ
 | `--disk-nice <int>`       | `auto`  | Nice level applied to disk workers. |
 | `--plain-arecord-timecode-offset-frames <int>` | `0` | Frame offset added to the 16-bit plain `arecord` WAV metadata timecode. PCM is not shifted. |
 | `--audio-timecode-offset-frames <int>` | `0` | Frame offset added to the 24-bit USB-capture WAV metadata timecode. PCM is not shifted. |
-| `--phase-lock [0\|1]` | *(unset)* | Frame-rate phase lock: locks frame cadence to the Pi wall clock (the audio clock) by dithering the sensor frame duration. Bare flag = `1`. Overrides the `fps_phase_lock` Redis key at start-up; unset leaves Redis as is. See [Frame-rate phase lock](#frame-rate-phase-lock). |
+| `--phase-lock [0\|1]` | *(unset)* | Frame-rate phase lock: locks frame cadence to the Pi wall clock (the audio clock) by dithering the sensor frame duration. Bare flag = `1`. See [Frame-rate phase lock](#frame-rate-phase-lock). |
 | `--unique-camera-model <string>` | `"cinepi"` | Override the `UniqueCameraModel` DNG tag embedded in recorded frames. Changing to `Blackmagic Pocket Cinema Camera 4K` enables ISO settings to clips in DaVinci Resolve. |
-| `fps_phase_lock` *(Redis key)* | `0` standalone, `1` under CineMate | Runtime switch for the phase lock (`--phase-lock` sets it at start-up). CineMate sets it from the per-camera `phase_lock` setting (default on); standalone, cinepi-raw writes `0` if the key is absent and no flag is given. See [Frame-rate phase lock](#frame-rate-phase-lock). |
-| `pll_kp` / `pll_ki` / `pll_deadband_us` *(Redis keys)* | `0.06` / `0.0015` / `6` | Phase-lock tuning: proportional gain (damping), integral gain (removes steady offset), and the phase-error deadband in Âµs below which the loop holds. Read-only telemetry while locked: `pll_phase_err_us`, `pll_req_dur_us`. |
 
 ## Frame-rate phase lock
 
