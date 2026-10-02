@@ -398,7 +398,11 @@ void CinePIController::sync(){
     }
 
     // ── Frame-rate phase-lock config (write defaults if the keys are absent) ──
-    if (auto v = redis_->get(CONTROL_KEY_PHASE_LOCK); v && !v->empty()) {
+    if (options_->phase_lock) {
+        // Explicit --phase-lock wins over whatever Redis holds at start-up.
+        phaseLockEnabled_.store(*options_->phase_lock);
+        redis_->set(CONTROL_KEY_PHASE_LOCK, *options_->phase_lock ? "1" : "0");
+    } else if (auto v = redis_->get(CONTROL_KEY_PHASE_LOCK); v && !v->empty()) {
         try { phaseLockEnabled_.store(std::stoi(*v) != 0); } catch (...) {}
     } else {
         redis_->set(CONTROL_KEY_PHASE_LOCK, "0");

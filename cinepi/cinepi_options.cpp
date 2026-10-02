@@ -224,6 +224,10 @@ CinePiOptions::CinePiOptions()
                 ("plain-arecord-timecode-offset-frames",
                     value<int>()->default_value(0),
                     "Frame offset to add to plain arecord WAV metadata timecode; PCM is unchanged")
+                ("phase-lock",
+                    value<std::string>()->implicit_value("1"),
+                    "Frame-rate phase lock to the Pi wall clock (audio clock): "
+                    "0|1, bare flag = 1. Overrides the fps_phase_lock Redis key at start-up")
                 ("unique-camera-model",
                     value<std::string>(),
                     "Override the DNG UniqueCameraModel tag "
@@ -562,6 +566,21 @@ bool CinePiOptions::Parse(int argc, char *argv[])
                                 throw std::runtime_error("--audio-timecode-offset-frames requires a value");
                         RawOptions::audio_timecode_offset_frames =
                                 parseFrameOffset("--audio-timecode-offset-frames", argv[++i]);
+                        continue;
+                }
+
+                if (arg == "--phase-lock" || arg.rfind("--phase-lock=", 0) == 0) {
+                        std::string val = "1";
+                        if (arg != "--phase-lock")
+                                val = arg.substr(sizeof("--phase-lock=") - 1);
+                        else if (i + 1 < argc && (std::string(argv[i + 1]) == "0" || std::string(argv[i + 1]) == "1"))
+                                val = argv[++i];
+                        if (val == "1" || val == "on" || val == "true")
+                                RawOptions::phase_lock = true;
+                        else if (val == "0" || val == "off" || val == "false")
+                                RawOptions::phase_lock = false;
+                        else
+                                throw std::runtime_error("--phase-lock expects 0 or 1, got '" + val + "'");
                         continue;
                 }
 

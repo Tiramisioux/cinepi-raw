@@ -63,6 +63,10 @@ struct RawOptions : public VideoOptions
     std::optional<int> encode_nice;
     std::optional<int> disk_nice;
 
+    /* --phase-lock [0|1]: startup override of the fps_phase_lock Redis key.
+     * Unset = leave Redis as is (CineMate sets it from its per-camera setting). */
+    std::optional<bool> phase_lock;
+
     int plain_arecord_timecode_offset_frames { 0 };
     int audio_timecode_offset_frames { 0 };
 };
