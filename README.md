@@ -180,7 +180,20 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-rawâ
 
 ## Frame-rate phase lock
 
-Syncs frame capture to the onboard clock of the Raspberry Pi intead of using the sensors clock. Makes it easier to record in sync with audio recordings (since both frame and audio capure are using the same clock). Off by default. 
+Syncs frame capture to the Raspberry Pi's onboard clock instead of the sensor's clock. Frame and audio capture then share one clock, which keeps recordings in sync with audio. Off by default.
+
+| Control | Scope | Notes |
+|---------|-------|-------|
+| `--phase-lock [0\|1]` | Start-up | Bare flag = on. Overrides the Redis key at launch. |
+| `fps_phase_lock` (Redis) | Runtime | `0`/`1`. CineMate sets it from the per-camera `phase_lock` setting (default on). |
+| `pll_kp`, `pll_ki`, `pll_deadband_us` (Redis) | Runtime | Loop tuning. Defaults `0.06`, `0.0015`, `6`. |
+| `pll_phase_err_us`, `pll_req_dur_us` (Redis) | Read-only | Telemetry while locked. |
+
+Standalone example:
+
+```bash
+cinepi-raw --phase-lock [other options]
+```
 
 ## Manual DNG encoder
 
