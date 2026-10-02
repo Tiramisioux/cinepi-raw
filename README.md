@@ -174,6 +174,8 @@ The following flags extend the base `rpicam-apps` functionality with CinePi-rawâ
 | `--plain-arecord-timecode-offset-frames <int>` | `0` | Frame offset added to the 16-bit plain `arecord` WAV metadata timecode. PCM is not shifted. |
 | `--audio-timecode-offset-frames <int>` | `0` | Frame offset added to the 24-bit USB-capture WAV metadata timecode. PCM is not shifted. |
 | `--unique-camera-model <string>` | `"cinepi"` | Override the `UniqueCameraModel` DNG tag embedded in recorded frames. Changing to `Blackmagic Pocket Cinema Camera 4K` enables ISO settings to clips in DaVinci Resolve. |
+| `fps_phase_lock` *(Redis key, not a CLI flag)* | `0` | Closed-loop frame-rate phase lock: `1` locks frame cadence to the Pi wall clock (the audio clock) by dithering the sensor frame duration; `0` = off. Runtime-switchable, default written on first start. See [Frame-rate phase lock](#frame-rate-phase-lock). |
+| `pll_kp` / `pll_ki` / `pll_deadband_us` *(Redis keys)* | `0.06` / `0.0015` / `6` | Phase-lock tuning: proportional gain (damping), integral gain (removes steady offset), and the phase-error deadband in Âµs below which the loop holds. Read-only telemetry while locked: `pll_phase_err_us`, `pll_req_dur_us`. |
 
 ## Frame-rate phase lock
 
